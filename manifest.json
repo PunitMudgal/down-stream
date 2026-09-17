@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Video Download Grabber (local)",
+  "version": "0.1.0",
+  "description": "Detect playable video on the current tab and download it locally. No backend, no third-party calls.",
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "Video downloads"
+  },
+  "background": {
+    "service_worker": "src/background.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://test-streams.mux.dev/*",
+        "https://dash.akamaized.net/*",
+        "https://interactive-examples.mdn.mozilla.net/*"
+      ],
+      "js": ["src/content.ts"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["activeTab", "webRequest", "downloads", "storage", "scripting"],
+  "host_permissions": [
+    "https://test-streams.mux.dev/*",
+    "https://dash.akamaized.net/*",
+    "https://interactive-examples.mdn.mozilla.net/*"
+  ]
+}

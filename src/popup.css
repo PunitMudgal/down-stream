@@ -1,0 +1,107 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #666;
+  --card: #f5f5f5;
+  --accent: #1a73e8;
+  --danger: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --fg: #e8e8e8;
+    --muted: #aaa;
+    --card: #2a2a2a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  width: 360px;
+  max-height: 520px;
+  margin: 0;
+  padding: 12px;
+  font: 13px/1.45 system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+h1 { font-size: 15px; margin: 0; }
+#rescan {
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+#rescan:hover { background: var(--accent); color: #fff; }
+#status { color: var(--muted); min-height: 18px; margin-bottom: 8px; }
+#list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+.card {
+  background: var(--card);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  gap: 10px;
+}
+.thumb {
+  width: 96px;
+  height: 54px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #000;
+  flex-shrink: 0;
+}
+.thumb-fallback {
+  width: 96px;
+  height: 54px;
+  border-radius: 4px;
+  background: #333;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.meta { flex: 1; min-width: 0; }
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-right: 6px;
+}
+.url {
+  color: var(--muted);
+  font-size: 11px;
+  word-break: break-all;
+  margin: 4px 0;
+}
+select, button.dl {
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px;
+  border-radius: 6px;
+  border: 1px solid #ccc;
+  font-size: 12px;
+}
+button.dl {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+}
+button.dl:disabled { background: #999; cursor: not-allowed; }
+.protected, .error { color: var(--danger); font-size: 12px; margin-top: 6px; }
+.progress { color: var(--accent); font-size: 12px; margin-top: 6px; }
+.empty { color: var(--muted); text-align: center; padding: 24px 12px; }

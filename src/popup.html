@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Video downloads</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Videos on this page</h1>
+      <button id="rescan" type="button" title="Re-scan the page for videos">Rescan page</button>
+    </header>
+    <div id="status" role="status" aria-live="polite"></div>
+    <main id="list"></main>
+    <script type="module" src="./popup.ts"></script>
+  </body>
+</html>
