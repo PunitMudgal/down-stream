@@ -1,5 +1,5 @@
 import { filenameForUrl } from "./lib/download";
-import type { DownloadJobState, MediaItem } from "./lib/types";
+import type { DownloadJobState, MediaItem, MediaType, VideoSignal } from "./lib/types";
 
 const listEl = document.getElementById("list") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
@@ -7,6 +7,8 @@ const rescanBtn = document.getElementById("rescan") as HTMLButtonElement;
 
 let currentTabId: number | null = null;
 let currentHost = "";
+let currentUrl = "";
+let workerAlive = false;
 let jobs: DownloadJobState[] = [];
 
 function shortUrl(url: string): string {
@@ -45,15 +47,183 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   ]);
 }
 
-async function activeTab(): Promise<{ id: number | null; host: string }> {
+async function activeTab(): Promise<{ id: number | null; host: string; url: string }> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   let host = "";
+  const url = tab?.url ?? "";
   try {
-    if (tab?.url) host = new URL(tab.url).host;
+    if (url) host = new URL(url).host;
   } catch {
     /* ignore */
   }
-  return { id: tab?.id ?? null, host };
+  return { id: tab?.id ?? null, host, url };
+}
+
+/** Pages where extensions are forbidden from running at all. */
+function blockedPageReason(url: string): string | null {
+  if (!url) return "No page URL available.";
+  if (/^(chrome|edge|about|chrome-extension|opera|brave|vivaldi):/.test(url))
+    return "Extensions can't access browser system pages. Open a normal website tab instead.";
+  if (/^https:\/\/(chrome\.google\.com\/webstore|chromewebstore\.google\.com)/.test(url))
+    return "Extensions can't run on the Chrome Web Store page.";
+  if (/^file:/.test(url))
+    return "File URLs need 'Allow access to file URLs' enabled for this extension.";
+  return null;
+}
+
+function classifyBare(url: string): MediaType | null {
+  const lower = url.toLowerCase().split("?")[0].split("#")[0];
+  if (lower.endsWith(".m3u8")) return "hls";
+  if (lower.endsWith(".mpd")) return "dash";
+  if (url.startsWith("blob:")) return "blob";
+  if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "mp4";
+  if (lower.endsWith(".webm")) return "webm";
+  if (lower.endsWith(".ogv") || lower.endsWith(".ogg")) return "ogg";
+  if (lower.endsWith(".mov")) return "mov";
+  if (lower.endsWith(".mkv")) return "mkv";
+  if (lower.endsWith(".avi")) return "avi";
+  if (lower.endsWith(".flv") || lower.endsWith(".f4v")) return "flv";
+  if (lower.endsWith(".wmv")) return "wmv";
+  if (lower.endsWith(".mpg") || lower.endsWith(".mpeg")) return "mpg";
+  if (lower.endsWith(".3gp") || lower.endsWith(".3g2")) return "mp4";
+  return null;
+}
+
+/**
+ * Worker-independent page scan: ask the tab's content script for its
+ * <video> elements directly (no background worker involved). Falls back to
+ * a one-shot injected collector when the content script isn't present
+ * (e.g. tab hasn't reloaded since install). Never throws — returns [].
+ */
+async function scanPageDirect(tabId: number): Promise<VideoSignal[]> {
+  try {
+    const res = await withTimeout(
+      chrome.tabs.sendMessage(tabId, { type: "COLLECT_FOR_POPUP" }),
+      3000,
+      "Page scan",
+    );
+    if (res?.ok && Array.isArray(res.videos)) return res.videos as VideoSignal[];
+  } catch {
+    /* no content script in this tab — try one-shot injection */
+  }
+  try {
+    const results = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const abs = (raw: string | null): string | null => {
+            if (!raw) return null;
+            const s = raw.trim();
+            if (!s || s.startsWith("data:")) return null;
+            try {
+              return new URL(s, location.href).toString();
+            } catch {
+              return null;
+            }
+          };
+          return Array.from(document.querySelectorAll("video")).flatMap((v) => {
+            const cands: string[] = [];
+            if ((v as HTMLVideoElement).currentSrc) cands.push((v as HTMLVideoElement).currentSrc);
+            for (const a of ["src", "data-src", "data-url", "data-video-url"]) {
+              const u = abs((v as HTMLVideoElement).getAttribute(a));
+              if (u && !cands.includes(u)) cands.push(u);
+            }
+            v.querySelectorAll("source[src]").forEach((n) => {
+              const u = abs(n.getAttribute("src"));
+              if (u && !cands.includes(u)) cands.push(u);
+            });
+            if (!cands.length && !(v as HTMLVideoElement).poster) return [];
+            return [
+              {
+                currentSrc: cands[0] ?? "",
+                candidates: cands,
+                poster: (v as HTMLVideoElement).poster || undefined,
+              },
+            ];
+          });
+        },
+      }),
+      6000,
+      "Page injection",
+    );
+    const out: VideoSignal[] = [];
+    for (const r of results ?? []) {
+      const val = (r as chrome.scripting.InjectionResult)?.result as unknown;
+      if (Array.isArray(val)) out.push(...(val as VideoSignal[]));
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** "1280×720 • 0:34 • playing" (local copy — background has its own). */
+function describeDomSignal(v: VideoSignal): string | undefined {
+  const parts: string[] = [];
+  if (v.width && v.height) parts.push(`${v.width}×${v.height}`);
+  if (v.duration != null && Number.isFinite(v.duration) && v.duration > 0) {
+    const s = Math.floor(v.duration);
+    parts.push(
+      s >= 3600
+        ? `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
+        : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`,
+    );
+  }
+  if (v.paused === false) parts.push("playing");
+  return parts.length ? parts.join(" • ") : undefined;
+}
+
+/** Turn raw DOM signals into display items (worker results win on merge). */
+function domSignalsToItems(signals: VideoSignal[], tabId: number): MediaItem[] {
+  const items: MediaItem[] = [];
+  const seen = new Set<string>();
+  for (const v of signals) {
+    const meta = describeDomSignal(v);
+    for (const src of [v.currentSrc, ...(v.candidates ?? [])]) {
+      if (!src || seen.has(src)) continue;
+      seen.add(src);
+      const type = classifyBare(src);
+      if (!type) continue;
+      if (type === "blob") {
+        items.push({
+          url: src,
+          tabId,
+          type: "blob",
+          filename: "",
+          detectedAt: Date.now(),
+          drmProtected: false,
+          poster: v.poster,
+          meta,
+          error: "Blob/MSE stream (in-player buffer) — the file is captured from the network when it loads. Play the video, then Rescan.",
+        });
+      } else if (type === "hls" || type === "dash") {
+        items.push({
+          url: src,
+          tabId,
+          type,
+          filename: filenameForUrl(src, type),
+          detectedAt: Date.now(),
+          drmProtected: false,
+          variants: [],
+          poster: v.poster,
+          meta,
+          error: "Found on the page — waiting for the background worker to parse qualities. If the worker is down, reload the extension.",
+        });
+      } else {
+        items.push({
+          url: src,
+          tabId,
+          type,
+          filename: filenameForUrl(src, type),
+          detectedAt: Date.now(),
+          drmProtected: false,
+          poster: v.poster,
+          meta,
+        });
+      }
+    }
+  }
+  return items;
 }
 
 function jobForItem(itemUrl: string): DownloadJobState | undefined {
@@ -61,54 +231,180 @@ function jobForItem(itemUrl: string): DownloadJobState | undefined {
   return related.sort((a, b) => b.updatedAt - a.updatedAt)[0];
 }
 
+function runningText(job: DownloadJobState): string {
+  const tail = "(safe to close popup)";
+  if (job.stage === "assembling") return `Assembling file… ${tail}`;
+  if (job.stage === "saving") return `Saving download… ${tail}`;
+  if (job.total > 1) return `Fetching… ${job.done}/${job.total} segments ${tail}`;
+  return `Downloading… ${tail}`;
+}
+
 async function loadMedia(): Promise<void> {
   setStatus("Scanning…");
   listEl.innerHTML = "";
   jobs = [];
+  workerAlive = false;
+
+  // 1. Find the tab; bail early on pages extensions can't touch.
+  let id: number | null;
   try {
-    const { id, host } = await withTimeout(activeTab(), 5000, "Finding active tab");
+    const t = await withTimeout(activeTab(), 5000, "Finding active tab");
+    id = t.id;
+    currentHost = t.host;
+    currentUrl = t.url;
     currentTabId = id;
-    currentHost = host;
     if (id == null) {
       setStatus("No active tab found.");
       return;
     }
-    const [mediaRes, jobsRes] = await withTimeout(
-      Promise.all([
-        chrome.runtime.sendMessage({ type: "GET_MEDIA", tabId: id }),
-        chrome.runtime.sendMessage({ type: "GET_JOBS", tabId: id }),
-      ]),
-      8000,
-      "Reading detections",
-    );
-    const items: MediaItem[] = mediaRes?.items ?? [];
-    jobs = jobsRes?.jobs ?? [];
-
-    if (items.length === 0) {
+    const blocked = blockedPageReason(t.url);
+    if (blocked) {
       setStatus("");
       const div = document.createElement("div");
       div.className = "empty";
-      div.textContent = currentHost
-        ? `No video detected on ${currentHost} yet. Play the video, then hit Rescan.`
-        : "No video detected yet. Play the video, then hit Rescan.";
+      div.textContent = blocked;
       listEl.appendChild(div);
       return;
     }
-    const downloadable = items.filter((x) => x.type !== "blob").length;
-    setStatus(
-      downloadable > 0
-        ? `${downloadable} downloadable video${downloadable > 1 ? "s" : ""} detected.`
-        : "Found player streams, but no direct file yet — play the video, then Rescan.",
-    );
-    for (const item of items) listEl.appendChild(renderCard(item));
   } catch (err) {
-    // Never leave the UI stuck on "Scanning…".
-    setStatus(err instanceof Error ? err.message : String(err));
+    showFatal(err instanceof Error ? err.message : String(err));
+    return;
+  }
+
+  // 2. Run the worker path and the direct page scan IN PARALLEL — neither
+  // may block or kill the other. The popup shows whatever comes back.
+  const tabId: number = id;
+  const workerPromise = (async (): Promise<MediaItem[]> => {
+    await withTimeout(chrome.runtime.sendMessage({ type: "PING" }), 3500, "Ping");
+    workerAlive = true;
+    const mediaRes = await withTimeout(
+      chrome.runtime.sendMessage({ type: "GET_MEDIA", tabId }),
+      8000,
+      "Reading detections",
+    );
+    // Jobs are best-effort and never block rendering.
+    try {
+      const jobsRes = await withTimeout(
+        chrome.runtime.sendMessage({ type: "GET_JOBS", tabId }),
+        5000,
+        "Reading download jobs",
+      );
+      jobs = jobsRes?.jobs ?? [];
+    } catch {
+      jobs = [];
+    }
+    return (mediaRes?.items ?? []) as MediaItem[];
+  })();
+  const pagePromise = scanPageDirect(tabId);
+
+  const [workerSettled, pageSettled] = await Promise.allSettled([workerPromise, pagePromise]);
+  const workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
+  const pageItems = domSignalsToItems(
+    pageSettled.status === "fulfilled" ? pageSettled.value : [],
+    tabId,
+  );
+
+  // Merge: worker detections win on exact URL; page-only signals fill gaps.
+  // Extra blob placeholders collapse to one row (all mean "player buffer").
+  const byUrl = new Map<string, MediaItem>();
+  for (const it of workerItems) byUrl.set(it.url, it);
+  for (const it of pageItems) {
+    if (byUrl.has(it.url)) continue;
+    if (it.type === "blob" && [...byUrl.values()].some((x) => x.type === "blob")) continue;
+    byUrl.set(it.url, it);
+  }
+  const items = [...byUrl.values()].sort((a, b) => b.detectedAt - a.detectedAt);
+
+  if (!workerAlive && pageItems.length > 0) {
+    showWorkerWarning();
+  }
+
+  if (items.length === 0) {
+    if (!workerAlive) {
+      showFatal("Background worker isn't answering, and no <video> found on the page itself.");
+      return;
+    }
+    setStatus("");
     const div = document.createElement("div");
     div.className = "empty";
-    div.textContent = "Could not load detections. Close and reopen the popup, or reload the extension.";
+    div.textContent = currentHost
+      ? `No video detected on ${currentHost} yet. Play the video, then hit Rescan.`
+      : "No video detected yet. Play the video, then hit Rescan.";
     listEl.appendChild(div);
+    return;
   }
+  const downloadable = items.filter((x) => x.type !== "blob").length;
+  setStatus(
+    workerAlive
+      ? downloadable > 0
+        ? `${downloadable} downloadable video${downloadable > 1 ? "s" : ""} detected.`
+        : "Found player streams, but no direct file yet — play the video, then Rescan."
+      : "Worker unreachable — showing what the page itself exposes. Direct files can still download; qualities need the worker.",
+  );
+  for (const item of items) listEl.appendChild(renderCard(item));
+}
+
+/** Banner (not a dead end): page scan worked, worker didn't. */
+function showWorkerWarning(): void {
+  const banner = document.createElement("div");
+  banner.className = "card";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const note = document.createElement("div");
+  note.className = "error";
+  note.textContent =
+    "Background worker isn't answering (it may have crashed). Page-level videos are shown below; direct files can still download. Reload the extension to restore quality lists and background downloads.";
+  meta.appendChild(note);
+  const reload = document.createElement("button");
+  reload.className = "dl";
+  reload.textContent = "Reload extension now";
+  reload.onclick = () => {
+    try {
+      chrome.runtime.reload();
+    } catch (err) {
+      setStatus(`Reload failed: ${err instanceof Error ? err.message : String(err)}. Use chrome://extensions instead.`);
+    }
+  };
+  meta.appendChild(reload);
+  banner.appendChild(meta);
+  listEl.appendChild(banner);
+}
+
+/** Terminal error state — never leave the UI stuck on "Scanning…". */
+function showFatal(message: string): void {
+  setStatus(message);
+  listEl.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "empty";
+  const p = document.createElement("div");
+  p.textContent = "Could not load detections.";
+  div.appendChild(p);
+  const hint = document.createElement("div");
+  hint.className = "url";
+  hint.textContent =
+    "If this keeps happening: chrome://extensions → Developer mode → this extension → 'Service worker' shows its crash log.";
+  div.appendChild(hint);
+
+  const retry = document.createElement("button");
+  retry.className = "dl";
+  retry.textContent = "Retry";
+  retry.onclick = () => void loadMedia();
+  div.appendChild(retry);
+
+  const reload = document.createElement("button");
+  reload.id = "rescan";
+  reload.style.marginTop = "8px";
+  reload.textContent = "Reload extension";
+  reload.title = "Restart the background worker, then reopen the popup";
+  reload.onclick = () => {
+    try {
+      chrome.runtime.reload();
+    } catch (err) {
+      setStatus(`Reload failed: ${err instanceof Error ? err.message : String(err)}. Use chrome://extensions instead.`);
+    }
+  };
+  div.appendChild(reload);
+  listEl.appendChild(div);
 }
 
 function renderCard(item: MediaItem): HTMLElement {
@@ -142,6 +438,23 @@ function renderCard(item: MediaItem): HTMLElement {
   urlDiv.textContent = shortUrl(item.url);
   urlDiv.title = item.url;
   meta.appendChild(urlDiv);
+
+  if (item.meta) {
+    const metaLine = document.createElement("div");
+    metaLine.className = "url";
+    metaLine.textContent = item.meta;
+    meta.appendChild(metaLine);
+  }
+
+  // Copy-link works without any worker — handy for external downloaders.
+  if (item.type !== "blob") {
+    const copy = document.createElement("button");
+    copy.className = "ghost";
+    copy.textContent = "Copy link";
+    copy.title = "Copy the video URL to the clipboard";
+    copy.onclick = () => void copyLink(item.url, copy);
+    meta.appendChild(copy);
+  }
 
   if (item.error && !item.variants?.length && !isDirect(item)) {
     const e = document.createElement("div");
@@ -205,8 +518,37 @@ function renderCard(item: MediaItem): HTMLElement {
   return card;
 }
 
+const DIRECT_BADGES = new Set(["MP4", "WEBM", "OGG", "MOV", "MKV", "AVI", "FLV", "WMV", "MPG"]);
+
 function isDirect(item: MediaItem): boolean {
-  return ["mp4", "webm", "ogg", "mov"].includes(item.type);
+  return DIRECT_BADGES.has(item.type.toUpperCase());
+}
+
+function jobLine(job: DownloadJobState, direct: boolean): { label: string; state: string } {
+  if (job.status === "running") return { label: runningText(job), state: "running" };
+  if (job.status === "done") return { label: "Done — check your downloads folder.", state: "done" };
+  if (/cancelled/i.test(job.error ?? "")) return { label: "Cancelled.", state: "cancelled" };
+  return { label: `Failed: ${job.error ?? "unknown error"}`, state: "error" };
+}
+
+function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, direct: boolean): void {
+  let cancel = card.querySelector("button.cancelbtn") as HTMLButtonElement | null;
+  // Direct downloads finish near-instantly via the browser — cancel only
+  // makes sense for multi-segment HLS/DASH jobs.
+  const showCancel = job?.status === "running" && !direct;
+  if (showCancel) {
+    if (!cancel) {
+      const jid = job.jobId;
+      cancel = document.createElement("button");
+      cancel.className = "ghost cancelbtn";
+      cancel.textContent = "Cancel";
+      cancel.onclick = () => void cancelJob(jid);
+      card.querySelector(".meta")?.appendChild(cancel);
+    }
+    cancel.hidden = false;
+  } else if (cancel) {
+    cancel.hidden = true;
+  }
 }
 
 /** Reflect the latest known job for this item (survives popup reopen). */
@@ -220,53 +562,90 @@ function paintJobState(card: HTMLElement, item: MediaItem): void {
     btn.disabled = false;
     return;
   }
-  if (job.status === "running") {
+  const direct = isDirect(item);
+  const line = jobLine(job, direct);
+  if (line.state === "running") {
     btn.disabled = true;
     prog.hidden = false;
-    prog.textContent =
-      job.total > 1
-        ? `Downloading… ${job.done}/${job.total} segments (safe to close popup)`
-        : "Downloading… (safe to close popup)";
-  } else if (job.status === "done") {
+    prog.textContent = line.label;
+  } else if (line.state === "done") {
     btn.disabled = false;
-    btn.textContent = isDirect(item) ? "Download again" : "Download variant again";
+    btn.textContent = direct ? "Download again" : "Download variant again";
     prog.hidden = false;
-    prog.textContent = "Done — check your downloads folder.";
+    prog.textContent = line.label;
   } else {
     btn.disabled = false;
     prog.hidden = false;
-    prog.textContent = `Failed: ${job.error ?? "unknown error"}`;
+    prog.textContent = line.label;
   }
+  paintJobButtons(card, job, direct);
 }
 
 function refreshCard(itemUrl: string): void {
   const card = listEl.querySelector(`[data-item-url="${CSS.escape(itemUrl)}"]`) as HTMLElement | null;
   if (!card) return;
-  // Re-resolve the item from the rendered card's context is complex;
-  // instead patch the progress/button in place using a lightweight lookup.
   const prog = card.querySelector(".progress") as HTMLElement | null;
   const btn = card.querySelector("button.dl") as HTMLButtonElement | null;
   if (!prog || !btn) return;
   const job = jobForItem(itemUrl);
   if (!job) return;
   const badge = card.querySelector(".badge")?.textContent ?? "";
-  const direct = ["MP4", "WEBM", "OGG", "MOV"].includes(badge);
-  if (job.status === "running") {
+  const direct = DIRECT_BADGES.has(badge);
+  const line = jobLine(job, direct);
+  if (line.state === "running") {
     btn.disabled = true;
     prog.hidden = false;
-    prog.textContent =
-      job.total > 1
-        ? `Downloading… ${job.done}/${job.total} segments (safe to close popup)`
-        : "Downloading… (safe to close popup)";
-  } else if (job.status === "done") {
+    prog.textContent = line.label;
+  } else if (line.state === "done") {
     btn.disabled = false;
     btn.textContent = direct ? "Download again" : "Download variant again";
     prog.hidden = false;
-    prog.textContent = "Done — check your downloads folder.";
+    prog.textContent = line.label;
   } else {
     btn.disabled = false;
     prog.hidden = false;
-    prog.textContent = `Failed: ${job.error ?? "unknown error"}`;
+    prog.textContent = line.label;
+  }
+  paintJobButtons(card, job, direct);
+}
+
+async function cancelJob(jobId: string): Promise<void> {
+  try {
+    await withTimeout(
+      chrome.runtime.sendMessage({ type: "CANCEL_JOB", jobId }),
+      8000,
+      "Cancelling",
+    );
+    setStatus("Cancelling…");
+  } catch (err) {
+    setStatus(`Cancel failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function copyLink(url: string, btn: HTMLButtonElement): Promise<void> {
+  const done = (msg: string) => {
+    const orig = "Copy link";
+    btn.textContent = msg;
+    setTimeout(() => {
+      btn.textContent = orig;
+    }, 1500);
+  };
+  try {
+    await navigator.clipboard.writeText(url);
+    done("Copied!");
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      done("Copied!");
+    } catch {
+      setStatus("Copy failed — right-click the URL text to copy manually.");
+      done("Copy link");
+    }
   }
 }
 
@@ -280,32 +659,75 @@ async function handleStartDownload(
     return;
   }
   btn.disabled = true;
-  try {
-    const res = await withTimeout(
-      chrome.runtime.sendMessage({
-        type: "START_DOWNLOAD",
-        tabId: currentTabId,
-        itemUrl: item.url,
-        variantId,
-      }),
-      15000,
-      "Starting download",
-    );
-    if (!res?.ok) {
-      setStatus(`Download failed: ${res?.error ?? "unknown error"}`);
-      btn.disabled = false;
+  // Preferred path: background worker (tracks jobs, offscreen for HLS/DASH).
+  if (workerAlive && currentTabId != null) {
+    try {
+      const res = await withTimeout(
+        chrome.runtime.sendMessage({
+          type: "START_DOWNLOAD",
+          tabId: currentTabId,
+          itemUrl: item.url,
+          variantId,
+        }),
+        15000,
+        "Starting download",
+      );
+      if (!res?.ok) {
+        // Worker knows the item but refused (e.g. DRM, unknown variant):
+        // surface its reason, but still allow the direct fallback below
+        // when the worker simply doesn't know this page-found URL.
+        const reason: string = res?.error ?? "unknown error";
+        if (workerAlive && isDirect(item) && /no longer listed|Unknown message/i.test(reason)) {
+          await downloadDirectFallback(item, btn);
+          return;
+        }
+        setStatus(`Download failed: ${reason}`);
+        btn.disabled = false;
+        return;
+      }
+      const job = res.job as DownloadJobState;
+      jobs = [job, ...jobs.filter((j) => j.jobId !== job.jobId)];
+      if (item.type === "hls" || item.type === "dash") {
+        setStatus(`Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`);
+      } else {
+        setStatus("Download started.");
+      }
+      refreshCard(item.url);
       return;
+    } catch (err) {
+      // Worker call failed — fall through to the direct fallback.
+      workerAlive = false;
+      void err;
     }
-    const job = res.job as DownloadJobState;
-    jobs = [job, ...jobs.filter((j) => j.jobId !== job.jobId)];
-    if (item.type === "hls" || item.type === "dash") {
-      setStatus(`Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`);
-    } else {
-      setStatus("Download started.");
+  }
+  // Fallback path (worker unreachable): direct files need no worker —
+  // the popup can hand the URL to chrome.downloads itself.
+  if (isDirect(item)) {
+    await downloadDirectFallback(item, btn);
+    return;
+  }
+  setStatus("Download failed: background worker isn't answering (needed for HLS/DASH). Reload the extension and retry.");
+  btn.disabled = false;
+}
+
+/** Worker-independent download for direct files. */
+async function downloadDirectFallback(item: MediaItem, btn: HTMLButtonElement): Promise<void> {
+  try {
+    await chrome.downloads.download({
+      url: item.url,
+      filename: item.filename || filenameForUrl(item.url, item.type),
+      saveAs: false,
+    });
+    setStatus("Download started.");
+    const card = listEl.querySelector(`[data-item-url="${CSS.escape(item.url)}"]`);
+    const prog = card?.querySelector(".progress") as HTMLElement | null;
+    if (prog) {
+      prog.hidden = false;
+      prog.textContent = "Done — check your downloads folder.";
     }
-    refreshCard(item.url);
   } catch (err) {
     setStatus(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
     btn.disabled = false;
   }
 }
@@ -329,6 +751,7 @@ rescanBtn.onclick = () => {
       const t = await activeTab();
       currentTabId = t.id;
       currentHost = t.host;
+      currentUrl = t.url;
     }
     if (currentTabId == null) {
       setStatus("No active tab found.");

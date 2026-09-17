@@ -76,6 +76,7 @@ export function parseHlsManifest(
 /**
  * Extract ordered segment URLs from a *media* playlist for download.
  * Call with the text of the chosen variant's playlist.
+ * Prepends fMP4 init segments (#EXT-X-MAP) so fragmented-MP4 HLS plays.
  */
 export function extractHlsSegments(
   variantPlaylistText: string,
@@ -88,9 +89,24 @@ export function extractHlsSegments(
   const manifest = parser.manifest as any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const segments: any[] = manifest?.segments ?? [];
-  return segments
-    .map((s) => safeResolve(s?.uri, variantPlaylistUrl))
-    .filter((u): u is string => Boolean(u));
+  const out: string[] = [];
+  const seenMaps = new Set<string>();
+  for (const s of segments) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mapUri: unknown = (s as any)?.map?.resolvedUri ?? (s as any)?.map?.uri;
+    if (typeof mapUri === "string" && mapUri.length > 0) {
+      const abs = safeResolve(mapUri, variantPlaylistUrl);
+      if (!seenMaps.has(abs)) {
+        seenMaps.add(abs);
+        out.push(abs);
+      }
+    }
+  }
+  for (const s of segments) {
+    const abs = safeResolve(s?.uri, variantPlaylistUrl);
+    if (abs) out.push(abs);
+  }
+  return out;
 }
 
 function safeResolve(maybeRelative: unknown, base: string): string {

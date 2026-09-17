@@ -21,13 +21,16 @@ export function filenameForUrl(url: string, type: string): string {
   try {
     const u = new URL(url);
     const last = u.pathname.split("/").pop() || "";
-    if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(last)) {
+    if (/\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|flv|f4v|wmv|mpg|mpeg|3gp|3g2)$/i.test(last)) {
       return sanitizeFilename(last, `video-${ts}.mp4`);
     }
   } catch {
     /* fall through */
   }
-  const ext = type === "webm" ? "webm" : type === "mov" ? "mov" : "mp4";
+  const lowerType = type.toLowerCase();
+  const ext = ["webm", "ogg", "mov", "mkv", "avi", "flv", "wmv", "mpg"].includes(lowerType)
+    ? lowerType
+    : "mp4";
   return `video-${ts}.${ext}`;
 }
 
@@ -39,26 +42,91 @@ export async function downloadDirect(
   await chrome.downloads.download({ url, filename, saveAs: false });
 }
 
-async function fetchBuffer(url: string): Promise<ArrayBuffer> {
-  const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error(`Segment fetch failed (${res.status}): ${url}`);
-  return res.arrayBuffer();
+export const MAX_SEGMENTS = 2000;
+export const MAX_BYTES = 1_500_000_000; // 1.5 GB safety cap
+const FETCH_CONCURRENCY = 5;
+const FETCH_RETRIES = 3;
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("Download cancelled.");
+}
+
+async function fetchBuffer(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  throwIfAborted(signal);
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= FETCH_RETRIES; attempt++) {
+    try {
+      const res = await fetch(url, { credentials: "include", signal });
+      if (!res.ok) throw new Error(`Segment fetch failed (${res.status}): ${url}`);
+      return await res.arrayBuffer();
+    } catch (err) {
+      if (signal?.aborted) throw new Error("Download cancelled.");
+      lastErr = err;
+      if (attempt < FETCH_RETRIES) {
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`Segment fetch failed: ${url}`);
+}
+
+/** Bounded parallel fetch that preserves segment order for concat. */
+async function fetchAllOrdered(
+  urls: string[],
+  mime: string,
+  onProgress?: ProgressCallback,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  if (urls.length === 0) throw new Error("No segments to download.");
+  if (urls.length > MAX_SEGMENTS) {
+    throw new Error(
+      `Playlist lists ${urls.length} segments (likely a live stream) — only bounded videos up to ${MAX_SEGMENTS} segments are supported.`,
+    );
+  }
+  const total = urls.length;
+  const parts: ArrayBuffer[] = new Array(total);
+  let done = 0;
+  let bytes = 0;
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      throwIfAborted(signal);
+      const i = next++;
+      if (i >= total) return;
+      const buf = await fetchBuffer(urls[i], signal);
+      parts[i] = buf;
+      bytes += buf.byteLength;
+      if (bytes > MAX_BYTES) {
+        throw new Error("Video exceeds the 1.5 GB safety cap — download stopped.");
+      }
+      done++;
+      onProgress?.(done, total);
+    }
+  };
+  const pool = Math.min(FETCH_CONCURRENCY, total);
+  await Promise.all(Array.from({ length: pool }, () => worker()));
+  throwIfAborted(signal);
+  return new Blob(parts, { type: mime });
 }
 
 /**
- * HLS download: fetch every segment of the chosen variant in order,
+ * HLS assembly: fetch every segment of the chosen variant in order,
  * concatenate into a single Blob (video/mp2t). No remuxing — the .ts
- * plays in VLC and most players. Must run in a document context with
- * DOM APIs (popup or offscreen document) — NOT in the service worker,
- * which can't reliably hold blob: URLs.
+ * plays in VLC and most players. Pure bytes-in/Blob-out: must run in a
+ * document context with DOM APIs (offscreen document) — NOT in the
+ * service worker. The caller (service worker) performs the actual
+ * chrome.downloads.download(), because offscreen documents only have
+ * the chrome.runtime API.
  */
-export async function downloadHlsVariant(
+export async function assembleHlsBlob(
   variantPlaylistUrl: string,
-  filename: string,
   onProgress?: ProgressCallback,
-): Promise<void> {
+  signal?: AbortSignal,
+): Promise<Blob> {
+  throwIfAborted(signal);
   const playlistRes = await fetch(variantPlaylistUrl, {
     credentials: "include",
+    signal,
   });
   if (!playlistRes.ok)
     throw new Error(
@@ -75,40 +143,36 @@ export async function downloadHlsVariant(
   if (segmentUrls.length === 0)
     throw new Error("No segments found in the HLS variant playlist.");
 
-  const parts: ArrayBuffer[] = [];
-  for (let i = 0; i < segmentUrls.length; i++) {
-    parts.push(await fetchBuffer(segmentUrls[i]));
-    onProgress?.(i + 1, segmentUrls.length);
-  }
-  const blob = new Blob(parts, { type: "video/mp2t" });
-  const blobUrl = URL.createObjectURL(blob);
-  try {
-    await chrome.downloads.download({ url: blobUrl, filename, saveAs: false });
-  } finally {
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-  }
+  // 5-way parallel fetch, order preserved for concat; retries + caps inside.
+  return fetchAllOrdered(segmentUrls, "video/mp2t", onProgress, signal);
 }
 
-/** DASH download: same concat approach over the parsed variant's segments. */
-export async function downloadDashVariant(
+/** DASH assembly: same concat approach over the parsed variant's segments. */
+export async function assembleDashBlob(
   segmentUrls: string[],
-  filename: string,
   onProgress?: ProgressCallback,
-): Promise<void> {
+  signal?: AbortSignal,
+): Promise<Blob> {
   if (segmentUrls.length === 0)
     throw new Error("No segments listed for this DASH variant.");
-  const parts: ArrayBuffer[] = [];
-  for (let i = 0; i < segmentUrls.length; i++) {
-    parts.push(await fetchBuffer(segmentUrls[i]));
-    onProgress?.(i + 1, segmentUrls.length);
-  }
   // DASH segments are typically fragmented MP4; concat preserves playability
   // for many players without a full remux (stretch goal, not v1).
-  const blob = new Blob(parts, { type: "video/mp4" });
-  const blobUrl = URL.createObjectURL(blob);
-  try {
-    await chrome.downloads.download({ url: blobUrl, filename, saveAs: false });
-  } finally {
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-  }
+  return fetchAllOrdered(segmentUrls, "video/mp4", onProgress, signal);
+}
+
+/** Blob -> base64 data URL for transfer to the service worker. */
+export function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    try {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Failed to encode download file."));
+      reader.onload = () => {
+        if (typeof reader.result === "string") resolve(reader.result);
+        else reject(new Error("Failed to encode download file."));
+      };
+      reader.readAsDataURL(blob);
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
 }

@@ -1,30 +1,30 @@
 # Video Download Grabber (local-only MV3 extension)
 
-Detect playable video on the current tab and download it locally — no backend, no third-party calls.
+Detect playable video on any tab and download it locally — no backend, no third-party calls.
 
 ## What it does
 
-- Background service worker watches `webRequest` for direct video (`mp4/webm/ogg/mov`), HLS (`.m3u8`), DASH (`.mpd`).
-- Fetches + parses HLS/DASH manifests client-side (`m3u8-parser`, `mpd-parser`), lists quality variants.
-- Refuses DRM cleanly (HLS `#EXT-X-KEY` METHOD != NONE, DASH `<ContentProtection>`) — never fetches/decrypts protected segments.
-- Content script watches the page continuously (MutationObserver, so SPA feeds like X/Twitter are covered), reports `<video>` elements, posters, and direct URLs the network layer may have missed (cached media).
-- Downloads run through an **offscreen document**: HLS/DASH segment fetch + concat (`.ts` for HLS since no remux; DASH concat as `.mp4`) keeps going **after the popup closes**. Reopen the popup anytime to see live progress (`Downloading… n/m segments`), Done, or error state. Direct files go straight through `chrome.downloads`.
+- **Works anywhere**: `<all_urls>` host + content-script coverage (all frames), so feeds, embeds, and players on any site are detected. (Chrome will show a broad-access warning at install — that access is what lets it see video traffic; everything stays local.)
+- **Many video types**: direct `mp4/m4v/webm/ogv/mov/mkv/avi/flv/wmv/mpg/3gp` (by URL and by `content-type`), HLS (`.m3u8`, incl. fMP4 with `#EXT-X-MAP` init segments), DASH (`.mpd`, incl. init segments). Raw `.ts`/octet-stream chunks are deliberately *not* listed (they're stream fragments — the playlist item covers them).
+- **Refuses DRM cleanly** (HLS `#EXT-X-KEY` METHOD != NONE, DASH `<ContentProtection>`) — never fetches/decrypts protected segments. Blob/MSE player buffers are shown with an explanation, not a dead button.
+- **Resilient detection**: network layer (`webRequest`) + continuous page scan (MutationObserver, shadow DOM, same-origin iframes, report-on-play). Auth-walled manifests fall back to a page-context fetch (page cookie jar) when the worker gets 401/403.
+- **Background downloads**: an offscreen document fetches segments (**5 parallel**, per-segment **retries**, 2000-segment / 1.5 GB safety caps) and assembles the file; the service worker saves it. Popup can close — progress (`Fetching… n/m` → `Assembling…` → `Saving…`) persists and live-updates on reopen. HLS/DASH jobs are **cancellable**. Output extension is sniffed from bytes (`.ts` vs `.mp4`), not guessed.
+- **Popup extras**: quality dropdowns, per-card **Copy link** (works even with the worker down; direct files can also download worker-free), resolution/duration/playing metadata, newest-first list, and a worker-independent page scan so an empty worker never means an empty popup.
 
-## Load unpacked in Chrome
+## Load unpacked in Chrome/Brave
 
 1. `npm install`
 2. `npm run build`
-3. Open `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select `dist/` (after build).
-4. Test:
-   - Direct MP4: any page under `interactive-examples.mdn.mozilla.net` serving `flower.mp4`.
-   - HLS: `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`.
-   - DASH: `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd`.
-   - X/Twitter feed (`x.com`): scroll until a video plays, open the popup, hit **Rescan** if needed. Note: feed players often use blob/MSE buffers — the extension surfaces the underlying network file (e.g. `video.twimg.com` MP4/HLS) once it loads; pure blob entries are shown with an explanation, not a dead button.
-5. Click the extension icon → pick quality → Download. You can close the popup — the download continues in the background.
+3. Open `chrome://extensions` (or `brave://extensions`) → enable **Developer mode** → **Load unpacked** → select `dist/` (after build). Confirm version **0.3.0**.
+4. **Reload the web page's tab** after installing/updating (content scripts only inject into fresh loads).
+5. Test: MDN `flower.mp4` (direct), `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8` (HLS master), `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd` (DASH), any X/Twitter feed video.
+6. Click the extension icon → pick quality → Download. You can close the popup.
+
+If the popup ever reports the worker unreachable: use **Reload extension now**, reopen — and if it persists, `chrome://extensions` → Developer mode → this extension → **Service worker** shows its log.
 
 ## Permissions
 
-`activeTab, webRequest, downloads, storage, scripting, offscreen` + `host_permissions` for the test sites plus `x.com`, `*.x.com`, `twitter.com`, `*.twitter.com`, `*.twimg.com`. No `<all_urls>`, no YouTube-specific logic, no remote servers.
+`activeTab, webRequest, downloads, storage, scripting, offscreen, clipboardWrite` + `<all_urls>` hosts. No YouTube-specific logic, no remote servers.
 
 ## Scripts
 

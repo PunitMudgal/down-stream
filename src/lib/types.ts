@@ -3,6 +3,11 @@ export type MediaType =
   | "webm"
   | "ogg"
   | "mov"
+  | "mkv"
+  | "avi"
+  | "flv"
+  | "wmv"
+  | "mpg"
   | "hls"
   | "dash"
   | "blob"
@@ -32,10 +37,13 @@ export interface MediaItem {
   variants?: Variant[];
   poster?: string;
   pageTitle?: string;
+  /** Short human line, e.g. "1280×720 • 0:34 • playing". */
+  meta?: string;
   error?: string;
 }
 
 export type RuntimeMessage =
+  | { type: "PING" }
   | { type: "GET_MEDIA"; tabId: number }
   | { type: "RESCAN"; tabId: number }
   | {
@@ -52,10 +60,19 @@ export type RuntimeMessage =
       variantId?: string;
     }
   | { type: "GET_JOBS"; tabId: number }
+  | { type: "CANCEL_JOB"; jobId: string }
+  | { type: "OFFSCREEN_CANCEL"; jobId: string }
+  | { type: "FETCH_TEXT"; tabId: number; url: string }
   // --- Offscreen <-> background ---
   | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
   | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number }
-  | { type: "DOWNLOAD_DONE"; jobId: string; downloadId?: number }
+  | { type: "JOB_STAGE"; jobId: string; stage: DownloadJobStage }
+  | {
+      type: "DOWNLOAD_BLOB";
+      jobId: string;
+      dataUrl: string;
+      filename: string;
+    }
   | { type: "DOWNLOAD_ERROR"; jobId: string; error: string }
   | { type: "JOB_UPDATED"; job: DownloadJobState };
 
@@ -88,6 +105,8 @@ export type DownloadJobStatus =
   | "done"
   | "error";
 
+export type DownloadJobStage = "fetching" | "assembling" | "saving";
+
 export interface DownloadJobState {
   jobId: string;
   tabId: number;
@@ -97,6 +116,8 @@ export interface DownloadJobState {
   status: DownloadJobStatus;
   done: number;
   total: number;
+  stage?: DownloadJobStage;
+  downloadId?: number;
   error?: string;
   updatedAt: number;
 }

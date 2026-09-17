@@ -1,6 +1,6 @@
 import { parseHlsManifest } from "./lib/parseHls";
 import { parseDashManifest } from "./lib/parseDash";
-import { filenameForUrl } from "./lib/download";
+import { downloadDirect, filenameForUrl } from "./lib/download";
 import type {
   DownloadJobRequest,
   DownloadJobState,
@@ -23,13 +23,20 @@ function newJobId(): string {
   return `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function readSessionKey<T>(key: string, fallback: T): Promise<T> {
+async function readSessionKey<T>(key: string, fallback: T, ms = 2500): Promise<T> {
+  // Never let a slow/unavailable storage backend hang a popup response:
+  // race the read against a timeout and fall back to memory/empty.
   try {
-    const got = await chrome.storage.session.get(key);
-    const val = got[key];
+    const got = await Promise.race([
+      chrome.storage.session.get(key),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("storage read timeout")), ms),
+      ),
+    ]);
+    const val = (got as Record<string, unknown>)[key];
     if (val && typeof val === "object") return val as T;
   } catch {
-    /* storage.session unavailable — fall back to memory only */
+    /* storage.session unavailable or slow — fall back to memory only */
   }
   return fallback;
 }
@@ -130,6 +137,10 @@ async function updateBadgeForActiveTab(): Promise<void> {
   }
 }
 
+const DIRECT_TYPES = new Set([
+  "mp4", "webm", "ogg", "mov", "mkv", "avi", "flv", "wmv", "mpg",
+]);
+
 function classify(url: string, contentType: string): MediaType | null {
   const ct = contentType.toLowerCase().split(";")[0].trim();
   const lower = url.toLowerCase().split("?")[0].split("#")[0];
@@ -137,17 +148,45 @@ function classify(url: string, contentType: string): MediaType | null {
   if (lower.endsWith(".m3u8") || ct === "application/vnd.apple.mpegurl" || ct === "application/x-mpegurl")
     return "hls";
   if (lower.endsWith(".mpd") || ct === "application/dash+xml") return "dash";
+  if (lower.endsWith(".ism/manifest") || lower.endsWith(".ism/manifest(format=mpd-time-csf)")) return "dash";
   if (url.startsWith("blob:")) return "blob";
   if (ct === "video/mp4") return "mp4";
   if (ct === "video/webm") return "webm";
   if (ct === "video/ogg") return "ogg";
   if (ct === "video/quicktime") return "mov";
+  if (ct === "video/x-matroska") return "mkv";
+  if (ct === "video/x-msvideo" || ct === "video/avi") return "avi";
+  if (ct === "video/x-flv") return "flv";
+  if (ct === "video/x-ms-wmv") return "wmv";
+  if (ct === "video/mpeg" || ct === "video/mp2v") return "mpg";
   // NOTE: video/mp2t and octet-stream are segment/chunk types — never items.
   if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "mp4";
   if (lower.endsWith(".webm")) return "webm";
   if (lower.endsWith(".ogv") || lower.endsWith(".ogg")) return "ogg";
   if (lower.endsWith(".mov")) return "mov";
+  if (lower.endsWith(".mkv")) return "mkv";
+  if (lower.endsWith(".avi")) return "avi";
+  if (lower.endsWith(".flv") || lower.endsWith(".f4v")) return "flv";
+  if (lower.endsWith(".wmv")) return "wmv";
+  if (lower.endsWith(".mpg") || lower.endsWith(".mpeg") || lower.endsWith(".m2v")) return "mpg";
+  if (lower.endsWith(".3gp") || lower.endsWith(".3g2")) return "mp4";
   return null;
+}
+
+/** "1280×720 • 0:34 • playing" from a content-script signal. */
+export function describeSignal(v: VideoSignal): string | undefined {
+  const parts: string[] = [];
+  if (v.width && v.height) parts.push(`${v.width}×${v.height}`);
+  if (v.duration != null && Number.isFinite(v.duration) && v.duration > 0) {
+    const s = Math.floor(v.duration);
+    parts.push(
+      s >= 3600
+        ? `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
+        : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`,
+    );
+  }
+  if (v.paused === false) parts.push("playing");
+  return parts.length ? parts.join(" • ") : undefined;
 }
 
 function headerValue(
@@ -195,12 +234,53 @@ async function patchItem(
   await updateBadge(tabId);
 }
 
+const MAX_MANIFEST_BYTES = 5_000_000;
+
+async function fetchManifestText(tabId: number, url: string): Promise<string> {
+  // First try from the worker (fast path, no tab involvement).
+  try {
+    const res = await fetch(url, { credentials: "include" });
+    if (res.ok) return await res.text();
+    if (res.status !== 401 && res.status !== 403) {
+      throw new Error(`Manifest fetch failed (${res.status})`);
+    }
+    // 401/403: fall through to the page-context fetch below.
+  } catch (err) {
+    // Network-level failure from the worker context — page fetch may still work.
+    if (err instanceof Error && err.message.startsWith("Manifest fetch failed")) throw err;
+  }
+  // Auth-walled manifests (logged-in sessions, HttpOnly cookies): refetch
+  // from the tab's content script, which runs with the page's cookie jar.
+  try {
+    const res = await Promise.race([
+      chrome.tabs.sendMessage(tabId, { type: "FETCH_TEXT", url }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("page fetch timeout")), 15000),
+      ),
+    ]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const r = res as any;
+    if (r?.ok && typeof r.text === "string") {
+      if (r.truncated) {
+        throw new Error("Manifest too large to parse (>5 MB).");
+      }
+      return r.text as string;
+    }
+    throw new Error(r?.error ?? "Page-context fetch failed.");
+  } catch (err) {
+    throw new Error(
+      `Manifest unreachable (worker + page fetch failed): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 async function parseStreamingItem(tabId: number, item: MediaItem): Promise<void> {
   try {
-    const res = await fetch(item.url, { credentials: "include" });
-    if (!res.ok) throw new Error(`Manifest fetch failed (${res.status})`);
+    const text = await fetchManifestText(tabId, item.url);
+    if (text.length > MAX_MANIFEST_BYTES) {
+      throw new Error("Manifest too large to parse (>5 MB).");
+    }
     if (item.type === "hls") {
-      const text = await res.text();
       const parsed = parseHlsManifest(text, item.url);
       await patchItem(tabId, item.url, {
         variants: parsed.variants,
@@ -208,7 +288,6 @@ async function parseStreamingItem(tabId: number, item: MediaItem): Promise<void>
         drmReason: parsed.drmReason,
       });
     } else if (item.type === "dash") {
-      const text = await res.text();
       const parsed = parseDashManifest(text, item.url);
       await patchItem(tabId, item.url, {
         variants: parsed.variants,
@@ -256,52 +335,94 @@ function onHeadersReceived(
   return undefined;
 }
 
-// ---- wiring ----
-chrome.webRequest.onHeadersReceived.addListener(
-  onHeadersReceived,
-  { urls: ["http://*/*", "https://*/*"] },
-  ["responseHeaders"],
-);
+// ---- startup ----
+// PING listener registers FIRST, before anything else that could throw
+// during startup on some Chromium variants. It answers synchronously with
+// zero dependencies, so the popup can always tell "worker alive" apart
+// from "worker stuck". (The main listener below handles every other type;
+// it deliberately skips PING to avoid a double response.)
+try {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ((msg as any)?.type === "PING") {
+      try {
+        sendResponse({ pong: true });
+      } catch {
+        /* ignore */
+      }
+    }
+    return false;
+  });
+} catch {
+  /* prehistoric browser — the main listener below still tries */
+}
+
+// ---- wiring (each guarded: one blocked API must never kill the worker) ----
+function safeWire(label: string, fn: () => void): void {
+  try {
+    fn();
+  } catch (err) {
+    console.warn(`[vdg] listener '${label}' unavailable:`, err);
+  }
+}
+
+safeWire("webRequest", () => {
+  chrome.webRequest.onHeadersReceived.addListener(
+    onHeadersReceived,
+    { urls: ["http://*/*", "https://*/*"] },
+    ["responseHeaders"],
+  );
+});
 
 // New page load = stale detections.
-chrome.webNavigation.onCommitted.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  lastUrlByTab.set(details.tabId, details.url);
-  await persistTab(details.tabId, []);
-  await updateBadge(details.tabId);
+safeWire("webNavigation.committed", () => {
+  chrome.webNavigation.onCommitted.addListener(async (details) => {
+    if (details.frameId !== 0) return;
+    lastUrlByTab.set(details.tabId, details.url);
+    await persistTab(details.tabId, []);
+    await updateBadge(details.tabId);
+  });
 });
 
 // SPA navigation (X/Twitter feed -> tweet detail etc.): new URL = stale detections.
-chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  const prev = lastUrlByTab.get(details.tabId);
-  if (prev && new URL(prev).pathname !== new URL(details.url).pathname) {
-    await persistTab(details.tabId, []);
-    await updateBadge(details.tabId);
-  }
-  lastUrlByTab.set(details.tabId, details.url);
+safeWire("webNavigation.history", () => {
+  chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
+    try {
+      if (details.frameId !== 0) return;
+      const prev = lastUrlByTab.get(details.tabId);
+      if (prev && new URL(prev).pathname !== new URL(details.url).pathname) {
+        await persistTab(details.tabId, []);
+        await updateBadge(details.tabId);
+      }
+      lastUrlByTab.set(details.tabId, details.url);
+    } catch {
+      /* malformed URLs etc. must never break the worker */
+    }
+  });
 });
 
-chrome.tabs.onActivated.addListener((info) => {
-  void updateBadge(info.tabId);
-});
+safeWire("tabs", () => {
+  chrome.tabs.onActivated.addListener((info) => {
+    void updateBadge(info.tabId);
+  });
 
-chrome.tabs.onUpdated.addListener((_tabId, info, tab) => {
-  if (info.status === "complete" && tab.url && tab.id != null) {
-    lastUrlByTab.set(tab.id, tab.url);
-  }
-});
+  chrome.tabs.onUpdated.addListener((_tabId, info, tab) => {
+    if (info.status === "complete" && tab.url && tab.id != null) {
+      lastUrlByTab.set(tab.id, tab.url);
+    }
+  });
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  memoryStore.delete(tabId);
-  lastUrlByTab.delete(tabId);
-  try {
-    const all = await readSessionKey<Record<string, MediaItem[]>>(SESSION_KEY, {});
-    delete all[String(tabId)];
-    await chrome.storage.session.set({ [SESSION_KEY]: all });
-  } catch {
-    /* ignore */
-  }
+  chrome.tabs.onRemoved.addListener(async (tabId) => {
+    memoryStore.delete(tabId);
+    lastUrlByTab.delete(tabId);
+    try {
+      const all = await readSessionKey<Record<string, MediaItem[]>>(SESSION_KEY, {});
+      delete all[String(tabId)];
+      await chrome.storage.session.set({ [SESSION_KEY]: all });
+    } catch {
+      /* ignore */
+    }
+  });
 });
 
 // Enrichment from content script: attach posters, surface blob: videos,
@@ -313,17 +434,24 @@ async function handleVideoSignals(
 ): Promise<void> {
   const items = await getTabItems(tabId);
   let changed = false;
-  const touch = (url: string, poster?: string) => {
+  const touch = (url: string, v: VideoSignal) => {
     const match = items.find(
       (x) => x.url === url || x.url.split("?")[0] === url.split("?")[0],
     );
-    if (match && poster && !match.poster) {
-      match.poster = poster;
+    if (!match) return;
+    if (v.poster && !match.poster) {
+      match.poster = v.poster;
+      changed = true;
+    }
+    const meta = describeSignal(v);
+    if (meta && !match.meta) {
+      match.meta = meta;
       changed = true;
     }
   };
 
   for (const v of videos) {
+    const meta = describeSignal(v);
     const candidates = [v.currentSrc, ...(v.candidates ?? [])].filter(Boolean);
     for (const src of candidates) {
       if (!src || src.startsWith("data:")) continue;
@@ -339,12 +467,19 @@ async function handleVideoSignals(
             drmProtected: false,
             poster: v.poster,
             pageTitle,
+            meta,
             error: "Blob/MSE stream (in-player buffer) — the downloadable file is captured from the network when it loads. Try playing, then Rescan.",
           });
           changed = true;
-        } else if (v.poster && !existing.poster) {
-          existing.poster = v.poster;
-          changed = true;
+        } else {
+          if (v.poster && !existing.poster) {
+            existing.poster = v.poster;
+            changed = true;
+          }
+          if (meta && !existing.meta) {
+            existing.meta = meta;
+            changed = true;
+          }
         }
         continue;
       }
@@ -362,14 +497,15 @@ async function handleVideoSignals(
             variants: [],
             poster: v.poster,
             pageTitle,
+            meta,
           };
           items.push(item);
           changed = true;
           void parseStreamingItem(tabId, item);
         } else {
-          touch(src, v.poster);
+          touch(src, v);
         }
-      } else if (type === "mp4" || type === "webm" || type === "ogg" || type === "mov") {
+      } else if (type && DIRECT_TYPES.has(type)) {
         // Direct file the network listener missed (cached before install etc.)
         if (!items.some((x) => x.url === src || x.url.split("?")[0] === src.split("?")[0])) {
           items.push({
@@ -381,13 +517,14 @@ async function handleVideoSignals(
             drmProtected: false,
             poster: v.poster,
             pageTitle,
+            meta,
           });
           changed = true;
         } else {
-          touch(src, v.poster);
+          touch(src, v);
         }
       } else {
-        touch(src, v.poster);
+        touch(src, v);
       }
     }
   }
@@ -398,14 +535,33 @@ async function handleVideoSignals(
 }
 
 // ---- Offscreen download orchestration (survives popup close) ----
-async function ensureOffscreen(): Promise<void> {
+// The offscreen document (runtime API only) assembles segment bytes;
+// the worker performs the actual chrome.downloads.download(), which
+// offscreen documents cannot call.
+async function offscreenExists(): Promise<boolean> {
   try {
+    // Preferred API (Chrome 116+).
+    const rt = chrome.runtime as typeof chrome.runtime & {
+      getContexts?: (filter: object) => Promise<Array<unknown>>;
+    };
+    if (typeof rt.getContexts === "function") {
+      const contexts = await rt.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+        documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
+      });
+      return contexts.length > 0;
+    }
     if (typeof chrome.offscreen?.hasDocument === "function") {
-      if (await chrome.offscreen.hasDocument()) return;
+      return await chrome.offscreen.hasDocument();
     }
   } catch {
     /* fall through to create */
   }
+  return false;
+}
+
+async function ensureOffscreen(): Promise<void> {
+  if (await offscreenExists()) return;
   try {
     await chrome.offscreen.createDocument({
       url: chrome.runtime.getURL(OFFSCREEN_URL),
@@ -423,7 +579,7 @@ async function maybeCloseOffscreen(): Promise<void> {
   const running = [...jobMemory.values()].some((j) => j.status === "running");
   if (running) return;
   try {
-    if (await chrome.offscreen.hasDocument()) {
+    if (await offscreenExists()) {
       await chrome.offscreen.closeDocument();
     }
   } catch {
@@ -473,7 +629,7 @@ async function startDownload(
   if (req.kind === "direct") {
     // Browser handles natively — no offscreen needed, popup may close safely.
     try {
-      await chrome.downloads.download({ url: req.url, filename: req.filename, saveAs: false });
+      await downloadDirect(req.url, req.filename);
       job.status = "done";
       job.done = 1;
     } catch (err) {
@@ -507,14 +663,36 @@ async function startDownload(
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // NOTE: PING is handled by the early listener at the top of this file
+  // (kept out of here to avoid a double sendResponse).
   void (async () => {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const m = msg as any;
       if (m?.type === "GET_MEDIA" && typeof m.tabId === "number") {
-        sendResponse({ items: await getTabItems(m.tabId) });
+        // Fast path first: memory answers instantly; session read is
+        // internally timeout-guarded and can never hang this response.
+        const mem = memoryStore.get(m.tabId);
+        sendResponse({ items: mem ?? (await getTabItems(m.tabId)) });
       } else if (m?.type === "GET_JOBS" && typeof m.tabId === "number") {
         sendResponse({ jobs: await getTabJobs(m.tabId) });
+      } else if (m?.type === "CANCEL_JOB" && typeof m.jobId === "string") {
+        await ensureJobsLoaded();
+        const job = jobMemory.get(m.jobId);
+        if (job && job.status === "running") {
+          // Ask the offscreen document to abort; it reports back via
+          // DOWNLOAD_ERROR("Download cancelled.") which finalizes the job.
+          try {
+            await chrome.runtime.sendMessage({ type: "OFFSCREEN_CANCEL", jobId: m.jobId });
+          } catch {
+            job.status = "error";
+            job.error = "Download cancelled.";
+            await upsertJob(job);
+          }
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: "Job is not running." });
+        }
       } else if (m?.type === "START_DOWNLOAD" && typeof m.tabId === "number" && typeof m.itemUrl === "string") {
         try {
           const job = await startDownload(m.tabId, m.itemUrl, m.variantId);
@@ -535,12 +713,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await upsertJob(job, false);
         }
         sendResponse({ ok: true });
-      } else if (m?.type === "DOWNLOAD_DONE" && typeof m.jobId === "string") {
+      } else if (m?.type === "JOB_STAGE" && typeof m.jobId === "string") {
+        await ensureJobsLoaded();
+        const job = jobMemory.get(m.jobId);
+        if (job && (m.stage === "fetching" || m.stage === "assembling" || m.stage === "saving")) {
+          job.stage = m.stage;
+          await upsertJob(job, false);
+        }
+        sendResponse({ ok: true });
+      } else if (m?.type === "DOWNLOAD_BLOB" && typeof m.jobId === "string") {
+        // Final handoff: the worker (full API access) saves the file the
+        // offscreen document assembled. data: URLs work with downloads.
         await ensureJobsLoaded();
         const job = jobMemory.get(m.jobId);
         if (job) {
-          job.status = "done";
-          job.done = job.total || job.done;
+          if (typeof m.dataUrl !== "string" || !m.dataUrl.startsWith("data:")) {
+            job.status = "error";
+            job.error = "Background worker received a corrupt file payload.";
+          } else {
+            try {
+              const downloadId = await chrome.downloads.download({
+                url: m.dataUrl,
+                filename: typeof m.filename === "string" && m.filename ? m.filename : job.filename,
+                saveAs: false,
+              });
+              job.status = "done";
+              job.downloadId = downloadId;
+              job.done = job.total || job.done;
+            } catch (err) {
+              job.status = "error";
+              job.error = err instanceof Error ? err.message : String(err);
+            }
+          }
           await upsertJob(job);
         }
         void maybeCloseOffscreen();
@@ -612,7 +816,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         }
         sendResponse({ ok: true });
-      } else if (m?.type === "JOB_UPDATED" || m?.type === "OFFSCREEN_DOWNLOAD") {
+      } else if (m?.type === "JOB_UPDATED" || m?.type === "OFFSCREEN_DOWNLOAD" || m?.type === "OFFSCREEN_CANCEL") {
         // Broadcast/offscreen traffic not addressed to the worker — ignore.
         sendResponse({ ok: true });
       } else {
@@ -625,5 +829,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // async response
 });
 
-// Initialize badge on SW startup.
-void updateBadgeForActiveTab();
+// Initialize badge on SW startup (never allowed to break startup).
+try {
+  void updateBadgeForActiveTab();
+} catch {
+  /* ignore */
+}

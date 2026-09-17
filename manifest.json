@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Download Grabber (local)",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Detect playable video on the current tab and download it locally. No backend, no third-party calls.",
   "action": {
     "default_popup": "src/popup.html",
@@ -13,29 +13,12 @@
   },
   "content_scripts": [
     {
-      "matches": [
-        "https://test-streams.mux.dev/*",
-        "https://dash.akamaized.net/*",
-        "https://interactive-examples.mdn.mozilla.net/*",
-        "https://x.com/*",
-        "https://*.x.com/*",
-        "https://twitter.com/*",
-        "https://*.twitter.com/*",
-        "https://*.twimg.com/*"
-      ],
+      "matches": ["<all_urls>"],
       "js": ["src/content.ts"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
-  "permissions": ["activeTab", "webRequest", "downloads", "storage", "scripting", "offscreen"],
-  "host_permissions": [
-    "https://test-streams.mux.dev/*",
-    "https://dash.akamaized.net/*",
-    "https://interactive-examples.mdn.mozilla.net/*",
-    "https://x.com/*",
-    "https://*.x.com/*",
-    "https://twitter.com/*",
-    "https://*.twitter.com/*",
-    "https://*.twimg.com/*"
-  ]
+  "permissions": ["activeTab", "webRequest", "downloads", "storage", "scripting", "offscreen", "clipboardWrite"],
+  "host_permissions": ["<all_urls>"]
 }

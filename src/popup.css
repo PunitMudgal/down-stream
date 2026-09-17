@@ -41,6 +41,19 @@ h1 { font-size: 15px; margin: 0; }
   cursor: pointer;
 }
 #rescan:hover { background: var(--accent); color: #fff; }
+button.ghost {
+  width: 100%;
+  margin-top: 6px;
+  padding: 5px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+button.ghost:hover { background: var(--accent); color: #fff; }
+button.ghost:disabled { opacity: 0.5; cursor: not-allowed; }
 #status { color: var(--muted); min-height: 18px; margin-bottom: 8px; }
 #list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
 .card {
