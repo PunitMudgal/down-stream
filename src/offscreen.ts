@@ -7,6 +7,16 @@ import type { DownloadJobRequest, DownloadJobStage } from "./lib/types";
 
 const controllers = new Map<string, AbortController>();
 
+interface CaptureAcc {
+  parts: ArrayBuffer[];
+  received: number;
+  total: number;
+  mime: string;
+  filename: string;
+}
+const captures = new Map<string, CaptureAcc>();
+const cancelledCaptures = new Set<string>();
+
 function report(msg: object): void {
   try {
     void chrome.runtime.sendMessage(msg);
@@ -46,11 +56,103 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const m = msg as any;
   if (m?.type === "OFFSCREEN_CANCEL" && typeof m.jobId === "string") {
     controllers.get(m.jobId)?.abort();
+    captures.delete(m.jobId);
+    cancelledCaptures.add(m.jobId);
     try {
       sendResponse({ ok: true });
     } catch {
       /* ignore */
     }
+    return false;
+  }
+  // ---- MSE capture accumulation (bytes stream in from the content script,
+  // paced one chunk per ack). Finalize reuses the DOWNLOAD_BLOB handoff. ----
+  if (m?.type === "MS_TRACK_START" && typeof m.jobId === "string") {
+    captures.set(m.jobId, {
+      parts: [],
+      received: 0,
+      total: typeof m.total === "number" ? m.total : 0,
+      mime: typeof m.mime === "string" ? m.mime : "video/mp4",
+      filename: typeof m.filename === "string" && m.filename ? m.filename : `capture-${m.jobId}.mp4`,
+    });
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "MS_TRACK_CHUNK" && typeof m.jobId === "string") {
+    const acc = captures.get(m.jobId);
+    if (!acc || cancelledCaptures.has(m.jobId)) {
+      try {
+        sendResponse({ ok: true });
+      } catch {
+        /* ignore */
+      }
+      return false;
+    }
+    if (m.buf instanceof ArrayBuffer) {
+      acc.parts.push(m.buf);
+      acc.received += m.buf.byteLength;
+      report({ type: "DOWNLOAD_PROGRESS", jobId: m.jobId, done: acc.received, total: acc.total });
+    }
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "MS_TRACK_END" && typeof m.jobId === "string") {
+    const acc = captures.get(m.jobId);
+    captures.delete(m.jobId);
+    if (!acc || cancelledCaptures.has(m.jobId)) {
+      cancelledCaptures.delete(m.jobId);
+      try {
+        sendResponse({ ok: true });
+      } catch {
+        /* ignore */
+      }
+      return false;
+    }
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    void (async () => {
+      try {
+        if (!acc.parts.length) throw new Error("Capture arrived empty.");
+        stage(m.jobId, "assembling");
+        const blob = new Blob(acc.parts, { type: acc.mime || "video/mp4" });
+        acc.parts = [];
+        const ext = await sniffExtension(blob, ".mp4");
+        const filename = withExtension(acc.filename, ext);
+        let dataUrl: string;
+        try {
+          dataUrl = await blobToDataUrl(blob);
+        } catch (err) {
+          throw new Error(
+            `Could not encode ${(blob.size / 1_000_000).toFixed(1)} MB capture for transfer: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        stage(m.jobId, "saving");
+        try {
+          await chrome.runtime.sendMessage({ type: "DOWNLOAD_BLOB", jobId: m.jobId, dataUrl, filename });
+        } catch (err) {
+          throw new Error(
+            `Assembled ${(blob.size / 1_000_000).toFixed(1)} MB but the transfer to the background worker failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } catch (err) {
+        report({
+          type: "DOWNLOAD_ERROR",
+          jobId: m.jobId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
     return false;
   }
   if (m?.type !== "OFFSCREEN_DOWNLOAD" || !m.job) return false;
@@ -74,10 +176,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const onProgress = (done: number, total: number) =>
         report({ type: "DOWNLOAD_PROGRESS", jobId: job.jobId, done, total });
       stage(job.jobId, "fetching");
+      const scope = job.netScope;
       const blob =
         job.kind === "hls"
-          ? await assembleHlsBlob(job.url, onProgress, signal)
-          : await assembleDashBlob(job.segments ?? [], onProgress, signal);
+          ? await assembleHlsBlob(job.url, onProgress, signal, scope)
+          : await assembleDashBlob(job.segments ?? [], onProgress, signal, scope);
 
       stage(job.jobId, "assembling");
       const ext = await sniffExtension(blob, job.kind === "hls" ? ".ts" : ".mp4");

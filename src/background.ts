@@ -6,6 +6,8 @@ import type {
   DownloadJobState,
   MediaItem,
   MediaType,
+  MsSessionMeta,
+  NetReplay,
   VideoSignal,
 } from "./lib/types";
 
@@ -237,9 +239,16 @@ async function patchItem(
 const MAX_MANIFEST_BYTES = 5_000_000;
 
 async function fetchManifestText(tabId: number, url: string): Promise<string> {
-  // First try from the worker (fast path, no tab involvement).
+  const net = lookupNet(tabId, url);
+  // First try from the worker (fast path, no tab involvement), replaying
+  // the page's own auth/referrer context where captured.
   try {
-    const res = await fetch(url, { credentials: "include" });
+    const res = await fetch(url, {
+      credentials: "include",
+      headers: net?.headers,
+      referrer: net?.referrer,
+      referrerPolicy: net?.referrer ? "unsafe-url" : undefined,
+    });
     if (res.ok) return await res.text();
     if (res.status !== 401 && res.status !== 403) {
       throw new Error(`Manifest fetch failed (${res.status})`);
@@ -302,6 +311,281 @@ async function parseStreamingItem(tabId: number, item: MediaItem): Promise<void>
   }
 }
 
+// ---- Segment-cluster engine (MSE/blob correlation) ----
+// Blob: URLs are unreachable, but the chunk traffic feeding the player
+// isn't. We track segment-like responses per tab, group them by masked URL
+// pattern, and promote busy groups to downloadable "segments" items.
+const MIN_CLUSTER_URLS = 4;
+const MAX_CLUSTER_URLS = 800;
+const MAX_CLUSTERS_PER_TAB = 12;
+
+interface Cluster {
+  key: string;
+  frameId: number;
+  urls: string[];
+  seen: Set<string>;
+  bytes: number;
+  firstTs: number;
+  lastTs: number;
+  lastPubCount: number;
+  lastPubTs: number;
+}
+
+const clustersByTab = new Map<number, Cluster[]>();
+
+function segPathExt(pathname: string): string | null {
+  const m = /\.([a-z0-9]{2,5})$/.exec(pathname.toLowerCase());
+  return m ? m[1] : null;
+}
+
+/** Cheap sequential-chunk heuristic for non-manifest responses. */
+function looksSequential(url: string): boolean {
+  const path = url.toLowerCase().split("?")[0];
+  if (/(seg|chunk|part|frag|seq|slice|cam|stream)[-_./]?\d/i.test(path)) return true;
+  if (/\d{2,}\.(ts|m4s|m4v|cmfv|cmfa|mp4)/i.test(path)) return true;
+  if (/[?&](seg|seq|part|chunk|index|no|n|counter)=\d+/i.test(url.toLowerCase())) return true;
+  return false;
+}
+
+function isSegmentCandidate(url: string, ct: string, status: number): boolean {
+  if (status < 200 || status >= 300) return false;
+  const path = url.toLowerCase().split("?")[0].split("#")[0];
+  const ext = segPathExt(path);
+  // Raw HLS/DASH chunks by extension — regardless of content-type.
+  if (ext && ["ts", "m4s", "m4v", "cmfv", "cmfa"].includes(ext)) return true;
+  // Range-chunked progressive files (one mp4/webm fetched as many 206s).
+  if (status === 206 && ext && ["mp4", "webm", "m4v"].includes(ext)) return true;
+  if (ct === "video/mp2t") return true;
+  if ((ct.startsWith("video/") || ct === "application/octet-stream") && looksSequential(url)) {
+    return true;
+  }
+  return false;
+}
+
+/** Group key: origin + digit-masked path (keeps extension + structure). */
+function clusterKey(url: string): string | null {
+  try {
+    const u = new URL(url);
+    return `${u.origin} ${u.pathname.replace(/\d+/g, "#")}`;
+  } catch {
+    return null;
+  }
+}
+
+function recordCandidate(
+  tabId: number,
+  frameId: number,
+  url: string,
+  contentType: string,
+  statusCode: number,
+  contentLength = 0,
+): void {
+  const ct = contentType.toLowerCase().split(";")[0].trim();
+  if (!isSegmentCandidate(url, ct, statusCode)) return;
+  const key = clusterKey(url);
+  if (!key) return;
+  let list = clustersByTab.get(tabId);
+  if (!list) {
+    list = [];
+    clustersByTab.set(tabId, list);
+  }
+  let cluster = list.find((c) => c.key === key && c.frameId === frameId);
+  if (!cluster) {
+    // New group; evict the stalest cluster if over budget.
+    if (list.length >= MAX_CLUSTERS_PER_TAB) {
+      list.sort((a, b) => a.lastTs - b.lastTs);
+      list.shift();
+    }
+    cluster = {
+      key,
+      frameId,
+      urls: [],
+      seen: new Set(),
+      bytes: 0,
+      firstTs: Date.now(),
+      lastTs: Date.now(),
+      lastPubCount: 0,
+      lastPubTs: 0,
+    };
+    list.push(cluster);
+  }
+  if (cluster.seen.has(url) || cluster.urls.length >= MAX_CLUSTER_URLS) {
+    cluster.lastTs = Date.now();
+    return;
+  }
+  cluster.seen.add(url);
+  cluster.urls.push(url); // keep signed query params — needed to fetch
+  if (contentLength > 0) cluster.bytes += contentLength;
+  cluster.lastTs = Date.now();
+  void maybePromoteCluster(tabId, cluster);
+}
+
+function clusterBytesLabel(bytes: number): string {
+  if (bytes <= 0) return "";
+  if (bytes < 1_000_000) return `≈${Math.round(bytes / 1000)} KB`;
+  return `≈${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+async function maybePromoteCluster(tabId: number, cluster: Cluster): Promise<void> {
+  if (cluster.urls.length < MIN_CLUSTER_URLS) return;
+  // Throttle republishing: every +8 urls or 10s, whichever first.
+  if (
+    cluster.urls.length - cluster.lastPubCount < 8 &&
+    Date.now() - cluster.lastPubTs < 10_000
+  ) {
+    return;
+  }
+  const items = await getTabItems(tabId);
+  // A known item for the canonical URL already covers this stream.
+  if (items.some((x) => x.url === cluster.urls[0])) return;
+  const existing = items.find((x) => x.type === "segments" && x.url === cluster.urls[0]);
+  const meta = `${cluster.urls.length} segments • auto-grouped from player traffic${cluster.bytes ? ` • ${clusterBytesLabel(cluster.bytes)}` : ""}`;
+  if (existing) {
+    existing.segments = [...cluster.urls];
+    existing.meta = meta;
+    await persistTab(tabId, items);
+  } else {
+    await upsertItem(tabId, {
+      url: cluster.urls[0],
+      tabId,
+      type: "segments",
+      filename: filenameForUrl(cluster.urls[0], "segments"),
+      detectedAt: Date.now(),
+      drmProtected: false,
+      segments: [...cluster.urls],
+      meta,
+    });
+  }
+  cluster.lastPubCount = cluster.urls.length;
+  cluster.lastPubTs = Date.now();
+}
+
+/** A parsed manifest supersedes raw clusters from the same directory. */
+async function dropSupersededClusters(tabId: number, manifestUrl: string): Promise<void> {
+  let dir: string;
+  try {
+    const u = new URL(manifestUrl);
+    dir = u.origin + u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1);
+  } catch {
+    return;
+  }
+  const items = await getTabItems(tabId);
+  const doomed = new Set(
+    items
+      .filter((x) => x.type === "segments" && x.url.startsWith(dir))
+      .map((x) => x.url),
+  );
+  if (!doomed.size) return;
+  await persistTab(
+    tabId,
+    items.filter((x) => !doomed.has(x.url)),
+  );
+  await updateBadge(tabId);
+}
+
+/** Recent cluster in the same frame — the likely source of a blob: URL. */
+function matchCluster(tabId: number, frameId: number | undefined): Cluster | undefined {
+  const list = clustersByTab.get(tabId);
+  if (!list?.length) return undefined;
+  const now = Date.now();
+  const recent = list.filter((c) => now - c.lastTs < 90_000);
+  const sameFrame = frameId != null ? recent.filter((c) => c.frameId === frameId) : [];
+  const pool = sameFrame.length ? sameFrame : recent;
+  return pool.sort((a, b) => b.urls.length - a.urls.length)[0];
+}
+
+// ---- Request-header capture (auth replay for 403-prone fetches) ----
+// Only replayable values are stored (Authorization + custom X-* headers and
+// the page referrer). Cookies are NEVER stored — and couldn't be replayed
+// via fetch() anyway. Memory-only (never persisted), per tab, FIFO-capped.
+const HDR_MAX_PER_TAB = 300;
+
+interface CapturedNet {
+  origin: string;
+  pattern: string;
+  headers: Record<string, string>;
+  referrer?: string;
+}
+
+const hdrStore = new Map<number, Map<string, CapturedNet>>();
+
+function videoishForHeaders(url: string): boolean {
+  if (classify(url, "") !== null) return true;
+  const path = url.toLowerCase().split("?")[0];
+  if (segPathExt(path) && ["ts", "m4s", "m4v", "cmfv", "cmfa"].includes(segPathExt(path)!)) return true;
+  return looksSequential(url);
+}
+
+function onSendHeaders(details: chrome.webRequest.OnSendHeadersDetails): void {
+  const { tabId, url } = details;
+  if (tabId == null || tabId < 0) return;
+  if (!url.startsWith("http://") && !url.startsWith("https://")) return;
+  if (!videoishForHeaders(url)) return;
+  const headers: Record<string, string> = {};
+  let referrer: string | undefined;
+  for (const h of details.requestHeaders ?? []) {
+    const name = h.name.toLowerCase();
+    const value = (h.value ?? "").slice(0, 2048);
+    if (!value) continue;
+    if (name === "authorization") {
+      headers["Authorization"] = value;
+    } else if (name.startsWith("x-") && Object.keys(headers).length < 10) {
+      headers[h.name] = value;
+    } else if (name === "referer") {
+      referrer = value;
+    }
+    // NOTE: cookie/set-cookie and everything else are deliberately skipped.
+  }
+  if (!Object.keys(headers).length && !referrer) return;
+  let origin: string;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    return;
+  }
+  let perTab = hdrStore.get(tabId);
+  if (!perTab) {
+    perTab = new Map();
+    hdrStore.set(tabId, perTab);
+  }
+  perTab.set(url, { origin, pattern: clusterKey(url) ?? url, headers, referrer });
+  while (perTab.size > HDR_MAX_PER_TAB) {
+    const oldest = perTab.keys().next().value as string | undefined;
+    if (!oldest) break;
+    perTab.delete(oldest);
+  }
+}
+
+/**
+ * Replayable net context for a target URL. Auth/custom headers only cross
+ * to the SAME origin they were captured from (no token leakage across
+ * hosts); the page referrer may go anywhere (matches page behavior).
+ */
+function lookupNet(tabId: number, targetUrl: string): NetReplay | undefined {
+  const perTab = hdrStore.get(tabId);
+  if (!perTab?.size) return undefined;
+  let targetOrigin: string;
+  try {
+    targetOrigin = new URL(targetUrl).origin;
+  } catch {
+    return undefined;
+  }
+  const exact = perTab.get(targetUrl);
+  const candidates = exact ? [exact] : [...perTab.values()].reverse();
+  for (const c of candidates) {
+    const patternMatch = exact ? true : c.pattern === clusterKey(targetUrl);
+    if (!patternMatch) continue;
+    const out: NetReplay = {};
+    if (c.origin === targetOrigin && Object.keys(c.headers).length) {
+      out.headers = { ...c.headers };
+    }
+    if (c.referrer) out.referrer = c.referrer;
+    if (out.headers || out.referrer) return out;
+    if (exact) return undefined;
+  }
+  return undefined;
+}
+
 function onHeadersReceived(
   details: chrome.webRequest.OnHeadersReceivedDetails,
 ): chrome.webRequest.BlockingResponse | undefined {
@@ -310,6 +594,11 @@ function onHeadersReceived(
   if (!url.startsWith("http://") && !url.startsWith("https://")) return undefined;
 
   const ct = headerValue(details.responseHeaders, "content-type");
+  // Always feed the segment-cluster engine (cheap prefilter inside) —
+  // this is what catches MSE/blob players via their chunk traffic.
+  const len = Number(headerValue(details.responseHeaders, "content-length") || "0");
+  recordCandidate(tabId, details.frameId ?? 0, url, ct, details.statusCode, Number.isFinite(len) ? len : 0);
+
   const type = classify(url, ct);
   if (!type) return undefined;
 
@@ -329,6 +618,8 @@ function onHeadersReceived(
     if (existing.some((x) => x.url === url)) return;
     await upsertItem(tabId, item);
     if (type === "hls" || type === "dash") {
+      // A parsed manifest replaces raw auto-groups from the same directory.
+      await dropSupersededClusters(tabId, url);
       await parseStreamingItem(tabId, item);
     }
   })();
@@ -366,6 +657,12 @@ function safeWire(label: string, fn: () => void): void {
   }
 }
 
+safeWire("webRequest.send", () => {
+  chrome.webRequest.onSendHeaders.addListener(onSendHeaders, { urls: ["http://*/*", "https://*/*"] }, [
+    "requestHeaders",
+  ]);
+});
+
 safeWire("webRequest", () => {
   chrome.webRequest.onHeadersReceived.addListener(
     onHeadersReceived,
@@ -374,11 +671,13 @@ safeWire("webRequest", () => {
   );
 });
 
-// New page load = stale detections.
+// New page load = stale detections (traffic, headers, items).
 safeWire("webNavigation.committed", () => {
   chrome.webNavigation.onCommitted.addListener(async (details) => {
     if (details.frameId !== 0) return;
     lastUrlByTab.set(details.tabId, details.url);
+    clustersByTab.delete(details.tabId);
+    hdrStore.delete(details.tabId);
     await persistTab(details.tabId, []);
     await updateBadge(details.tabId);
   });
@@ -415,6 +714,8 @@ safeWire("tabs", () => {
   chrome.tabs.onRemoved.addListener(async (tabId) => {
     memoryStore.delete(tabId);
     lastUrlByTab.delete(tabId);
+    clustersByTab.delete(tabId);
+    hdrStore.delete(tabId);
     try {
       const all = await readSessionKey<Record<string, MediaItem[]>>(SESSION_KEY, {});
       delete all[String(tabId)];
@@ -431,6 +732,7 @@ async function handleVideoSignals(
   tabId: number,
   videos: VideoSignal[],
   pageTitle?: string,
+  frameId?: number,
 ): Promise<void> {
   const items = await getTabItems(tabId);
   let changed = false;
@@ -456,6 +758,25 @@ async function handleVideoSignals(
     for (const src of candidates) {
       if (!src || src.startsWith("data:")) continue;
       if (src.startsWith("blob:")) {
+        // If the player feeding this blob: URL has visible chunk traffic in
+        // the same frame, link the poster/meta to the grouped item instead
+        // of adding a dead placeholder row.
+        const cluster = matchCluster(tabId, frameId);
+        if (cluster) {
+          const linked = items.find((x) => x.type === "segments" && x.url === cluster.urls[0]);
+          if (linked) {
+            if (v.poster && !linked.poster) {
+              linked.poster = v.poster;
+              changed = true;
+            }
+            const m = describeSignal(v);
+            if (m && !linked.meta?.includes("×")) {
+              linked.meta = `${linked.meta ?? ""} • ${m}`;
+              changed = true;
+            }
+            continue;
+          }
+        }
         const existing = items.find((x) => x.url === src);
         if (!existing) {
           items.push({
@@ -534,6 +855,132 @@ async function handleVideoSignals(
   }
 }
 
+function mbLabel(bytes: number): string {
+  if (bytes < 1_000_000) return `${Math.max(1, Math.round(bytes / 1000))} KB`;
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+// Last-seen timestamps for capture keys (prune player teardowns).
+const captureSeen = new Map<string, number>();
+
+/**
+ * MSE capture sessions -> downloadable `capture` items (one per track).
+ * Refusal rules (never bypassed):
+ * - session.eme (setMediaKeys/encrypted on its element) -> DRM row, refused.
+ * - session clean BUT page requested EME keys -> refused as unverified: on a
+ *   mixed page we cannot prove this buffer isn't DRM-adjacent.
+ * - clean session, clean page, bytes>0 -> downloadable capture item.
+ */
+async function handleCaptureSessions(
+  tabId: number,
+  sessions: MsSessionMeta[] | undefined,
+  posterByBlob: Map<string, string>,
+  pageTitle?: string,
+): Promise<void> {
+  if (!sessions) return;
+  const now = Date.now();
+  const items = await getTabItems(tabId);
+  let changed = false;
+
+  for (const s of sessions) {
+    if (!s || typeof s.id !== "string") continue;
+    const keyBase = `capture:${s.id}:`;
+    captureSeen.set(keyBase, now);
+    for (const t of s.tracks ?? []) {
+      const url = `${keyBase}${t.idx}`;
+      captureSeen.set(url, now);
+      const kindLabel = t.kind === "video" ? "video" : t.kind === "audio" ? "audio" : "track";
+      const sizeLabel = t.bytes > 0 ? ` • ${mbLabel(t.bytes)}` : "";
+      const existing = items.find((x) => x.url === url);
+
+      if (s.eme) {
+        if (!existing) {
+          items.push({
+            url,
+            tabId,
+            type: "capture",
+            captureRef: `${s.id}:${t.idx}`,
+            filename: "",
+            detectedAt: now,
+            drmProtected: true,
+            drmReason: "Protected content — this player uses an encrypted media path (DRM). Cannot download.",
+            meta: `${kindLabel}${sizeLabel} • captured buffer`,
+            pageTitle,
+          });
+          changed = true;
+        }
+        continue;
+      }
+      if (s.pageEme) {
+        if (!existing) {
+          items.push({
+            url,
+            tabId,
+            type: "capture",
+            captureRef: `${s.id}:${t.idx}`,
+            filename: "",
+            detectedAt: now,
+            drmProtected: true,
+            drmReason: "This page uses DRM playback, so buffered captures are disabled here to stay safe.",
+            meta: `${kindLabel}${sizeLabel} • captured buffer`,
+            pageTitle,
+          });
+          changed = true;
+        }
+        continue;
+      }
+      if (t.bytes <= 0) continue; // nothing captured yet — wait for buffer
+      const meta = `${kindLabel}${sizeLabel} • captured buffer${s.complete === false ? " • partial" : ""}`;
+      const poster = s.blobUrl ? posterByBlob.get(s.blobUrl) : undefined;
+      if (!existing) {
+        const ts = new Date(now).toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        items.push({
+          url,
+          tabId,
+          type: "capture",
+          captureRef: `${s.id}:${t.idx}`,
+          filename: `capture-${kindLabel}-${ts}.mp4`,
+          detectedAt: now,
+          drmProtected: false,
+          poster,
+          pageTitle,
+          meta,
+        });
+        changed = true;
+      } else if (!existing.drmProtected) {
+        if (existing.meta !== meta) {
+          existing.meta = meta;
+          changed = true;
+        }
+        if (poster && !existing.poster) {
+          existing.poster = poster;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // Prune captures whose sessions vanished >120s ago (player teardown).
+  const staleCutoff = now - 120_000;
+  let pruned = false;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const x = items[i];
+    if (x.type !== "capture") continue;
+    const seen = captureSeen.get(x.url) ?? captureSeen.get(x.url.split(":").slice(0, 2).join(":") + ":") ?? 0;
+    if (seen < staleCutoff) {
+      items.splice(i, 1);
+      captureSeen.delete(x.url);
+      pruned = true;
+    }
+  }
+  if (pruned) changed = true;
+
+  if (changed) {
+    await persistTab(tabId, enforceCaps(items));
+    await updateBadge(tabId);
+  }
+}
+
 // ---- Offscreen download orchestration (survives popup close) ----
 // The offscreen document (runtime API only) assembles segment bytes;
 // the worker performs the actual chrome.downloads.download(), which
@@ -598,19 +1045,97 @@ async function startDownload(
   if (item.drmProtected) throw new Error(item.drmReason ?? "Protected content — cannot download.");
   if (item.type === "blob") throw new Error("Blob/MSE stream — not directly downloadable.");
 
+  // MSE capture downloads route through the tab's content script, which
+  // pulls bytes from the page hook and streams them to the offscreen
+  // document (existing DOWNLOAD_BLOB finalization).
+  if (item.type === "capture") {
+    if (!item.captureRef) throw new Error("Capture reference lost — Rescan while the video plays.");
+    const [captureId, trackIdxRaw] = item.captureRef.split(":");
+    const trackIdx = Number(trackIdxRaw) || 0;
+    const jobId = newJobId();
+    const job: DownloadJobState = {
+      jobId,
+      tabId,
+      itemUrl,
+      filename: item.filename || `capture-${jobId}.mp4`,
+      status: "running",
+      done: 0,
+      total: 0,
+      stage: "fetching",
+      updatedAt: Date.now(),
+    };
+    await upsertJob(job);
+    await ensureOffscreen();
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: "MS_DOWNLOAD",
+        jobId,
+        captureId,
+        trackIdx,
+        filename: job.filename,
+      });
+    } catch (err) {
+      job.status = "error";
+      job.error = `Could not reach the page capture: ${err instanceof Error ? err.message : String(err)} Reload the tab and retry.`;
+      await upsertJob(job);
+    }
+    return job;
+  }
+
   const jobId = newJobId();
+  // Per-origin replay scopes for every host this job will touch (cap 10).
+  const scopeUrls: string[] = [];
+  const seenOrigins = new Set<string>();
+  const consider = (u: string | undefined) => {
+    if (!u || seenOrigins.size >= 10) return;
+    try {
+      const o = new URL(u).origin;
+      if (!seenOrigins.has(o)) {
+        seenOrigins.add(o);
+        scopeUrls.push(u);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
   let req: DownloadJobRequest;
   if (item.type === "hls" || item.type === "dash") {
     const variant = item.variants?.find((v) => v.id === (variantId ?? item.variants?.[0]?.id)) ?? item.variants?.[0];
     if (!variant) throw new Error(item.error ?? "Manifest not parsed yet — reopen the popup in a moment and retry.");
     if (item.type === "hls") {
+      consider(variant.url);
       req = { jobId, tabId, kind: "hls", url: variant.url, filename: item.filename, mime: "video/mp2t" };
     } else {
       if (!variant.segments?.length) throw new Error("No segments listed for this DASH variant.");
+      consider(item.url);
+      for (const s of variant.segments) consider(s);
       req = { jobId, tabId, kind: "dash", url: item.url, segments: variant.segments, filename: item.filename, mime: "video/mp4" };
     }
+  } else if (item.type === "segments") {
+    // Auto-grouped chunk traffic: same byte-concat path as DASH, container
+    // sniffed at assembly time. No manifest, no DRM signals by construction
+    // (encrypted chunks would fail closed at fetch/parse with a clear error).
+    if (!item.segments?.length) throw new Error("No grouped segments for this video (group expired — Rescan while it plays).");
+    consider(item.url);
+    for (const s of item.segments) consider(s);
+    req = { jobId, tabId, kind: "dash", url: item.url, segments: [...item.segments], filename: item.filename, mime: "video/mp4" };
   } else {
     req = { jobId, tabId, kind: "direct", url: item.url, filename: item.filename };
+  }
+  // Attach per-origin replay contexts (auth scoped to capture origin).
+  if (req.kind !== "direct") {
+    const byOrigin: Record<string, NetReplay> = {};
+    for (const u of scopeUrls) {
+      const net = lookupNet(tabId, u);
+      if (net) {
+        try {
+          byOrigin[new URL(u).origin] = net;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (Object.keys(byOrigin).length) req.netScope = { byOrigin };
   }
 
   const job: DownloadJobState = {
@@ -689,6 +1214,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             job.error = "Download cancelled.";
             await upsertJob(job);
           }
+          // Capture jobs also stream from the tab — stop the driver too.
+          if (job.itemUrl.startsWith("capture:")) {
+            try {
+              await chrome.tabs.sendMessage(job.tabId, { type: "MS_CANCEL", jobId: m.jobId });
+            } catch {
+              /* driver ends on its own via abort flag or completion */
+            }
+          }
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false, error: "Job is not running." });
@@ -702,7 +1235,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       } else if (m?.type === "VIDEO_ELEMENTS" && typeof m.tabId === "number") {
         const fromSender = sender.tab?.id ?? m.tabId;
-        await handleVideoSignals(fromSender, m.videos ?? [], m.pageTitle);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const vids = (m.videos ?? []) as any[];
+        await handleVideoSignals(fromSender, vids, m.pageTitle, sender.frameId);
+        // Posters keyed by blob: URL for capture-session rows.
+        const posterByBlob = new Map<string, string>();
+        for (const v of vids) {
+          if (typeof v?.currentSrc === "string" && v.currentSrc.startsWith("blob:") && typeof v?.poster === "string") {
+            posterByBlob.set(v.currentSrc, v.poster);
+          }
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await handleCaptureSessions(fromSender, m.msSessions as any, posterByBlob, m.pageTitle);
         sendResponse({ ok: true });
       } else if (m?.type === "DOWNLOAD_PROGRESS" && typeof m.jobId === "string") {
         await ensureJobsLoaded();
@@ -719,6 +1263,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (job && (m.stage === "fetching" || m.stage === "assembling" || m.stage === "saving")) {
           job.stage = m.stage;
           await upsertJob(job, false);
+        }
+        sendResponse({ ok: true });
+      } else if (
+        (m?.type === "MS_TRACK_START" || m?.type === "MS_TRACK_CHUNK" || m?.type === "MS_TRACK_END") &&
+        typeof m.jobId === "string"
+      ) {
+        // Capture-transfer traffic is addressed to the offscreen document
+        // (which acks it); the worker only notes the total for progress.
+        if (m.type === "MS_TRACK_START" && typeof m.total === "number") {
+          await ensureJobsLoaded();
+          const job = jobMemory.get(m.jobId);
+          if (job && job.status === "running") {
+            job.total = m.total;
+            job.stage = "fetching";
+            await upsertJob(job, false);
+          }
         }
         sendResponse({ ok: true });
       } else if (m?.type === "DOWNLOAD_BLOB" && typeof m.jobId === "string") {

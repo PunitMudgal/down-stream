@@ -1,4 +1,5 @@
 import { extractHlsSegments } from "./parseHls";
+import type { NetReplay } from "./types";
 
 export type ProgressCallback = (done: number, total: number) => void;
 
@@ -27,6 +28,7 @@ export function filenameForUrl(url: string, type: string): string {
   } catch {
     /* fall through */
   }
+  if (type === "segments") return `video-segments-${ts}.mp4`;
   const lowerType = type.toLowerCase();
   const ext = ["webm", "ogg", "mov", "mkv", "avi", "flv", "wmv", "mpg"].includes(lowerType)
     ? lowerType
@@ -51,12 +53,42 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("Download cancelled.");
 }
 
-async function fetchBuffer(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+function netInit(net: NetReplay | undefined, signal?: AbortSignal): RequestInit {
+  return {
+    credentials: "include",
+    signal,
+    headers: net?.headers,
+    referrer: net?.referrer,
+    referrerPolicy: net?.referrer ? "unsafe-url" : undefined,
+  };
+}
+
+/** Pick the replay context for a URL's origin (headers never cross origins). */
+export function pickNet(
+  scope: { byOrigin: Record<string, NetReplay> } | undefined,
+  url: string,
+): NetReplay | undefined {
+  if (!scope) return undefined;
+  try {
+    return scope.byOrigin[new URL(url).origin];
+  } catch {
+    return undefined;
+  }
+}
+
+async function fetchBuffer(
+  url: string,
+  signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
+): Promise<ArrayBuffer> {
   throwIfAborted(signal);
+  const net = pickNet(scope, url);
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= FETCH_RETRIES; attempt++) {
     try {
-      const res = await fetch(url, { credentials: "include", signal });
+      // NOTE: headers in `net` were already scoped to this origin by the
+      // background lookup — never attach foreign auth here.
+      const res = await fetch(url, netInit(net, signal));
       if (!res.ok) throw new Error(`Segment fetch failed (${res.status}): ${url}`);
       return await res.arrayBuffer();
     } catch (err) {
@@ -76,6 +108,7 @@ async function fetchAllOrdered(
   mime: string,
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
 ): Promise<Blob> {
   if (urls.length === 0) throw new Error("No segments to download.");
   if (urls.length > MAX_SEGMENTS) {
@@ -93,7 +126,7 @@ async function fetchAllOrdered(
       throwIfAborted(signal);
       const i = next++;
       if (i >= total) return;
-      const buf = await fetchBuffer(urls[i], signal);
+      const buf = await fetchBuffer(urls[i], signal, scope);
       parts[i] = buf;
       bytes += buf.byteLength;
       if (bytes > MAX_BYTES) {
@@ -122,12 +155,10 @@ export async function assembleHlsBlob(
   variantPlaylistUrl: string,
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
 ): Promise<Blob> {
   throwIfAborted(signal);
-  const playlistRes = await fetch(variantPlaylistUrl, {
-    credentials: "include",
-    signal,
-  });
+  const playlistRes = await fetch(variantPlaylistUrl, netInit(pickNet(scope, variantPlaylistUrl), signal));
   if (!playlistRes.ok)
     throw new Error(
       `Variant playlist fetch failed (${playlistRes.status})`,
@@ -144,7 +175,7 @@ export async function assembleHlsBlob(
     throw new Error("No segments found in the HLS variant playlist.");
 
   // 5-way parallel fetch, order preserved for concat; retries + caps inside.
-  return fetchAllOrdered(segmentUrls, "video/mp2t", onProgress, signal);
+  return fetchAllOrdered(segmentUrls, "video/mp2t", onProgress, signal, scope);
 }
 
 /** DASH assembly: same concat approach over the parsed variant's segments. */
@@ -152,12 +183,13 @@ export async function assembleDashBlob(
   segmentUrls: string[],
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
 ): Promise<Blob> {
   if (segmentUrls.length === 0)
     throw new Error("No segments listed for this DASH variant.");
   // DASH segments are typically fragmented MP4; concat preserves playability
   // for many players without a full remux (stretch goal, not v1).
-  return fetchAllOrdered(segmentUrls, "video/mp4", onProgress, signal);
+  return fetchAllOrdered(segmentUrls, "video/mp4", onProgress, signal, scope);
 }
 
 /** Blob -> base64 data URL for transfer to the service worker. */

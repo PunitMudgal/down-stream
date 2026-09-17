@@ -1,5 +1,5 @@
 import { filenameForUrl } from "./lib/download";
-import type { DownloadJobState, MediaItem, MediaType, VideoSignal } from "./lib/types";
+import type { DownloadJobState, MediaItem, MediaType, MsSessionMeta, VideoSignal } from "./lib/types";
 
 const listEl = document.getElementById("list") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
@@ -93,16 +93,21 @@ function classifyBare(url: string): MediaType | null {
  * Worker-independent page scan: ask the tab's content script for its
  * <video> elements directly (no background worker involved). Falls back to
  * a one-shot injected collector when the content script isn't present
- * (e.g. tab hasn't reloaded since install). Never throws — returns [].
+ * (e.g. tab hasn't reloaded since install). Never throws.
  */
-async function scanPageDirect(tabId: number): Promise<VideoSignal[]> {
+async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; msSessions: MsSessionMeta[] }> {
   try {
     const res = await withTimeout(
       chrome.tabs.sendMessage(tabId, { type: "COLLECT_FOR_POPUP" }),
-      3000,
+      4000,
       "Page scan",
     );
-    if (res?.ok && Array.isArray(res.videos)) return res.videos as VideoSignal[];
+    if (res?.ok && Array.isArray(res.videos)) {
+      return {
+        videos: res.videos as VideoSignal[],
+        msSessions: Array.isArray(res.msSessions) ? (res.msSessions as MsSessionMeta[]) : [],
+      };
+    }
   } catch {
     /* no content script in this tab — try one-shot injection */
   }
@@ -151,10 +156,59 @@ async function scanPageDirect(tabId: number): Promise<VideoSignal[]> {
       const val = (r as chrome.scripting.InjectionResult)?.result as unknown;
       if (Array.isArray(val)) out.push(...(val as VideoSignal[]));
     }
-    return out;
+    return { videos: out, msSessions: [] };
   } catch {
-    return [];
+    return { videos: [], msSessions: [] };
   }
+}
+
+function mbShort(bytes: number): string {
+  if (bytes < 1_000_000) return `${Math.max(1, Math.round(bytes / 1000))} KB`;
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+/**
+ * Capture sessions -> display items without any worker (same refusal rules
+ * as the background: EME-tainted or DRM-page sessions are refused rows).
+ */
+function domSessionsToItems(sessions: MsSessionMeta[], tabId: number): MediaItem[] {
+  const items: MediaItem[] = [];
+  const now = Date.now();
+  for (const s of sessions) {
+    if (!s || typeof s.id !== "string") continue;
+    for (const t of s.tracks ?? []) {
+      const url = `capture:${s.id}:${t.idx}`;
+      const kindLabel = t.kind === "video" ? "video" : t.kind === "audio" ? "audio" : "track";
+      const sizeLabel = t.bytes > 0 ? ` • ${mbShort(t.bytes)}` : "";
+      if (s.eme) {
+        items.push({
+          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`, filename: "",
+          detectedAt: now, drmProtected: true,
+          drmReason: "Protected content — this player uses an encrypted media path (DRM). Cannot download.",
+          meta: `${kindLabel}${sizeLabel} • captured buffer`,
+        });
+        continue;
+      }
+      if (s.pageEme) {
+        items.push({
+          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`, filename: "",
+          detectedAt: now, drmProtected: true,
+          drmReason: "This page uses DRM playback, so buffered captures are disabled here to stay safe.",
+          meta: `${kindLabel}${sizeLabel} • captured buffer`,
+        });
+        continue;
+      }
+      if (t.bytes <= 0) continue;
+      const ts = new Date(now).toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      items.push({
+        url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`,
+        filename: `capture-${kindLabel}-${ts}.mp4`,
+        detectedAt: now, drmProtected: false,
+        meta: `${kindLabel}${sizeLabel} • captured buffer${s.complete === false ? " • partial" : ""}`,
+      });
+    }
+  }
+  return items;
 }
 
 /** "1280×720 • 0:34 • playing" (local copy — background has its own). */
@@ -231,8 +285,19 @@ function jobForItem(itemUrl: string): DownloadJobState | undefined {
   return related.sort((a, b) => b.updatedAt - a.updatedAt)[0];
 }
 
+function mbPair(done: number, total: number): string {
+  const f = (b: number) =>
+    b < 1_000_000 ? `${Math.max(0, Math.round(b / 1000))} KB` : `${(b / 1_000_000).toFixed(1)} MB`;
+  return total > 0 ? `${f(done)}/${f(total)}` : f(done);
+}
+
 function runningText(job: DownloadJobState): string {
   const tail = "(safe to close popup)";
+  if (job.itemUrl.startsWith("capture:")) {
+    if (job.stage === "assembling") return `Assembling capture… ${tail}`;
+    if (job.stage === "saving") return `Saving download… ${tail}`;
+    return `Capturing… ${mbPair(job.done, job.total)} ${tail}`;
+  }
   if (job.stage === "assembling") return `Assembling file… ${tail}`;
   if (job.stage === "saving") return `Saving download… ${tail}`;
   if (job.total > 1) return `Fetching… ${job.done}/${job.total} segments ${tail}`;
@@ -299,10 +364,11 @@ async function loadMedia(): Promise<void> {
 
   const [workerSettled, pageSettled] = await Promise.allSettled([workerPromise, pagePromise]);
   const workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
-  const pageItems = domSignalsToItems(
-    pageSettled.status === "fulfilled" ? pageSettled.value : [],
-    tabId,
-  );
+  const pageScan = pageSettled.status === "fulfilled" ? pageSettled.value : { videos: [], msSessions: [] };
+  const pageItems = [
+    ...domSignalsToItems(pageScan.videos, tabId),
+    ...domSessionsToItems(pageScan.msSessions, tabId),
+  ];
 
   // Merge: worker detections win on exact URL; page-only signals fill gaps.
   // Extra blob placeholders collapse to one row (all mean "player buffer").
@@ -446,8 +512,8 @@ function renderCard(item: MediaItem): HTMLElement {
     meta.appendChild(metaLine);
   }
 
-  // Copy-link works without any worker — handy for external downloaders.
-  if (item.type !== "blob") {
+  // Copy-link needs a real URL (blob:/capture: rows have none fetchable).
+  if (item.type !== "blob" && item.type !== "capture") {
     const copy = document.createElement("button");
     copy.className = "ghost";
     copy.textContent = "Copy link";
@@ -501,6 +567,28 @@ function renderCard(item: MediaItem): HTMLElement {
       btn.onclick = () => void handleStartDownload(item, sel.value, btn);
       meta.appendChild(btn);
     }
+  } else if (item.type === "segments") {
+    const n = item.segments?.length ?? 0;
+    if (n === 0) {
+      const note = document.createElement("div");
+      note.className = "error";
+      note.textContent = item.error ?? "Grouped player chunks expired — play the video, then Rescan.";
+      meta.appendChild(note);
+    } else {
+      const btn = document.createElement("button");
+      btn.className = "dl";
+      btn.textContent = `Download (${n} grouped chunks)`;
+      btn.onclick = () => void handleStartDownload(item, undefined, btn);
+      meta.appendChild(btn);
+    }
+  } else if (item.type === "capture") {
+    // DRM-protected captures are handled by the drmProtected branch above.
+    const btn = document.createElement("button");
+    btn.className = "dl";
+    btn.textContent = "Download capture";
+    btn.title = "Download the exact bytes the player buffered (lossless)";
+    btn.onclick = () => void handleStartDownload(item, undefined, btn);
+    meta.appendChild(btn);
   } else if (item.type === "blob") {
     const note = document.createElement("div");
     note.className = "error";
@@ -706,7 +794,7 @@ async function handleStartDownload(
     await downloadDirectFallback(item, btn);
     return;
   }
-  setStatus("Download failed: background worker isn't answering (needed for HLS/DASH). Reload the extension and retry.");
+  setStatus("Download failed: background worker isn't answering (needed for HLS/DASH/grouped/capture downloads). Reload the extension and retry.");
   btn.disabled = false;
 }
 

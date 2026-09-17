@@ -10,6 +10,8 @@ export type MediaType =
   | "mpg"
   | "hls"
   | "dash"
+  | "segments"
+  | "capture"
   | "blob"
   | "unknown";
 
@@ -35,6 +37,10 @@ export interface MediaItem {
   drmProtected: boolean;
   drmReason?: string;
   variants?: Variant[];
+  /** Observed segment URLs for auto-grouped `segments` items. */
+  segments?: string[];
+  /** MSE capture reference `msId:trackIdx` for `capture` items. */
+  captureRef?: string;
   poster?: string;
   pageTitle?: string;
   /** Short human line, e.g. "1280×720 • 0:34 • playing". */
@@ -51,6 +57,7 @@ export type RuntimeMessage =
       tabId: number;
       videos: VideoSignal[];
       pageTitle?: string;
+      msSessions?: MsSessionMeta[];
     }
   // --- Background-mediated downloads (survive popup close) ---
   | {
@@ -63,6 +70,12 @@ export type RuntimeMessage =
   | { type: "CANCEL_JOB"; jobId: string }
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
   | { type: "FETCH_TEXT"; tabId: number; url: string }
+  // --- MSE capture transfer (content script <-> hook <-> offscreen) ---
+  | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string }
+  | { type: "MS_CANCEL"; jobId: string }
+  | { type: "MS_TRACK_START"; jobId: string; total: number; mime: string; filename: string }
+  | { type: "MS_TRACK_CHUNK"; jobId: string; index: number; total: number; buf: ArrayBuffer }
+  | { type: "MS_TRACK_END"; jobId: string }
   // --- Offscreen <-> background ---
   | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
   | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number }
@@ -87,7 +100,18 @@ export interface VideoSignal {
   candidates?: string[];
 }
 
-export type DownloadKind = "direct" | "hls" | "dash";
+export type DownloadKind = "direct" | "hls" | "dash" | "capture";
+
+/**
+ * Replayable network context captured from the page's own successful
+ * requests. Only safe-to-replay values are ever stored: Authorization and
+ * custom X-* headers (same-origin only at lookup time) plus the page
+ * referrer. Cookies are NEVER stored (and couldn't be replayed via fetch).
+ */
+export interface NetReplay {
+  headers?: Record<string, string>;
+  referrer?: string;
+}
 
 export interface DownloadJobRequest {
   jobId: string;
@@ -98,6 +122,8 @@ export interface DownloadJobRequest {
   segments?: string[];
   filename: string;
   mime?: string;
+  /** Per-origin replay contexts (auth scoped to capture origin). */
+  netScope?: { byOrigin: Record<string, NetReplay> };
 }
 
 export type DownloadJobStatus =
@@ -106,6 +132,31 @@ export type DownloadJobStatus =
   | "error";
 
 export type DownloadJobStage = "fetching" | "assembling" | "saving";
+
+/**
+ * MSE capture session metadata (hook -> content -> background).
+ * Bytes stay in the page until a download is requested.
+ */
+export interface MsTrackMeta {
+  idx: number;
+  mime: string;
+  kind: "video" | "audio" | "other";
+  bytes: number;
+  chunks: number;
+}
+
+export interface MsSessionMeta {
+  id: string;
+  blobUrl?: string;
+  tracks: MsTrackMeta[];
+  bytes: number;
+  /** True when nothing was dropped (per-track memory cap never hit). */
+  complete: boolean;
+  /** EME (Widevine/FairPlay/PlayReady-style DRM path) touched this session. */
+  eme: boolean;
+  /** Page requested EME keys at all — unattributed sessions stay refused. */
+  pageEme: boolean;
+}
 
 export interface DownloadJobState {
   jobId: string;
