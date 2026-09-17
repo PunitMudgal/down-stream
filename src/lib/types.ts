@@ -43,7 +43,21 @@ export type RuntimeMessage =
       tabId: number;
       videos: VideoSignal[];
       pageTitle?: string;
-    };
+    }
+  // --- Background-mediated downloads (survive popup close) ---
+  | {
+      type: "START_DOWNLOAD";
+      tabId: number;
+      itemUrl: string;
+      variantId?: string;
+    }
+  | { type: "GET_JOBS"; tabId: number }
+  // --- Offscreen <-> background ---
+  | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
+  | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number }
+  | { type: "DOWNLOAD_DONE"; jobId: string; downloadId?: number }
+  | { type: "DOWNLOAD_ERROR"; jobId: string; error: string }
+  | { type: "JOB_UPDATED"; job: DownloadJobState };
 
 export interface VideoSignal {
   currentSrc: string;
@@ -52,4 +66,37 @@ export interface VideoSignal {
   paused?: boolean;
   width?: number;
   height?: number;
+  /** Raw src attribute + <source> children (may differ from currentSrc). */
+  candidates?: string[];
+}
+
+export type DownloadKind = "direct" | "hls" | "dash";
+
+export interface DownloadJobRequest {
+  jobId: string;
+  tabId: number;
+  kind: DownloadKind;
+  /** Resolved URL to fetch: direct file, HLS variant playlist, or "" for DASH (uses segments). */
+  url: string;
+  segments?: string[];
+  filename: string;
+  mime?: string;
+}
+
+export type DownloadJobStatus =
+  | "running"
+  | "done"
+  | "error";
+
+export interface DownloadJobState {
+  jobId: string;
+  tabId: number;
+  itemUrl: string;
+  variantId?: string;
+  filename: string;
+  status: DownloadJobStatus;
+  done: number;
+  total: number;
+  error?: string;
+  updatedAt: number;
 }

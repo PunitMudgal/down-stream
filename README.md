@@ -7,8 +7,8 @@ Detect playable video on the current tab and download it locally — no backend,
 - Background service worker watches `webRequest` for direct video (`mp4/webm/ogg/mov`), HLS (`.m3u8`), DASH (`.mpd`).
 - Fetches + parses HLS/DASH manifests client-side (`m3u8-parser`, `mpd-parser`), lists quality variants.
 - Refuses DRM cleanly (HLS `#EXT-X-KEY` METHOD != NONE, DASH `<ContentProtection>`) — never fetches/decrypts protected segments.
-- Content script enriches items with `<video>` poster thumbnails.
-- Popup downloads: direct files via `chrome.downloads`; HLS/DASH via ordered segment fetch + concat (`.ts` for HLS since no remux; DASH concat as `.mp4`).
+- Content script watches the page continuously (MutationObserver, so SPA feeds like X/Twitter are covered), reports `<video>` elements, posters, and direct URLs the network layer may have missed (cached media).
+- Downloads run through an **offscreen document**: HLS/DASH segment fetch + concat (`.ts` for HLS since no remux; DASH concat as `.mp4`) keeps going **after the popup closes**. Reopen the popup anytime to see live progress (`Downloading… n/m segments`), Done, or error state. Direct files go straight through `chrome.downloads`.
 
 ## Load unpacked in Chrome
 
@@ -19,11 +19,12 @@ Detect playable video on the current tab and download it locally — no backend,
    - Direct MP4: any page under `interactive-examples.mdn.mozilla.net` serving `flower.mp4`.
    - HLS: `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`.
    - DASH: `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd`.
-5. Click the extension icon → pick quality → Download. Keep the popup open while segments fetch (`Downloading… n/m segments`).
+   - X/Twitter feed (`x.com`): scroll until a video plays, open the popup, hit **Rescan** if needed. Note: feed players often use blob/MSE buffers — the extension surfaces the underlying network file (e.g. `video.twimg.com` MP4/HLS) once it loads; pure blob entries are shown with an explanation, not a dead button.
+5. Click the extension icon → pick quality → Download. You can close the popup — the download continues in the background.
 
 ## Permissions
 
-`activeTab, webRequest, downloads, storage, scripting` + 3 test-site `host_permissions`. Expand hosts only as needed; no `<all_urls>`, no YouTube-specific logic, no remote servers.
+`activeTab, webRequest, downloads, storage, scripting, offscreen` + `host_permissions` for the test sites plus `x.com`, `*.x.com`, `twitter.com`, `*.twitter.com`, `*.twimg.com`. No `<all_urls>`, no YouTube-specific logic, no remote servers.
 
 ## Scripts
 

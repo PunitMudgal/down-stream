@@ -48,8 +48,9 @@ async function fetchBuffer(url: string): Promise<ArrayBuffer> {
 /**
  * HLS download: fetch every segment of the chosen variant in order,
  * concatenate into a single Blob (video/mp2t). No remuxing — the .ts
- * plays in VLC and most players. Must run in popup context
- * (service workers can't reliably hold blob: URLs).
+ * plays in VLC and most players. Must run in a document context with
+ * DOM APIs (popup or offscreen document) — NOT in the service worker,
+ * which can't reliably hold blob: URLs.
  */
 export async function downloadHlsVariant(
   variantPlaylistUrl: string,
