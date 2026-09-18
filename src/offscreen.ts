@@ -1,5 +1,6 @@
 import {
   blobToDataUrl,
+  fetchDirectBlob,
   fetchSegments,
   isExpiredFailure,
   orderAndValidateSegmentParts,
@@ -466,13 +467,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   void (async () => {
     try {
-      if (job.kind === "direct") {
-        throw new Error("Direct downloads are handled by the service worker.");
-      }
       const onProgress = (done: number, total: number, bytesDone?: number) =>
         report({ type: "DOWNLOAD_PROGRESS", jobId: job.jobId, done, total, bytesDone });
       stage(job.jobId, "fetching");
       const scope = job.netScope;
+
+      // Direct files go through the page's own auth context (cookies +
+      // captured same-origin headers + referrer). Script endpoints like
+      // `remote_control.php` gate on exactly this — a bare browser download
+      // misses it and the server answers with a stub or an HTML page.
+      if (job.kind === "direct") {
+        const onBytes = (received: number, total: number) =>
+          report({ type: "DOWNLOAD_PROGRESS", jobId: job.jobId, done: received, total, bytesDone: received });
+        const blob = await fetchDirectBlob(job.url, onBytes, signal, scope);
+        const ext = await sniffExtension(blob, ".mp4");
+        stage(job.jobId, "assembling");
+        await finalizeJobFile(job.jobId, blob, withExtension(job.filename, ext));
+        return;
+      }
 
       // Paired split A/V (HLS pairUrl or DASH pairSegments): fetch both
       // tracks, then merge into ONE file with audio.
@@ -500,6 +512,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         jobId: job.jobId,
         error: message,
         expired: isExpiredFailure(err),
+        fallbackDirect: (err as unknown as Record<string, unknown>)?.fallbackDirect === true,
       } as unknown as Record<string, unknown> as never);
     } finally {
       controllers.delete(job.jobId);

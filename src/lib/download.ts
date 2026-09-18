@@ -100,12 +100,131 @@ export function filenameForUrl(url: string, type: string, title?: string): strin
   return `video-${ts}.${ext}`;
 }
 
-/** Direct file: browser handles it natively. */
+/** Direct file: browser handles it natively (fallback when in-app fetch can't). */
 export async function downloadDirect(
   url: string,
   filename: string,
 ): Promise<void> {
   await chrome.downloads.download({ url, filename, saveAs: false });
+}
+
+/** Byte progress for single-stream direct downloads (received, total|0). */
+export type ByteProgressCallback = (received: number, total: number) => void;
+
+/**
+ * Fetch a direct file URL with the page's own auth context (cookies +
+ * captured same-origin Authorization/X-* headers + referrer). Script
+ * endpoints like `remote_control.php` gate on exactly this: a bare browser
+ * download misses it and the server answers with a 100–300 KB stub or an
+ * HTML "no hotlinking" page instead of the video.
+ *
+ * Validates the payload (error pages refused, never saved) and reports byte
+ * progress. Throws expired-session errors for 403/404/410 so the UI can
+ * offer Refresh & Retry. Files over MAX_BYTES get `fallbackDirect` set so
+ * the caller can hand oversized files to the browser instead of failing.
+ */
+export async function fetchDirectBlob(
+  url: string,
+  onProgress?: ByteProgressCallback,
+  signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
+): Promise<Blob> {
+  throwIfAborted(signal);
+  // Idle timeout, not a total cap: each received chunk resets the clock, so
+  // slow-but-moving downloads survive while stalled ones fail fast.
+  const ctrl = new AbortController();
+  const onOuterAbort = (): void => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) throw new Error("Download cancelled.");
+    signal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const arm = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => ctrl.abort(), SEGMENT_TIMEOUT_MS);
+  };
+  const disarm = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  try {
+    arm();
+    const res = await fetch(url, netInit(pickNet(scope, url), ctrl.signal));
+    if (res.status === 403 || res.status === 404 || res.status === 410) {
+      throw new Error(
+        `Stream file unavailable (${res.status}) — the link likely expired. Replay the video, hit Rescan, and retry right away.`,
+      );
+    }
+    if (!res.ok) throw new Error(`File fetch failed (${res.status}): ${url}`);
+    const contentType = res.headers.get("content-type");
+    const len = Number(res.headers.get("content-length") || "0");
+    const total = Number.isFinite(len) && len > 0 ? len : 0;
+    // Stream the body: byte progress, in-app cap enforced while reading,
+    // idle timer reset per chunk.
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    const body = res.body;
+    if (!body) throw new Error(`File fetch failed (empty response): ${url}`);
+    const reader = body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        arm(); // progress resets the idle clock
+        if (value && value.byteLength > 0) {
+          chunks.push(value);
+          received += value.byteLength;
+          if (received > MAX_BYTES) {
+            const err = new Error("Video exceeds the 1.5 GB in-app cap — retrying via the browser.");
+            (err as unknown as Record<string, unknown>).fallbackDirect = true;
+            throw err;
+          }
+          onProgress?.(received, total);
+        }
+        if (signal?.aborted) throw new Error("Download cancelled.");
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* ignore */
+      }
+    }
+    const buf = new Uint8Array(received);
+    let off = 0;
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.byteLength;
+    }
+    const ab = buf.buffer as ArrayBuffer;
+    // Refuse stubs baked in as "video": hotlink gates answer 200 with an
+    // HTML/JSON error body. (No valid video container starts with `<`.)
+    rejectErrorPage(contentType, ab);
+    const ct = (contentType ?? "").toLowerCase().split(";")[0].trim();
+    const videoish =
+      ct.startsWith("video/") ||
+      ct.startsWith("audio/") ||
+      ct === "application/octet-stream" ||
+      ct === "binary/octet-stream" ||
+      ct === "";
+    if (!videoish) {
+      throw new Error(
+        "A stream file came back as an error page instead of video (link expired or request blocked). Replay the video, hit Rescan, and retry right away.",
+      );
+    }
+    if (ab.byteLength === 0) throw new Error("Server returned an empty file — replay the video, Rescan, and retry.");
+    onProgress?.(ab.byteLength, total);
+    return new Blob([ab], { type: ct || "video/mp4" });
+  } catch (err) {
+    if (signal?.aborted) throw new Error("Download cancelled.");
+    if (err instanceof DOMException && err.name === "AbortError" && !signal?.aborted) {
+      throw new Error(`File fetch stalled for ${SEGMENT_TIMEOUT_MS / 1000}s with no data: ${url}`);
+    }
+    throw err;
+  } finally {
+    disarm();
+    signal?.removeEventListener("abort", onOuterAbort);
+  }
 }
 
 export const MAX_SEGMENTS = 2000;

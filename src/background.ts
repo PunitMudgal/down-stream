@@ -1556,10 +1556,13 @@ async function startDownload(
     for (const s of orderedSegments) consider(s);
     req = { jobId, tabId, kind: "dash", url: item.url, segments: orderedSegments, filename: item.filename, mime: "video/mp4" };
   } else {
+    consider(item.url);
     req = { jobId, tabId, kind: "direct", url: item.url, filename: item.filename };
   }
   // Attach per-origin replay contexts (auth scoped to capture origin).
-  if (req.kind !== "direct") {
+  // Direct files need this too: script endpoints (.php) gate on the page's
+  // referrer/cookies/headers — a bare download gets a stub instead.
+  {
     const byOrigin: Record<string, NetReplay> = {};
     for (const u of scopeUrls) {
       const net = lookupNet(tabId, u);
@@ -1585,27 +1588,17 @@ async function startDownload(
     filename: req.filename,
     status: "running",
     done: 0,
-    total: req.kind === "direct" ? 1 : (req.segments?.length ?? 0),
+    total: req.kind === "direct" ? 0 : (req.segments?.length ?? 0),
+    unit: req.kind === "direct" ? "bytes" : "segments",
     bytesDone: 0,
     startedAt: Date.now(),
     updatedAt: Date.now(),
   };
   await upsertJob(job);
 
-  if (req.kind === "direct") {
-    // Browser handles natively — no offscreen needed, popup may close safely.
-    try {
-      await downloadDirect(req.url, req.filename);
-      job.status = "done";
-      job.done = 1;
-    } catch (err) {
-      job.status = "error";
-      job.error = err instanceof Error ? err.message : String(err);
-    }
-    await upsertJob(job);
-    return { job, paired: false, merged: false };
-  }
-
+  // Direct files fetch in-app (offscreen) with the page's auth context so
+  // gated endpoints serve the real video, with validation + byte progress.
+  // Oversized files fall back to the browser via DOWNLOAD_ERROR fallback.
   await ensureOffscreen();
   await dispatchOffscreen(req, job);
   let paired = false;
@@ -1853,12 +1846,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await ensureJobsLoaded();
         const job = jobMemory.get(m.jobId);
         if (job) {
-          // A pause-then-cancel race can deliver a late abort after resume;
-          // only terminal states from a non-paused job finalize as error.
-          job.status = "error";
-          job.error = m.error ?? "Download failed.";
-          job.expired = m.expired === true;
-          await upsertJob(job);
+          // Oversized in-app fetches hand over to the browser, which has no
+          // memory cap — the download still completes, just without progress.
+          if (m.fallbackDirect === true && job.unit === "bytes") {
+            try {
+              const downloadId = await downloadDirect(job.itemUrl, job.filename);
+              void downloadId;
+              job.status = "done";
+              job.done = job.total || job.done;
+            } catch (err) {
+              job.status = "error";
+              job.error = err instanceof Error ? err.message : String(err);
+            }
+            await upsertJob(job);
+          } else {
+            // A pause-then-cancel race can deliver a late abort after resume;
+            // only terminal states from a non-paused job finalize as error.
+            job.status = "error";
+            job.error = m.error ?? "Download failed.";
+            job.expired = m.expired === true;
+            await upsertJob(job);
+          }
         }
         void maybeCloseOffscreen();
         sendResponse({ ok: true });

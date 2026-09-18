@@ -15,7 +15,12 @@ function shortUrl(url: string): string {
   try {
     const u = new URL(url);
     const path = u.pathname.length > 40 ? "…" + u.pathname.slice(-39) : u.pathname;
-    return u.host + path;
+    // Query strings often carry the per-video id (?id=…, ?token=…) — without
+    // them, sibling cards from one endpoint look identical.
+    const q = u.search.length > 1
+      ? u.search.slice(0, 15) + (u.search.length > 15 ? "…" : "")
+      : "";
+    return u.host + path + q;
   } catch {
     return url.slice(0, 60);
   }
@@ -465,6 +470,17 @@ function runningText(job: DownloadJobState): string {
     if (job.stage === "saving") return `Saving download… ${tail}`;
     return `Capturing… ${mbPair(job.done, job.total)} ${tail}`;
   }
+  // Direct single-stream downloads report raw bytes (done/total are bytes,
+  // total may be 0 when the server omits content-length).
+  if (job.unit === "bytes") {
+    if (job.stage === "assembling") return `Assembling file… ${tail}`;
+    if (job.stage === "saving") return `Saving download… ${tail}`;
+    const f = (b: number): string =>
+      b < 1_000_000 ? `${Math.max(0, Math.round(b / 1000))} KB` : `${(b / 1_000_000).toFixed(1)} MB`;
+    const have = f(job.bytesDone ?? job.done);
+    const want = job.total > 0 ? `/${f(job.total)}` : "";
+    return `Downloading… ${have}${want}${speedEta(job)} ${tail}`;
+  }
   if (job.stage === "assembling") return `Assembling file… ${tail}`;
   if (job.stage === "saving") return `Saving download… ${tail}`;
   if (job.total > 1) {
@@ -841,8 +857,9 @@ function jobLine(job: DownloadJobState, direct: boolean): { label: string; state
   return { label: `Failed: ${job.error ?? "unknown error"}`, state: "error" };
 }
 
-/** Segmented jobs (HLS/DASH/groups) support pause; direct + capture/blob stream do not. */
+/** Segmented jobs (HLS/DASH/groups) support pause; direct streams + capture/blob do not. */
 function isPausableJob(job: DownloadJobState): boolean {
+  if (job.unit === "bytes") return false;
   if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) return false;
   return true;
 }
@@ -859,7 +876,9 @@ function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, d
   // makes sense for multi-segment HLS/DASH jobs. Page-blob ("blobfile")
   // downloads stream slices for a while, so they keep Cancel too.
   const isBlobFile = (card.dataset.itemUrl ?? "").startsWith("blob:");
-  const showCancel = activeRelated.length > 0 && (!direct || isBlobFile);
+  // Direct in-app fetches are abortable streams, so they keep Cancel too.
+  const cancellable = activeRelated.filter((j) => !direct || isBlobFile || j.unit === "bytes");
+  const showCancel = cancellable.length > 0;
   if (showCancel) {
     if (!cancel) {
       cancel = document.createElement("button");
@@ -870,7 +889,7 @@ function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, d
     cancel.hidden = false;
     // Rebind every tick: retries create new jobIds for the same card, and
     // paired downloads need every active part cancelled.
-    const ids = activeRelated.map((j) => j.jobId);
+    const ids = cancellable.map((j) => j.jobId);
     cancel.onclick = (): void => {
       void (async () => {
         for (const id of ids) await cancelJob(id);
@@ -1076,7 +1095,9 @@ async function handleStartDownload(
               : `Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`,
         );
       } else {
-        setStatus("Download started.");
+        setStatus(
+          `Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`,
+        );
       }
       refreshCard(item.url);
       return;

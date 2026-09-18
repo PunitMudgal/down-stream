@@ -110,7 +110,7 @@ export type RuntimeMessage =
     }
   /** Offscreen saved the file itself (anchor download) — no bytes moved. */
   | { type: "DOWNLOAD_DONE"; jobId: string; filename: string }
-  | { type: "DOWNLOAD_ERROR"; jobId: string; error: string; expired?: boolean }
+  | { type: "DOWNLOAD_ERROR"; jobId: string; error: string; expired?: boolean; fallbackDirect?: boolean }
   | { type: "JOB_UPDATED"; job: DownloadJobState };
 
 export interface VideoSignal {
@@ -208,6 +208,8 @@ export interface DownloadJobState {
   status: DownloadJobStatus;
   done: number;
   total: number;
+  /** Progress unit: segment counts for HLS/DASH, raw bytes for direct streams. */
+  unit?: "segments" | "bytes";
   /** Bytes assembled so far (for speed/ETA). Segments vary in size. */
   bytesDone?: number;
   /** Wall-clock start of the job (for speed calc). */
