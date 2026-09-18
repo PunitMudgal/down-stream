@@ -9,6 +9,9 @@ import {
   fourcc,
   initOnlyStream,
   multiVideoTrakStream,
+  muxedFragmentedStream,
+  muxedStream,
+  psshInUdtaStream,
   u32,
   videoStream,
 } from "./helpers/fmp4";
@@ -72,7 +75,7 @@ describe("splitFmp4", () => {
 
   it("throws when there is no moov", () => {
     const frag = buildFragment({ trackId: 1, baseTime: 0, sequence: 1, samples: [{ dur: 2560, size: 10 }] });
-    expect(() => splitFmp4(frag)).toThrow(/ftyp\/moov/);
+    expect(() => splitFmp4(frag)).toThrow(/exactly one ftyp and one moov/);
   });
 
   it("throws when there are no fragments", () => {
@@ -242,6 +245,78 @@ describe("muxFmp4 — v1 (negative cts) path", () => {
     // First sample entry: dur(4), size(4), flags(4), then signed cts = -1280.
     const entry = trun.start + trun.header + 12; // ver/flags+count+offset
     expect(dv.getInt32(entry + 12)).toBe(-1280);
+  });
+});
+
+describe("muxFmp4 — validator hardening (byte-level gaps)", () => {
+  it("refuses sub-8-byte trailing junk that a partial box walk would silently drop", () => {
+    const audio = audioStream(2);
+    const junked = concat([videoStream(1), new Uint8Array(5).fill(0x41)]);
+    expect(() => muxFmp4(junked, audio)).toThrow(/trailing junk/);
+  });
+
+  it("refuses corrupt ≥8-byte trailing data instead of dropping it", () => {
+    const audio = audioStream(2);
+    // A 'free' box whose declared size overruns the buffer.
+    const junked = concat([videoStream(1), u32(0xffffff), fourcc("free"), new Uint8Array(40)]);
+    expect(() => muxFmp4(junked, audio)).toThrow(/Corrupt/);
+  });
+
+  it("refuses a second ftyp/moov mid-stream (joined file or second quality)", () => {
+    const audio = audioStream(2);
+    const joined = concat([videoStream(1), videoStream(3)]);
+    expect(() => muxFmp4(joined, audio)).toThrow(/exactly one ftyp/);
+  });
+
+  it("reorders media-before-init streams instead of producing garbage init", () => {
+    const audio = audioStream(2);
+    const stream = videoStream(1);
+    const { init } = splitFmp4(stream);
+    const media = stream.subarray(init.byteLength);
+    const out = muxFmp4(concat([media, init]), audio); // init at the END
+    expect(walk(out).map((b) => b.type).filter((t) => t === "moof")).toHaveLength(4);
+    expect(walk(out)[0].type).toBe("ftyp");
+  });
+
+  it("refuses pssh nested inside moov > udta (any-depth walk)", () => {
+    const audio = audioStream(2);
+    expect(() => muxFmp4(psshInUdtaStream(), audio)).toThrow(/Encrypted/);
+  });
+
+  it("refuses a muxed (vide+soun) fragmented init as one input", () => {
+    const audio = audioStream(2);
+    const stream = concat([muxedFragmentedStream(), buildFragment({ trackId: 1, baseTime: 0, sequence: 1, samples: [{ dur: 2560, size: 80 }] })]);
+    expect(() => muxFmp4(stream, audio)).toThrow(/mixes video and audio/);
+  });
+
+  it("refuses an init without mvex (non-fragmented MP4) before misleading errors", () => {
+    const audio = audioStream(2);
+    const stream = concat([muxedStream(), buildFragment({ trackId: 1, baseTime: 0, sequence: 1, samples: [{ dur: 2560, size: 80 }] })]);
+    expect(() => muxFmp4(stream, audio)).toThrow(/no mvex/);
+  });
+
+  it("refuses a fragment whose tfhd track id does not match the init", () => {
+    const audio = audioStream(2);
+    const { init } = splitFmp4(videoStream(1));
+    const foreign = buildFragment({ trackId: 7, baseTime: 0, sequence: 9, samples: [{ dur: 2560, size: 64 }] });
+    expect(() => muxFmp4(concat([init, foreign]), audio)).toThrow(/track 7/);
+  });
+
+  it("refuses a moof carrying two trafs for the same track", () => {
+    const audio = audioStream(2);
+    const { init } = splitFmp4(videoStream(1));
+    const frag = buildFragment({ trackId: 1, baseTime: 0, sequence: 3, samples: [{ dur: 2560, size: 64 }] });
+    const boxes = walk(frag);
+    const moof = boxes.find((b) => b.type === "moof")!;
+    const mdat = boxes.find((b) => b.type === "mdat")!;
+    const moofBytes = frag.subarray(moof.start, moof.start + moof.size);
+    const kids = childrenOf(moofBytes, moof);
+    const mfhd = kids[0];
+    const traf = kids.find((c) => c.type === "traf")!;
+    const trafBytes = moofBytes.subarray(traf.start, traf.start + traf.size);
+    const doubledMoof = box("moof", moofBytes.subarray(mfhd.start, mfhd.start + mfhd.size), trafBytes, trafBytes);
+    const doubled = concat([init, doubledMoof, frag.subarray(mdat.start)]);
+    expect(() => muxFmp4(doubled, audio)).toThrow(/two trafs/);
   });
 });
 

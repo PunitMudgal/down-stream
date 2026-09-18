@@ -14,8 +14,8 @@
  * - Each input fragment becomes one single-track output fragment, ordered
  *   chronologically across tracks. trun entries are rewritten fully explicit
  *   (duration/size/flags/cts) with recomputed data offsets.
- * - Encrypted input (senc/saiz/pssh) or non-fragmented input throws —
- *   never silently produce garbage.
+ * - Encrypted input (pssh at any nesting depth, senc/saiz/sbgp) or
+ *   non-fragmented input throws — never silently produce garbage.
  */
 
 export interface MuxSample {
@@ -97,6 +97,7 @@ function children(box: Box, type: string): Box[] {
 }
 
 function full(box: Box): { version: number; flags: number } {
+  if (box.data.byteLength < 4) throw new Error(`Corrupt '${box.type}' box: missing version/flags header.`);
   const d = dv(box.data, 0);
   return { version: d.getUint8(0), flags: (d.getUint8(1) << 16) | (d.getUint8(2) << 8) | d.getUint8(3) };
 }
@@ -152,11 +153,33 @@ export function mp4box(type: string, ...payloads: Uint8Array[]): Uint8Array {
 
 /** Split concatenated fMP4 bytes into init (ftyp+moov) + per-fragment chunks. */
 export function splitFmp4(u8: Uint8Array): { init: Uint8Array; frags: Uint8Array[] } {
+  // parseBoxes walks the WHOLE buffer and refuses corrupt/truncated boxes —
+  // trailing junk can never be silently dropped from the output.
   const boxes = parseBoxes(u8);
-  const initParts = boxes.filter((b) => b.type === "ftyp" || b.type === "moov");
-  const initTypes = initParts.map((b) => b.type);
-  if (!initTypes.includes("ftyp") || !initTypes.includes("moov")) {
-    throw new Error("Not fragmented MP4: init segment lacks ftyp/moov.");
+  if (boxes.length) {
+    const last = boxes[boxes.length - 1];
+    const consumed = last.start + last.size;
+    if (consumed !== u8.byteLength) {
+      // parseBoxes only refuses junk tails ≥ 8 bytes (its loop guard needs a
+      // full header); anything shorter is caught here.
+      throw new Error(`Corrupt MP4 stream: ${u8.byteLength - consumed} bytes of trailing junk after the last box.`);
+    }
+  }
+  const isInit = (b: Box): boolean => b.type === "ftyp" || b.type === "moov";
+  const initParts = boxes.filter(isInit);
+  const ftyps = boxes.filter((b) => b.type === "ftyp");
+  const moovs = boxes.filter((b) => b.type === "moov");
+  if (ftyps.length !== 1 || moovs.length !== 1) {
+    // A second ftyp/moov mid-stream means a second quality or a joined file.
+    throw new Error("Not fragmented MP4: expected exactly one ftyp and one moov in the stream.");
+  }
+  // Init (ftyp+moov) must lead the file. Media-before-header happens with
+  // out-of-order capture/salvage paths — header boxes are pure metadata, so
+  // reordering them is always safe.
+  const firstInitStart = initParts[0].start;
+  const firstMediaStart = boxes.find((b) => !isInit(b))?.start ?? Infinity;
+  if (firstMediaStart < firstInitStart) {
+    boxes.sort((a, b) => Number(isInit(b)) - Number(isInit(a)));
   }
   const init = concat(initParts.map((b) => u8.slice(b.start, b.start + b.size)));
   // Group top-level boxes into fragments: each moof starts one; trailing
@@ -165,7 +188,7 @@ export function splitFmp4(u8: Uint8Array): { init: Uint8Array; frags: Uint8Array
   let current: Uint8Array[] | null = null;
   let currentStart = 0;
   for (const b of boxes) {
-    if (b.type === "ftyp" || b.type === "moov") continue;
+    if (isInit(b)) continue;
     if (b.type === "moof") {
       if (current) frags.push(u8.slice(currentStart, b.start));
       current = [];
@@ -191,18 +214,42 @@ function parseTrex(mvex: Box | undefined, trackId: number): TrackDefaults {
   return def;
 }
 
+/** True if a pssh box hides anywhere inside this container (any depth). */
+function containsPssh(root: Box): boolean {
+  const stack: Box[] = [root];
+  let visited = 0;
+  while (stack.length > 0) {
+    const b = stack.pop()!;
+    if (++visited > 256) throw new Error("Init segment moov nesting is too deep — refusing to mux.");
+    if (b.type === "pssh") return true;
+    if (b.type === "mdat") continue; // opaque media payload
+    try {
+      // moov>meta is a FullBox: children start after version/flags.
+      const inner = b.type === "meta" ? parseBoxes(b.data.subarray(4)) : parseBoxes(b.data);
+      for (const c of inner) stack.push(c);
+    } catch {
+      /* opaque or corrupt payload — box sizes were already validated top-level */
+    }
+  }
+  return false;
+}
+
 function parseInitTrack(init: Uint8Array, wantHandler: "vide" | "soun"): ParsedTrack {
   const boxes = parseBoxes(init);
   const moov = boxes.find((b) => b.type === "moov");
   if (!moov) throw new Error("Init segment has no moov box.");
-  for (const pssh of children(moov, "pssh")) {
-    void pssh;
+  if (containsPssh(moov)) {
     throw new Error("Encrypted content (protection box) — refusing to mux.");
   }
+  // fMP4 by contract: fragments take their sample defaults from mvex/trex.
+  const mvex = child(moov, "mvex");
+  if (!mvex) throw new Error("Init segment has no mvex box — not a fragmented MP4 stream.");
   const traks = children(moov, "trak");
+  if (!traks.length) throw new Error("Init segment moov has no trak box.");
   // NOTE: child box offsets are relative to moov payload — rebase to init.
   const moovBase = moov.start + moov.header;
   const matches: ParsedTrack[] = [];
+  let mediaTracks = 0;
   for (const trak of traks) {
     const tkhd = child(trak, "tkhd");
     const mdia = child(trak, "mdia");
@@ -227,6 +274,7 @@ function parseInitTrack(init: Uint8Array, wantHandler: "vide" | "soun"): ParsedT
     if (stblBoxes.includes("saiz") || stblBoxes.includes("sbgp") || stblBoxes.includes("senc")) {
       throw new Error("Encrypted samples in track — refusing to mux.");
     }
+    if (handler === "vide" || handler === "soun") mediaTracks++;
     if (handler === wantHandler) {
       matches.push({
         id,
@@ -234,12 +282,15 @@ function parseInitTrack(init: Uint8Array, wantHandler: "vide" | "soun"): ParsedT
         handler,
         codec,
         trak: init.slice(moovBase + trak.start, moovBase + trak.start + trak.size),
-        trex: parseTrex(child(moov, "mvex"), id),
+        trex: parseTrex(mvex, id),
       });
     }
   }
-  if (!matches.length) throw new Error(`No ${wantHandler === "vide" ? "video" : "audio"} track in init segment.`);
   if (matches.length > 1) throw new Error("Multi-track input per stream is not supported.");
+  if (mediaTracks > 1) {
+    throw new Error("Init segment mixes video and audio tracks (muxed stream) — refusing to mux.");
+  }
+  if (!matches.length) throw new Error(`No ${wantHandler === "vide" ? "video" : "audio"} track in init segment.`);
   return matches[0];
 }
 
@@ -249,30 +300,39 @@ function parseTraf(traf: Box, trex: TrackDefaults): { trackId: number; baseTime:
   }
   const tfhd = child(traf, "tfhd");
   if (!tfhd) throw new Error("Fragment traf has no tfhd box.");
+  if (tfhd.data.byteLength < 8) throw new Error("Corrupt tfhd: missing version/flags or track_ID.");
   const tf = full(tfhd);
   const d = dv(tfhd.data, 0);
   let off = 4;
+  if (tfhd.data.byteLength < off + 4) throw new Error("Corrupt tfhd: missing track_ID.");
   const trackId = d.getUint32(off);
   off += 4;
   let defDur: number | null = null;
   let defSize: number | null = null;
   let defFlags: number | null = null;
   let firstFlags: number | null = null;
-  if (tf.flags & 0x000001) off += 8; // base_data_offset (normalized away on write)
-  if (tf.flags & 0x000002) off += 4; // sample_description_index
+  const need = (n: number): void => {
+    if (tfhd.data.byteLength < off + n) throw new Error("Corrupt tfhd: box ends mid-field.");
+  };
+  if (tf.flags & 0x000001) { need(8); off += 8; } // base_data_offset (normalized away on write)
+  if (tf.flags & 0x000002) { need(4); off += 4; } // sample_description_index
   if (tf.flags & 0x000008) {
+    need(4);
     defDur = d.getUint32(off);
     off += 4;
   }
   if (tf.flags & 0x000010) {
+    need(4);
     defSize = d.getUint32(off);
     off += 4;
   }
   if (tf.flags & 0x000020) {
+    need(4);
     defFlags = d.getUint32(off);
     off += 4;
   }
   if (tf.flags & 0x000004) {
+    need(4);
     firstFlags = d.getUint32(off);
     off += 4;
   }
@@ -281,6 +341,8 @@ function parseTraf(traf: Box, trex: TrackDefaults): { trackId: number; baseTime:
   const tfdt = child(traf, "tfdt");
   if (tfdt) {
     const v = full(tfdt);
+    const want = v.version === 1 ? 12 : 8;
+    if (tfdt.data.byteLength < want) throw new Error("Corrupt tfdt: truncated baseMediaDecodeTime.");
     baseTime = v.version === 1 ? Number(dv(tfdt.data, 0).getBigUint64(4)) : dv(tfdt.data, 0).getUint32(4);
   }
 
@@ -288,6 +350,7 @@ function parseTraf(traf: Box, trex: TrackDefaults): { trackId: number; baseTime:
   for (const trun of children(traf, "trun")) {
     const rf = full(trun);
     const rd = dv(trun.data, 0);
+    if (trun.data.byteLength < 8) throw new Error("Corrupt trun: missing sample_count.");
     const count = rd.getUint32(4);
     let ro = 8;
     if (rf.flags & 0x000001) ro += 4; // data_offset (recomputed on write)
@@ -446,8 +509,16 @@ export function muxFmp4(videoBytes: Uint8Array, audioBytes: Uint8Array): Uint8Ar
       if (!payloads.length) throw new Error("Fragment has no media data.");
       const trafs = children(moof, "traf");
       if (!trafs.length) throw new Error("Fragment moof has no traf box.");
+      const seenIds = new Set<number>();
       for (const traf of trafs) {
         const parsed = parseTraf(traf, track.trex);
+        if (parsed.trackId !== track.id) {
+          throw new Error(`Fragment references track ${parsed.trackId}, but the init segment describes track ${track.id}.`);
+        }
+        if (seenIds.has(parsed.trackId)) {
+          throw new Error("Fragment carries two trafs for the same track (muxed fragments are unsupported).");
+        }
+        seenIds.add(parsed.trackId);
         work.push({
           track: order,
           sec: parsed.baseTime / track.timescale,

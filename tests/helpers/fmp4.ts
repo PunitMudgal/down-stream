@@ -227,3 +227,70 @@ export function multiVideoTrakStream(): Uint8Array {
   const mvex = box("mvex", buildTrex(1), buildTrex(2));
   return concat([ftyp, box("moov", trakV1, trakV2, mvex)]);
 }
+
+/** Bare pssh box of the given payload size (DRM marker). */
+export function psshBox(payloadSize = 32): Uint8Array {
+  return box("pssh", new Uint8Array(payloadSize));
+}
+
+/**
+ * One moov carrying BOTH a video and an audio trak and no mvex — a muxed
+ * (player-style) MP4, exactly what orderAndValidateSegmentParts and the
+ * muxer must refuse. Doubles as the no-mvex (non-fragmented) fixture.
+ */
+export function muxedStream(): Uint8Array {
+  const ftyp = box("ftyp", fourcc("isom"), u32(0x200), fourcc("isom"));
+  const trakV = buildTrak({ trackId: 1, handler: "vide", codec4cc: "avc1", timescale: 12800, width: 64, height: 64 });
+  const trakA = buildTrak({ trackId: 2, handler: "soun", codec4cc: "mp4a", timescale: 48000 });
+  return concat([ftyp, box("moov", trakV, trakA)]);
+}
+
+/** vide+soun traks WITH mvex — fragmented layout but a muxed stream. */
+export function muxedFragmentedStream(): Uint8Array {
+  const ftyp = box("ftyp", fourcc("isom"), u32(0x200), fourcc("isom"));
+  const trakV = buildTrak({ trackId: 1, handler: "vide", codec4cc: "avc1", timescale: 12800, width: 64, height: 64 });
+  const trakA = buildTrak({ trackId: 2, handler: "soun", codec4cc: "mp4a", timescale: 48000 });
+  const mvex = box("mvex", buildTrex(1), buildTrex(2));
+  return concat([ftyp, box("moov", trakV, trakA, mvex)]);
+}
+
+/** pssh hidden inside moov > udta (common packager layout, any depth). */
+export function psshInUdtaStream(): Uint8Array {
+  const init = buildInit({ trackId: 1, handler: "vide", codec4cc: "avc1", timescale: 12800, width: 64, height: 64 });
+  const boxes = [...walkBoxes(init)];
+  const moov = boxes.find((b) => b.type === "moov")!;
+  const withUdta = concat([
+    init.subarray(moov.start, moov.start + moov.header),
+    init.subarray(moov.start + moov.header, moov.start + moov.size),
+    box("udta", psshBox(24)),
+  ]);
+  const moovSize = withUdta.byteLength;
+  withUdta.set(u32(moovSize), 0);
+  const ftyp = init.subarray(0, boxes.find((b) => b.type === "ftyp")!.size);
+  const f1 = buildFragment({ trackId: 1, baseTime: 0, sequence: 1, samples: [{ dur: 2560, size: 100 }] });
+  const f2 = buildFragment({ trackId: 1, baseTime: 2560, sequence: 2, samples: [{ dur: 2560, size: 80 }] });
+  return concat([ftyp, withUdta, f1, f2]);
+}
+
+// ---- internal box walker for fixture post-processing --------------------
+
+interface RawBox {
+  type: string;
+  start: number;
+  size: number;
+  header: number;
+}
+
+function walkBoxes(u8: Uint8Array): RawBox[] {
+  const out: RawBox[] = [];
+  let off = 0;
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  while (off + 8 <= u8.byteLength) {
+    const size = dv.getUint32(off);
+    const type = String.fromCharCode(u8[off + 4], u8[off + 5], u8[off + 6], u8[off + 7]);
+    if (size < 8 || off + size > u8.byteLength) break;
+    out.push({ type, start: off, size, header: 8 });
+    off += size;
+  }
+  return out;
+}
