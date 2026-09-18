@@ -1,14 +1,16 @@
 import {
-  assembleHlsBlob,
-  assembleDashBlob,
   blobToDataUrl,
   fetchSegments,
+  isExpiredFailure,
+  orderAndValidateSegmentParts,
 } from "./lib/download";
 import { extractHlsSegments } from "./lib/parseHls";
 import { muxFmp4 } from "./lib/mp4mux";
 import type { DownloadJobRequest, DownloadJobStage } from "./lib/types";
 
 const controllers = new Map<string, AbortController>();
+/** Jobs currently paused — fetch workers wait instead of taking new segments. */
+const pausedJobs = new Set<string>();
 
 /** Upper bound for one assembled file (matches the fetch-side cap). */
 const MAX_ASSEMBLED_BYTES = 1_500_000_000;
@@ -66,13 +68,17 @@ async function finalizeJobFile(jobId: string, blob: Blob, filename: string): Pro
       }
       throw err;
     }
+    // The browser streams the download FROM the blob URL for the whole
+    // transfer — revoking early aborts slow/large downloads. A 1.5 GB file
+    // at 0.5 Mbps needs ~7h; keep the URL alive 12h (the offscreen document
+    // closing reclaims it sooner anyway).
     setTimeout(() => {
       try {
         URL.revokeObjectURL(url);
       } catch {
         /* ignore */
       }
-    }, 120_000);
+    }, 12 * 3_600_000);
     // Grace period for the browser to claim the blob URL before reporting.
     await new Promise((r) => setTimeout(r, 1500));
     report({ type: "DOWNLOAD_DONE", jobId, filename });
@@ -165,6 +171,90 @@ function toU8(parts: ArrayBuffer[]): Uint8Array {
   return out;
 }
 
+type ByteProgress = (done: number, total: number, bytesDone?: number) => void;
+
+function partialsOf(err: unknown): Array<ArrayBuffer | undefined> | undefined {
+  const p = (err as unknown as Record<string, unknown> | null)?.partials;
+  return Array.isArray(p) ? (p as Array<ArrayBuffer | undefined>) : undefined;
+}
+
+/**
+ * HLS fetch with one automatic playlist refresh. Signed segment URLs expire
+ * mid-download (403/410); re-resolving the variant playlist usually yields
+ * fresh URLs for the same indices. Completed parts are kept — only holes
+ * are retried with the refreshed list.
+ */
+async function fetchHlsSegmentsWithRefresh(
+  jobId: string,
+  variantUrl: string,
+  scope: NetScope | undefined,
+  signal: AbortSignal,
+  onProgress: ByteProgress,
+): Promise<ArrayBuffer[]> {
+  const isPaused = (): boolean => pausedJobs.has(jobId);
+  const text = await textWithNet(variantUrl, scope, signal);
+  if (/#EXT-X-KEY\s*:\s*[^\r\n]*METHOD\s*=\s*(?!NONE\b)/i.test(text)) {
+    throw new Error("Protected content — cannot download (encrypted HLS).");
+  }
+  const urls = extractHlsSegments(text, variantUrl);
+  if (!urls.length) throw new Error("No segments found in the HLS variant playlist.");
+  try {
+    return await fetchSegments(urls, onProgress, signal, scope, { isPaused });
+  } catch (err) {
+    if (signal.aborted || pausedJobs.has(jobId) || !isExpiredFailure(err)) throw err;
+    // One refresh attempt: re-resolve the playlist for fresh signed URLs.
+    let fresh: string[];
+    try {
+      const retryText = await textWithNet(variantUrl, scope, signal);
+      fresh = extractHlsSegments(retryText, variantUrl);
+    } catch {
+      throw err; // refresh itself failed — surface the original expiry error
+    }
+    const partials = partialsOf(err);
+    if (!fresh.length || !partials || partials.length !== urls.length) throw err;
+    // Remap by index when the refreshed playlist matches (VOD case).
+    // If the playlist slid (live) or resized, restart cleanly with fresh URLs.
+    const sameLength = fresh.length === urls.length;
+    return await fetchSegments(fresh, onProgress, signal, scope, {
+      isPaused,
+      existingParts: sameLength ? partials : undefined,
+    });
+  }
+}
+
+async function assembleHlsBlob(
+  jobId: string,
+  variantPlaylistUrl: string,
+  onProgress?: ByteProgress,
+  signal?: AbortSignal,
+  scope?: NetScope | undefined,
+): Promise<Blob> {
+  if (signal?.aborted) throw new Error("Download cancelled.");
+  const parts = await fetchHlsSegmentsWithRefresh(
+    jobId,
+    variantPlaylistUrl,
+    scope,
+    signal as AbortSignal,
+    onProgress ?? (() => undefined),
+  );
+  if (signal?.aborted) throw new Error("Download cancelled.");
+  return new Blob(orderAndValidateSegmentParts(parts), { type: "video/mp2t" });
+}
+
+async function assembleDashBlob(
+  jobId: string,
+  segmentUrls: string[],
+  onProgress?: ByteProgress,
+  signal?: AbortSignal,
+  scope?: NetScope | undefined,
+): Promise<Blob> {
+  if (!segmentUrls.length) throw new Error("No segments listed for this DASH variant.");
+  const isPaused = (): boolean => pausedJobs.has(jobId);
+  const parts = await fetchSegments(segmentUrls, onProgress, signal, scope, { isPaused });
+  if (signal?.aborted) throw new Error("Download cancelled.");
+  return new Blob(orderAndValidateSegmentParts(parts), { type: "video/mp4" });
+}
+
 /**
  * Fetch both tracks (progress combined across the two lists) and merge
  * into one multi-track fMP4. Throws a clear error for non-fMP4 pairs.
@@ -174,7 +264,7 @@ async function assembleMuxedBlob(
   pairUrls: string[],
   scope: NetScope | undefined,
   signal: AbortSignal,
-  onProgress: (done: number, total: number) => void,
+  onProgress: (done: number, total: number, bytesDone?: number) => void,
 ): Promise<Blob> {
   let mainUrls: string[];
   if (job.kind === "hls") {
@@ -187,15 +277,26 @@ async function assembleMuxedBlob(
   }
   const total = mainUrls.length + pairUrls.length;
   let done = 0;
-  const prog = (d: number, t: number) => {
-    void t;
+  let bytesDone = 0;
+  let vBytes = 0;
+  let aBytes = 0;
+  const isPaused = (): boolean => pausedJobs.has(job.jobId);
+  const progV = (_d: number, _t: number, b?: number): void => {
     done++;
-    onProgress(done, total);
+    if (typeof b === "number") vBytes = b;
+    bytesDone = vBytes + aBytes;
+    onProgress(done, total, bytesDone);
+  };
+  const progA = (_d: number, _t: number, b?: number): void => {
+    done++;
+    if (typeof b === "number") aBytes = b;
+    bytesDone = vBytes + aBytes;
+    onProgress(done, total, bytesDone);
   };
   // Video first, then audio — order irrelevant, progress combined.
   const [vParts, aParts] = await Promise.all([
-    fetchSegments(mainUrls, prog, signal, scope),
-    fetchSegments(pairUrls, prog, signal, scope),
+    fetchSegments(mainUrls, progV, signal, scope, { isPaused }),
+    fetchSegments(pairUrls, progA, signal, scope, { isPaused }),
   ]);
   stage(job.jobId, "assembling");
   let merged: Uint8Array;
@@ -215,7 +316,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (m?.type === "OFFSCREEN_CANCEL" && typeof m.jobId === "string") {
     controllers.get(m.jobId)?.abort();
     captures.delete(m.jobId);
+    pausedJobs.delete(m.jobId);
     cancelledCaptures.add(m.jobId);
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "OFFSCREEN_PAUSE" && typeof m.jobId === "string") {
+    pausedJobs.add(m.jobId);
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "OFFSCREEN_RESUME" && typeof m.jobId === "string") {
+    pausedJobs.delete(m.jobId);
     try {
       sendResponse({ ok: true });
     } catch {
@@ -349,8 +469,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (job.kind === "direct") {
         throw new Error("Direct downloads are handled by the service worker.");
       }
-      const onProgress = (done: number, total: number) =>
-        report({ type: "DOWNLOAD_PROGRESS", jobId: job.jobId, done, total });
+      const onProgress = (done: number, total: number, bytesDone?: number) =>
+        report({ type: "DOWNLOAD_PROGRESS", jobId: job.jobId, done, total, bytesDone });
       stage(job.jobId, "fetching");
       const scope = job.netScope;
 
@@ -365,8 +485,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       } else {
         blob =
           job.kind === "hls"
-            ? await assembleHlsBlob(job.url, onProgress, signal, scope)
-            : await assembleDashBlob(job.segments ?? [], onProgress, signal, scope);
+            ? await assembleHlsBlob(job.jobId, job.url, onProgress, signal, scope)
+            : await assembleDashBlob(job.jobId, job.segments ?? [], onProgress, signal, scope);
         const ext = await sniffExtension(blob, job.kind === "hls" ? ".ts" : ".mp4");
         filename = withExtension(job.filename, ext);
       }
@@ -374,13 +494,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       stage(job.jobId, "assembling");
       await finalizeJobFile(job.jobId, blob, filename);
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       report({
         type: "DOWNLOAD_ERROR",
         jobId: job.jobId,
-        error: err instanceof Error ? err.message : String(err),
-      });
+        error: message,
+        expired: isExpiredFailure(err),
+      } as unknown as Record<string, unknown> as never);
     } finally {
       controllers.delete(job.jobId);
+      pausedJobs.delete(job.jobId);
     }
   })();
   return false;

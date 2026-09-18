@@ -1,7 +1,20 @@
 import { extractHlsSegments } from "./parseHls";
 import type { NetReplay } from "./types";
 
-export type ProgressCallback = (done: number, total: number) => void;
+export type ProgressCallback = (done: number, total: number, bytesDone?: number) => void;
+
+export interface FetchSegmentsOptions {
+  /** When true, workers wait instead of picking new segments (pause without abort). */
+  isPaused?: () => boolean;
+  /** Pre-filled parts to resume from (holes are undefined). Length must match urls. */
+  existingParts?: Array<ArrayBuffer | undefined>;
+}
+
+/** True when a fetch failure looks like expired signed URLs / blocked chunk. */
+export function isExpiredFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /unavailable \(40|error page instead of video|isn't video data/i.test(err.message);
+}
 
 export function sanitizeFilename(name: string, fallback: string): string {
   const cleaned = name
@@ -429,12 +442,16 @@ export function orderAndValidateSegmentParts(parts: ArrayBuffer[]): ArrayBuffer[
 /**
  * Fetch segment URLs with bounded parallelism, retries, and safety caps.
  * Returns ordered ArrayBuffers (caller decides concat vs mux).
+ * Supports pause (workers wait while isPaused) and resume via existingParts.
+ * On failure, partial parts are attached to the thrown error as `partials`
+ * so callers can retry only the holes (e.g. after playlist refresh).
  */
 export async function fetchSegments(
   urls: string[],
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
   scope?: { byOrigin: Record<string, NetReplay> },
+  opts?: FetchSegmentsOptions,
 ): Promise<ArrayBuffer[]> {
   if (urls.length === 0) throw new Error("No segments to download.");
   if (urls.length > MAX_SEGMENTS) {
@@ -443,29 +460,73 @@ export async function fetchSegments(
     );
   }
   const total = urls.length;
-  const parts: ArrayBuffer[] = new Array(total);
+  const parts: Array<ArrayBuffer | undefined> = opts?.existingParts?.length === total
+    ? [...opts.existingParts]
+    : new Array(total);
   let done = 0;
   let bytes = 0;
+  for (let i = 0; i < total; i++) {
+    if (parts[i]) {
+      done++;
+      bytes += parts[i]!.byteLength;
+    }
+  }
+  if (done > 0) onProgress?.(done, total, bytes);
+  // Skip-ahead cursor: start after the leading run of completed parts so a
+  // resume doesn't re-queue everything through the pool.
   let next = 0;
+  while (next < total && parts[next]) next++;
+  const waitWhilePaused = async (): Promise<void> => {
+    while (opts?.isPaused?.()) {
+      throwIfAborted(signal);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  };
+  let firstErr: unknown = null;
   const worker = async (): Promise<void> => {
     while (true) {
       throwIfAborted(signal);
+      // Drain, don't stampede: after one segment fails, in-flight fetches
+      // finish (their bytes are kept in partials) but no NEW indices start —
+      // the remainder will be retried with refreshed URLs by the caller.
+      if (firstErr) return;
+      await waitWhilePaused();
+      if (firstErr) return;
       const i = next++;
       if (i >= total) return;
-      const buf = await fetchBuffer(urls[i], signal, scope);
-      parts[i] = buf;
-      bytes += buf.byteLength;
-      if (bytes > MAX_BYTES) {
-        throw new Error("Video exceeds the 1.5 GB safety cap — download stopped.");
+      // Skip holes filled by a racing worker after resume mapping.
+      if (parts[i]) continue;
+      try {
+        const buf = await fetchBuffer(urls[i], signal, scope);
+        parts[i] = buf;
+        bytes += buf.byteLength;
+        if (bytes > MAX_BYTES) {
+          if (!firstErr) {
+            firstErr = new Error("Video exceeds the 1.5 GB safety cap — download stopped.");
+          }
+          return;
+        }
+        done++;
+        onProgress?.(done, total, bytes);
+      } catch (err) {
+        // Cancel keeps fail-fast semantics (nothing is resumable anyway).
+        if (signal?.aborted) throw err;
+        if (!firstErr) firstErr = err;
+        return;
       }
-      done++;
-      onProgress?.(done, total);
     }
   };
   const pool = Math.min(FETCH_CONCURRENCY, total);
   await Promise.all(Array.from({ length: pool }, () => worker()));
   throwIfAborted(signal);
-  return parts;
+  if (firstErr) {
+    // Preserve partial progress for refresh-and-retry callers.
+    if (firstErr && typeof firstErr === "object" && !("partials" in (firstErr as object))) {
+      (firstErr as unknown as Record<string, unknown>).partials = parts;
+    }
+    throw firstErr;
+  }
+  return parts as ArrayBuffer[];
 }
 
 /**

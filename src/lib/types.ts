@@ -84,7 +84,11 @@ export type RuntimeMessage =
     }
   | { type: "GET_JOBS"; tabId: number }
   | { type: "CANCEL_JOB"; jobId: string }
+  | { type: "PAUSE_JOB"; jobId: string }
+  | { type: "RESUME_JOB"; jobId: string }
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
+  | { type: "OFFSCREEN_PAUSE"; jobId: string }
+  | { type: "OFFSCREEN_RESUME"; jobId: string }
   | { type: "FETCH_TEXT"; tabId: number; url: string }
   // --- MSE capture transfer (content script <-> hook <-> offscreen) ---
   | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string; pairTrackIdx?: number }
@@ -96,7 +100,7 @@ export type RuntimeMessage =
   | { type: "MS_TRACK_END"; jobId: string }
   // --- Offscreen <-> background ---
   | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
-  | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number }
+  | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number; bytesDone?: number }
   | { type: "JOB_STAGE"; jobId: string; stage: DownloadJobStage }
   | {
       type: "DOWNLOAD_BLOB";
@@ -106,7 +110,7 @@ export type RuntimeMessage =
     }
   /** Offscreen saved the file itself (anchor download) — no bytes moved. */
   | { type: "DOWNLOAD_DONE"; jobId: string; filename: string }
-  | { type: "DOWNLOAD_ERROR"; jobId: string; error: string }
+  | { type: "DOWNLOAD_ERROR"; jobId: string; error: string; expired?: boolean }
   | { type: "JOB_UPDATED"; job: DownloadJobState };
 
 export interface VideoSignal {
@@ -164,6 +168,7 @@ export interface DownloadJobRequest {
 
 export type DownloadJobStatus =
   | "running"
+  | "paused"
   | "done"
   | "error";
 
@@ -203,8 +208,14 @@ export interface DownloadJobState {
   status: DownloadJobStatus;
   done: number;
   total: number;
+  /** Bytes assembled so far (for speed/ETA). Segments vary in size. */
+  bytesDone?: number;
+  /** Wall-clock start of the job (for speed calc). */
+  startedAt?: number;
   stage?: DownloadJobStage;
   downloadId?: number;
   error?: string;
+  /** True when the failure looks like expired signed URLs (offers Refresh & Retry). */
+  expired?: boolean;
   updatedAt: number;
 }

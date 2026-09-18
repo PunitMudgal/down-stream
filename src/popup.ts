@@ -380,8 +380,41 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number, pageTitle?: st
 }
 
 function jobForItem(itemUrl: string): DownloadJobState | undefined {
-  const related = jobs.filter((j) => j.itemUrl === itemUrl);
-  return related.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return jobsForItem(itemUrl)[0];
+}
+
+/** All jobs for one card, newest first (paired A/V downloads create two). */
+function jobsForItem(itemUrl: string): DownloadJobState[] {
+  return jobs
+    .filter((j) => j.itemUrl === itemUrl)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * Combined label for cards with two active part-jobs (split A/V two-file
+ * downloads share one itemUrl). Without this the card flickers between the
+ * two jobs on every progress tick.
+ */
+function combinedLine(related: DownloadJobState[], direct: boolean): { label: string; state: string } {
+  const active = related.filter((j) => j.status === "running" || j.status === "paused");
+  if (active.length > 1) {
+    const anyRunning = active.some((j) => j.status === "running");
+    const segs = active.map((j) => `${j.done}/${j.total}`).join(" + ");
+    const bytes = active.reduce((n, j) => n + (j.bytesDone ?? 0), 0);
+    const mb = bytes > 0 ? ` • ${(bytes / 1_000_000).toFixed(1)} MB` : "";
+    const tail = "(safe to close popup)";
+    if (!anyRunning) return { label: `Paused (${segs} segments) — resume to continue.`, state: "paused" };
+    return { label: `Fetching 2 parts… ${segs} segments${mb} ${tail}`, state: "running" };
+  }
+  // One part still active while its sibling finished: keep showing progress,
+  // never a premature "Done".
+  if (active.length === 1) return jobLine(active[0], direct);
+  if (related.length > 1 && related.every((j) => j.status === "done")) {
+    return { label: "Done — check your downloads folder.", state: "done" };
+  }
+  const job = related[0];
+  if (!job) return { label: "", state: "idle" };
+  return jobLine(job, direct);
 }
 
 function mbPair(done: number, total: number): string {
@@ -390,8 +423,43 @@ function mbPair(done: number, total: number): string {
   return total > 0 ? `${f(done)}/${f(total)}` : f(done);
 }
 
+function formatSpeed(bps: number): string {
+  if (!Number.isFinite(bps) || bps <= 0) return "";
+  if (bps < 1_000_000) return `${Math.max(1, Math.round(bps / 1000))} KB/s`;
+  return `${(bps / 1_000_000).toFixed(1)} MB/s`;
+}
+
+function formatEta(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "";
+  const s = Math.round(sec);
+  if (s < 5) return "~a few sec left";
+  if (s < 60) return `~${s}s left`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `~${m}m ${s % 60}s left`;
+  return `~${Math.floor(m / 60)}h ${m % 60}m left`;
+}
+
+/** Speed + ETA from bytesDone/startedAt; segment-average estimates the remainder. */
+function speedEta(job: DownloadJobState): string {
+  const bytes = job.bytesDone ?? 0;
+  const start = job.startedAt ?? job.updatedAt ?? Date.now();
+  const elapsed = Math.max(1, (Date.now() - start) / 1000);
+  if (bytes < 50_000) return "";
+  const speed = bytes / elapsed;
+  const speedStr = formatSpeed(speed);
+  if (!speedStr || job.done < 3 || job.total <= job.done) return speedStr ? ` • ${speedStr}` : "";
+  const avg = bytes / Math.max(1, job.done);
+  const remainingBytes = avg * (job.total - job.done);
+  const eta = formatEta(remainingBytes / Math.max(1, speed));
+  return ` • ${speedStr}${eta ? ` • ${eta}` : ""}`;
+}
+
 function runningText(job: DownloadJobState): string {
   const tail = "(safe to close popup)";
+  if (job.status === "paused") {
+    const segs = job.total > 1 ? ` ${job.done}/${job.total} segments` : "";
+    return `Paused${segs} — resume to continue.`;
+  }
   if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
     if (job.stage === "assembling") return `Assembling capture… ${tail}`;
     if (job.stage === "saving") return `Saving download… ${tail}`;
@@ -399,7 +467,12 @@ function runningText(job: DownloadJobState): string {
   }
   if (job.stage === "assembling") return `Assembling file… ${tail}`;
   if (job.stage === "saving") return `Saving download… ${tail}`;
-  if (job.total > 1) return `Fetching… ${job.done}/${job.total} segments ${tail}`;
+  if (job.total > 1) {
+    const mb = job.bytesDone && job.bytesDone > 0
+      ? ` • ${(job.bytesDone / 1_000_000).toFixed(1)} MB`
+      : "";
+    return `Fetching… ${job.done}/${job.total} segments${mb}${speedEta(job)} ${tail}`;
+  }
   return `Downloading… ${tail}`;
 }
 
@@ -760,31 +833,71 @@ function isDirect(item: MediaItem): boolean {
 }
 
 function jobLine(job: DownloadJobState, direct: boolean): { label: string; state: string } {
+  if (job.status === "paused") return { label: runningText(job), state: "paused" };
   if (job.status === "running") return { label: runningText(job), state: "running" };
   if (job.status === "done") return { label: "Done — check your downloads folder.", state: "done" };
   if (/cancelled/i.test(job.error ?? "")) return { label: "Cancelled.", state: "cancelled" };
+  if (job.expired) return { label: `Link expired mid-download: ${job.error ?? ""} Hit Refresh & Retry for fresh URLs.`, state: "error" };
   return { label: `Failed: ${job.error ?? "unknown error"}`, state: "error" };
 }
 
+/** Segmented jobs (HLS/DASH/groups) support pause; direct + capture/blob stream do not. */
+function isPausableJob(job: DownloadJobState): boolean {
+  if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) return false;
+  return true;
+}
+
 function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, direct: boolean): void {
+  // Resolve the full related set: paired A/V downloads share one card, so
+  // Cancel/Pause must act on BOTH part-jobs, not just the latest tick.
+  const itemUrl = card.dataset.itemUrl ?? job?.itemUrl ?? "";
+  const related = itemUrl ? jobsForItem(itemUrl) : job ? [job] : [];
+  const activeRelated = related.filter((j) => j.status === "running" || j.status === "paused");
   let cancel = card.querySelector("button.cancelbtn") as HTMLButtonElement | null;
+  let pause = card.querySelector("button.pausebtn") as HTMLButtonElement | null;
   // Direct downloads finish near-instantly via the browser — cancel only
   // makes sense for multi-segment HLS/DASH jobs. Page-blob ("blobfile")
   // downloads stream slices for a while, so they keep Cancel too.
   const isBlobFile = (card.dataset.itemUrl ?? "").startsWith("blob:");
-  const showCancel = job?.status === "running" && (!direct || isBlobFile);
+  const showCancel = activeRelated.length > 0 && (!direct || isBlobFile);
   if (showCancel) {
     if (!cancel) {
-      const jid = job.jobId;
       cancel = document.createElement("button");
       cancel.className = "ghost cancelbtn";
       cancel.textContent = "Cancel";
-      cancel.onclick = () => void cancelJob(jid);
       card.querySelector(".meta")?.appendChild(cancel);
     }
     cancel.hidden = false;
+    // Rebind every tick: retries create new jobIds for the same card, and
+    // paired downloads need every active part cancelled.
+    const ids = activeRelated.map((j) => j.jobId);
+    cancel.onclick = (): void => {
+      void (async () => {
+        for (const id of ids) await cancelJob(id);
+      })();
+    };
   } else if (cancel) {
     cancel.hidden = true;
+  }
+  const pausable = activeRelated.filter((j) => !direct && isPausableJob(j));
+  const showPause = pausable.length > 0;
+  if (showPause) {
+    if (!pause) {
+      pause = document.createElement("button");
+      pause.className = "ghost pausebtn";
+      card.querySelector(".meta")?.appendChild(pause);
+    }
+    pause.hidden = false;
+    const allPaused = pausable.every((j) => j.status === "paused");
+    pause.textContent = allPaused ? "Resume" : "Pause";
+    const ids = pausable.map((j) => j.jobId);
+    pause.onclick = (): void => {
+      void (async () => {
+        for (const id of ids) await (allPaused ? resumeJob(id) : pauseJob(id));
+      })();
+    };
+  } else if (pause) {
+    pause.hidden = true;
   }
 }
 
@@ -793,15 +906,16 @@ function paintJobState(card: HTMLElement, item: MediaItem): void {
   const prog = card.querySelector(".progress") as HTMLElement | null;
   const btn = card.querySelector("button.dl") as HTMLButtonElement | null;
   if (!prog || !btn) return;
-  const job = jobForItem(item.url);
+  const related = jobsForItem(item.url);
+  const job = related[0];
   if (!job) {
     prog.hidden = true;
     btn.disabled = false;
     return;
   }
   const direct = isDirect(item);
-  const line = jobLine(job, direct);
-  if (line.state === "running") {
+  const line = combinedLine(related, direct);
+  if (line.state === "running" || line.state === "paused") {
     btn.disabled = true;
     prog.hidden = false;
     prog.textContent = line.label;
@@ -812,6 +926,7 @@ function paintJobState(card: HTMLElement, item: MediaItem): void {
     prog.textContent = line.label;
   } else {
     btn.disabled = false;
+    btn.textContent = related.some((j) => j.expired) ? "Refresh & Retry" : "Retry";
     prog.hidden = false;
     prog.textContent = line.label;
   }
@@ -824,12 +939,13 @@ function refreshCard(itemUrl: string): void {
   const prog = card.querySelector(".progress") as HTMLElement | null;
   const btn = card.querySelector("button.dl") as HTMLButtonElement | null;
   if (!prog || !btn) return;
-  const job = jobForItem(itemUrl);
+  const related = jobsForItem(itemUrl);
+  const job = related[0];
   if (!job) return;
   const badge = card.querySelector(".badge")?.textContent ?? "";
   const direct = DIRECT_BADGES.has(badge);
-  const line = jobLine(job, direct);
-  if (line.state === "running") {
+  const line = combinedLine(related, direct);
+  if (line.state === "running" || line.state === "paused") {
     btn.disabled = true;
     prog.hidden = false;
     prog.textContent = line.label;
@@ -840,10 +956,37 @@ function refreshCard(itemUrl: string): void {
     prog.textContent = line.label;
   } else {
     btn.disabled = false;
+    btn.textContent = related.some((j) => j.expired) ? "Refresh & Retry" : "Retry";
     prog.hidden = false;
     prog.textContent = line.label;
   }
   paintJobButtons(card, job, direct);
+}
+
+async function pauseJob(jobId: string): Promise<void> {
+  try {
+    await withTimeout(
+      chrome.runtime.sendMessage({ type: "PAUSE_JOB", jobId }),
+      8000,
+      "Pausing",
+    );
+    setStatus("Paused — resume anytime. Fetched parts are kept.");
+  } catch (err) {
+    setStatus(`Pause failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function resumeJob(jobId: string): Promise<void> {
+  try {
+    await withTimeout(
+      chrome.runtime.sendMessage({ type: "RESUME_JOB", jobId }),
+      8000,
+      "Resuming",
+    );
+    setStatus("Resuming…");
+  } catch (err) {
+    setStatus(`Resume failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 async function cancelJob(jobId: string): Promise<void> {
@@ -988,6 +1131,17 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   return false;
 });
+
+// 1s ticker so speed/ETA on running jobs stays live even between segments.
+setInterval(() => {
+  try {
+    for (const j of jobs) {
+      if (j.status === "running" || j.status === "paused") refreshCard(j.itemUrl);
+    }
+  } catch {
+    /* ignore */
+  }
+}, 1000);
 
 rescanBtn.onclick = () => {
   void (async () => {

@@ -42,6 +42,6 @@
       "world": "MAIN"
     }
   ],
-  "permissions": ["activeTab", "webRequest", "downloads", "storage", "scripting", "offscreen", "clipboardWrite"],
+  "permissions": ["activeTab", "webRequest", "webNavigation", "downloads", "storage", "scripting", "offscreen", "clipboardWrite"],
   "host_permissions": ["<all_urls>"]
 }

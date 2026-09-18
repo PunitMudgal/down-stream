@@ -801,8 +801,11 @@ function safeWire(label: string, fn: () => void): void {
 }
 
 safeWire("webRequest.send", () => {
+  // extraHeaders is required to SEE Authorization/Referer — without it the
+  // capture silently misses auth and every replayed fetch 403s.
   chrome.webRequest.onSendHeaders.addListener(onSendHeaders, { urls: ["http://*/*", "https://*/*"] }, [
     "requestHeaders",
+    "extraHeaders",
   ]);
 });
 
@@ -1275,8 +1278,10 @@ async function ensureOffscreen(): Promise<void> {
 
 async function maybeCloseOffscreen(): Promise<void> {
   await ensureJobsLoaded();
-  const running = [...jobMemory.values()].some((j) => j.status === "running");
-  if (running) return;
+  // Paused jobs keep their fetched parts in the offscreen document — never
+  // close it while anything is running OR paused.
+  const active = [...jobMemory.values()].some((j) => j.status === "running" || j.status === "paused");
+  if (active) return;
   try {
     if (await offscreenExists()) {
       await chrome.offscreen.closeDocument();
@@ -1292,10 +1297,13 @@ async function maybeCloseOffscreen(): Promise<void> {
  * Fail-closed to false (two files) on any fetch/parse problem.
  */
 async function probeHlsFmp4(tabId: number, variantUrl: string): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15_000);
   try {
     const net = lookupNet(tabId, variantUrl);
     const res = await fetch(variantUrl, {
       credentials: "include",
+      signal: ctrl.signal,
       headers: net?.headers,
       referrer: net?.referrer,
       referrerPolicy: net?.referrer ? "unsafe-url" : undefined,
@@ -1309,6 +1317,8 @@ async function probeHlsFmp4(tabId: number, variantUrl: string): Promise<boolean>
     return false;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1347,6 +1357,8 @@ async function startDownload(
       status: "running",
       done: 0,
       total: 0,
+      bytesDone: 0,
+      startedAt: Date.now(),
       stage: "fetching",
       updatedAt: Date.now(),
     };
@@ -1399,6 +1411,8 @@ async function startDownload(
       status: "running",
       done: 0,
       total: 0,
+      bytesDone: 0,
+      startedAt: Date.now(),
       stage: "fetching",
       updatedAt: Date.now(),
     };
@@ -1476,20 +1490,43 @@ async function startDownload(
         }
       }
     } else {
-      if (!variant.segments?.length) throw new Error("No segments listed for this DASH variant.");
+      // DASH: re-resolve the manifest at download time so signed segment
+      // URLs are fresh (stored variants may have expired since detection).
+      let dashVariant = variant;
+      let dashAudio = item.variants?.find((v) => {
+        const c = codecsOf(v);
+        return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
+      });
+      try {
+        const freshText = await fetchManifestText(tabId, item.url);
+        const fresh = parseDashManifest(freshText, item.url);
+        const fv = fresh.variants.find((v) => v.id === variant.id) ?? fresh.variants[0];
+        if (fv?.segments?.length) {
+          dashVariant = { ...variant, segments: fv.segments };
+          const fa = fresh.variants.find((v) => {
+            const c = codecsOf(v);
+            return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
+          });
+          if (fa?.segments?.length) {
+            dashAudio = { ...dashAudio, ...fa } as typeof dashAudio;
+          }
+          // Persist fresh segments so an immediate retry doesn't reuse stale URLs.
+          await patchItem(tabId, item.url, { variants: fresh.variants });
+        }
+      } catch {
+        /* offline/expired manifest — fall back to stored segments */
+      }
+      if (!dashVariant.segments?.length) throw new Error("No segments listed for this DASH variant.");
       consider(item.url);
-      for (const s of variant.segments) consider(s);
-      req = { jobId, tabId, kind: "dash", url: item.url, segments: variant.segments, filename: item.filename, mime: "video/mp4" };
-      const cc = codecsOf(variant);
-      if (hasVideoCodec(cc) && !hasAudioCodec(cc) && item.variants) {
-        const audio = item.variants.find((v) => {
-          const c = codecsOf(v);
-          return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
-        });
+      for (const s of dashVariant.segments) consider(s);
+      req = { jobId, tabId, kind: "dash", url: item.url, segments: dashVariant.segments, filename: item.filename, mime: "video/mp4" };
+      const cc = codecsOf(dashVariant);
+      if (hasVideoCodec(cc) && !hasAudioCodec(cc)) {
+        const audio = dashAudio;
         if (audio?.segments?.length) {
           for (const s of audio.segments) consider(s);
           const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
-          if (looksFmp4Segments(variant.segments) && looksFmp4Segments(audio.segments)) {
+          if (looksFmp4Segments(dashVariant.segments ?? []) && looksFmp4Segments(audio.segments)) {
             req.pairSegments = [...audio.segments];
             req.filename = `${stem}.mp4`;
           } else {
@@ -1549,6 +1586,8 @@ async function startDownload(
     status: "running",
     done: 0,
     total: req.kind === "direct" ? 1 : (req.segments?.length ?? 0),
+    bytesDone: 0,
+    startedAt: Date.now(),
     updatedAt: Date.now(),
   };
   await upsertJob(job);
@@ -1581,6 +1620,8 @@ async function startDownload(
       status: "running",
       done: 0,
       total: 0,
+      bytesDone: 0,
+      startedAt: Date.now(),
       stage: "fetching",
       updatedAt: Date.now(),
     };
@@ -1630,7 +1671,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (m?.type === "CANCEL_JOB" && typeof m.jobId === "string") {
         await ensureJobsLoaded();
         const job = jobMemory.get(m.jobId);
-        if (job && job.status === "running") {
+        if (job && (job.status === "running" || job.status === "paused")) {
           // Ask the offscreen document to abort; it reports back via
           // DOWNLOAD_ERROR("Download cancelled.") which finalizes the job.
           try {
@@ -1651,6 +1692,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false, error: "Job is not running." });
+        }
+      } else if (m?.type === "PAUSE_JOB" && typeof m.jobId === "string") {
+        await ensureJobsLoaded();
+        const job = jobMemory.get(m.jobId);
+        if (job && job.status === "running") {
+          job.status = "paused";
+          await upsertJob(job);
+          try {
+            await chrome.runtime.sendMessage({ type: "OFFSCREEN_PAUSE", jobId: m.jobId });
+          } catch {
+            /* offscreen will pick it up via flag on next tick; state already paused */
+          }
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: "Job is not running." });
+        }
+      } else if (m?.type === "RESUME_JOB" && typeof m.jobId === "string") {
+        await ensureJobsLoaded();
+        const job = jobMemory.get(m.jobId);
+        if (job && job.status === "paused") {
+          job.status = "running";
+          await upsertJob(job);
+          try {
+            await chrome.runtime.sendMessage({ type: "OFFSCREEN_RESUME", jobId: m.jobId });
+          } catch {
+            /* workers poll the flag; resume takes effect on next tick */
+          }
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: "Job is not paused." });
         }
       } else if (m?.type === "START_DOWNLOAD" && typeof m.tabId === "number" && typeof m.itemUrl === "string") {
         try {
@@ -1708,6 +1779,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (job) {
           job.done = m.done ?? job.done;
           job.total = m.total ?? job.total;
+          if (typeof m.bytesDone === "number") job.bytesDone = m.bytesDone;
+          if (!job.startedAt) job.startedAt = Date.now();
           await upsertJob(job, false);
         }
         sendResponse({ ok: true });
@@ -1780,8 +1853,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await ensureJobsLoaded();
         const job = jobMemory.get(m.jobId);
         if (job) {
+          // A pause-then-cancel race can deliver a late abort after resume;
+          // only terminal states from a non-paused job finalize as error.
           job.status = "error";
           job.error = m.error ?? "Download failed.";
+          job.expired = m.expired === true;
           await upsertJob(job);
         }
         void maybeCloseOffscreen();
@@ -1843,7 +1919,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         }
         sendResponse({ ok: true });
-      } else if (m?.type === "JOB_UPDATED" || m?.type === "OFFSCREEN_DOWNLOAD" || m?.type === "OFFSCREEN_CANCEL") {
+      } else if (m?.type === "JOB_UPDATED" || m?.type === "OFFSCREEN_DOWNLOAD" || m?.type === "OFFSCREEN_CANCEL" || m?.type === "OFFSCREEN_PAUSE" || m?.type === "OFFSCREEN_RESUME") {
         // Broadcast/offscreen traffic not addressed to the worker — ignore.
         sendResponse({ ok: true });
       } else {
@@ -1862,3 +1938,27 @@ try {
 } catch {
   /* ignore */
 }
+
+// Jobs alive in storage but with no offscreen document lost their fetched
+// parts (offscreen memory is gone) — they can never resume. Mark them so
+// the popup offers Retry instead of a stuck Paused/Running row. Skipped
+// when offscreen is still alive (normal SW suspend during a download).
+void (async () => {
+  try {
+    await ensureJobsLoaded();
+    if (await offscreenExists()) return;
+    let dirty = false;
+    for (const job of jobMemory.values()) {
+      if (job.status === "running" || job.status === "paused") {
+        job.status = "error";
+        job.error = "Interrupted by a browser/extension restart — fetched parts were lost. Hit Retry for fresh URLs.";
+        job.expired = true;
+        job.updatedAt = Date.now();
+        dirty = true;
+      }
+    }
+    if (dirty) await persistJobs();
+  } catch {
+    /* best-effort */
+  }
+})();
