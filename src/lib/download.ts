@@ -477,45 +477,63 @@ function sniffKind(head: Uint8Array): SniffedKind {
   return "unknown";
 }
 
-/** Walk top-level ISOBMFF boxes (bounded) looking for moov/pssh. */
+/**
+ * Walk ISOBMFF boxes (bounded) looking for moov/pssh/media.
+ * Descends into moov containers: DRM's SystemID header lives in a pssh
+ * nested INSIDE moov on most packagers, so a top-level-only scan would let
+ * encrypted streams through validation (the muxer would still refuse them,
+ * but the error surfaces later and differently than intended).
+ * Container types walked: moov (where pssh legally lives). Fragments
+ * (moof) are NOT descended — senc/saiz there are the muxer's job and a
+ * corrupt moof must not mask the container verdict.
+ */
 function scanTopLevel(
   buf: ArrayBuffer,
   budget = 262144,
 ): { moov: boolean; pssh: boolean; media: boolean } {
   const v = new Uint8Array(buf);
   const n = Math.min(v.length, budget);
-  let off = 0;
   let moov = false;
   let pssh = false;
   let media = false;
-  while (off + 8 <= n) {
-    let size =
-      (v[off] * 16777216 + v[off + 1] * 65536 + v[off + 2] * 256 + v[off + 3]) >>> 0;
-    const type = String.fromCharCode(v[off + 4], v[off + 5], v[off + 6], v[off + 7]);
-    let hdr = 8;
-    if (size === 1) {
-      // 64-bit largesize follows the type.
-      if (off + 16 > n) break;
-      const hi =
-        (v[off + 8] * 16777216 + v[off + 9] * 65536 + v[off + 10] * 256 + v[off + 11]) >>> 0;
-      const lo =
-        (v[off + 12] * 16777216 + v[off + 13] * 65536 + v[off + 14] * 256 + v[off + 15]) >>> 0;
-      const full = hi * 4294967296 + lo;
-      if (!Number.isSafeInteger(full) || full < 16 || full > v.length) break;
-      size = full;
-      hdr = 16;
-    } else if (size === 0) {
-      break; // box extends to end of file — nothing more to learn
+
+  /** Bounded recursive walk; depth 1 (into moov) keeps worst case linear. */
+  const walk = (start: number, end: number, depth: number): void => {
+    let off = start;
+    while (off + 8 <= end) {
+      let size =
+        (v[off] * 16777216 + v[off + 1] * 65536 + v[off + 2] * 256 + v[off + 3]) >>> 0;
+      const type = String.fromCharCode(v[off + 4], v[off + 5], v[off + 6], v[off + 7]);
+      let hdr = 8;
+      if (size === 1) {
+        // 64-bit largesize follows the type.
+        if (off + 16 > end) return;
+        const hi =
+          (v[off + 8] * 16777216 + v[off + 9] * 65536 + v[off + 10] * 256 + v[off + 11]) >>> 0;
+        const lo =
+          (v[off + 12] * 16777216 + v[off + 13] * 65536 + v[off + 14] * 256 + v[off + 15]) >>> 0;
+        const large = hi * 4294967296 + lo;
+        if (!Number.isSafeInteger(large) || large < 16 || large > v.length) return;
+        size = large;
+        hdr = 16;
+      } else if (size === 0) {
+        return; // box extends to end of file — nothing more to learn
+      }
+      if (size < hdr) return; // corrupt
+      if (type === "moov") moov = true;
+      else if (type === "pssh") pssh = true;
+      else if (type === "moof" || type === "mdat") media = true;
+      if (moov && pssh && media) return;
+      if (type === "moov" && depth < 1) {
+        walk(off + hdr, Math.min(off + size, end), depth + 1);
+      }
+      const next = off + size;
+      if (next <= off || next > end) return;
+      off = next;
     }
-    if (size < hdr) break; // corrupt
-    if (type === "moov") moov = true;
-    else if (type === "pssh") pssh = true;
-    else if (type === "moof" || type === "mdat") media = true;
-    if (moov && pssh && media) break;
-    const next = off + size;
-    if (next <= off || next > v.length) break;
-    off = next;
-  }
+  };
+
+  walk(0, n, 0);
   return { moov, pssh, media };
 }
 
@@ -536,7 +554,8 @@ function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
  * - any chunk is an error page / non-video data,
  * - chunks mix containers/qualities (can't merge into one file),
  * - fragmented-MP4 chunks lack their init (`moov`) header,
- * - chunks carry a `pssh` box (encrypted — undecryptable by design).
+ * - chunks carry a `pssh` box, top level or nested in moov (encrypted —
+ *   undecryptable by design).
  */
 export function orderAndValidateSegmentParts(parts: ArrayBuffer[]): ArrayBuffer[] {
   if (parts.length === 0) throw new Error("No segments to download.");

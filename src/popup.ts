@@ -1,3 +1,4 @@
+import { classify as classifyBare } from "./lib/classify";
 import { cleanTitle, filenameForUrl, sanitizeStem } from "./lib/download";
 import type { DownloadJobState, MediaItem, MediaType, MsSessionMeta, VideoSignal } from "./lib/types";
 
@@ -183,53 +184,6 @@ function blockedPageReason(url: string): string | null {
   return null;
 }
 
-/** Local mirror of the worker's chunk rule (page-found URLs need it too). */
-function looksLikeChunkBare(url: string): boolean {
-  let path: string;
-  try {
-    path = new URL(url).pathname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (/\.(ts|m4s|cmfv|cmfa)$/.test(path)) return true;
-  const tokens = path.split("/").filter(Boolean);
-  let score = 0;
-  let digitTokens = 0;
-  for (const raw of tokens) {
-    const t = raw.replace(/\.[a-z0-9]{2,5}$/, "");
-    if (/^\d+$/.test(t)) {
-      digitTokens++;
-      continue;
-    }
-    if (/\d+x\d+/.test(t)) score += 2;
-    if (/^(avc1|mp4a|hev1|hvc1|vp09|av01|ec-3|ec3|ac-3|ac-4|opus)$/.test(t)) score += 2;
-    if (/(seg|chunk|frag|part|range|seq|stream|media|track|video|audio)[-_./]?\d/i.test(t)) score += 2;
-  }
-  score += Math.min(2, digitTokens);
-  if (score >= 3) return true;
-  if (/\.m4v$/.test(path) && score >= 2) return true;
-  return false;
-}
-
-function classifyBare(url: string): MediaType | null {
-  const lower = url.toLowerCase().split("?")[0].split("#")[0];
-  if (lower.endsWith(".m3u8")) return "hls";
-  if (lower.endsWith(".mpd")) return "dash";
-  if (url.startsWith("blob:")) return "blob";
-  if (looksLikeChunkBare(url)) return null;
-  if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "mp4";
-  if (lower.endsWith(".webm")) return "webm";
-  if (lower.endsWith(".ogv") || lower.endsWith(".ogg")) return "ogg";
-  if (lower.endsWith(".mov")) return "mov";
-  if (lower.endsWith(".mkv")) return "mkv";
-  if (lower.endsWith(".avi")) return "avi";
-  if (lower.endsWith(".flv") || lower.endsWith(".f4v")) return "flv";
-  if (lower.endsWith(".wmv")) return "wmv";
-  if (lower.endsWith(".mpg") || lower.endsWith(".mpeg")) return "mpg";
-  if (lower.endsWith(".3gp") || lower.endsWith(".3g2")) return "mp4";
-  return null;
-}
-
 /**
  * Worker-independent page scan: ask the tab's content script for its
  * <video> elements directly (no background worker involved). Falls back to
@@ -401,7 +355,7 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number, pageTitle?: st
     for (const src of [v.currentSrc, ...(v.candidates ?? [])]) {
       if (!src || seen.has(src)) continue;
       seen.add(src);
-      const type = classifyBare(src);
+      const type = classifyBare(src, "");
       if (!type) continue;
       if (type === "blob") {
         items.push({
