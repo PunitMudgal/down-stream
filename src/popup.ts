@@ -4,12 +4,81 @@ import type { DownloadJobState, MediaItem, MediaType, MsSessionMeta, VideoSignal
 const listEl = document.getElementById("list") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 const rescanBtn = document.getElementById("rescan") as HTMLButtonElement;
+const searchEl = document.getElementById("search") as HTMLInputElement | null;
+const countEl = document.getElementById("count") as HTMLElement | null;
 
 let currentTabId: number | null = null;
 let currentHost = "";
 let currentUrl = "";
 let workerAlive = false;
 let jobs: DownloadJobState[] = [];
+let totalCards = 0;
+
+/** Inline SVG icons (no emoji, no remote assets — extension sandbox safe). */
+const ICONS: Record<string, string> = {
+  play: '<svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>',
+  copy: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  download:
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  search:
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  alert:
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+};
+
+function iconSpan(name: string, cls: string): HTMLElement {
+  const s = document.createElement("span");
+  s.className = cls;
+  s.setAttribute("aria-hidden", "true");
+  s.innerHTML = ICONS[name] ?? "";
+  return s;
+}
+
+/** Fraction 0..1 of job completion, or null when indeterminate. */
+function jobFraction(job: DownloadJobState): number | null {
+  if (job.status === "done") return 1;
+  if (job.stage === "assembling" || job.stage === "saving") return null;
+  if (job.unit === "bytes") {
+    if (job.total > 0 && job.done >= 0) {
+      return Math.min(0.999, job.done / job.total);
+    }
+    return (job.bytesDone ?? 0) > 0 ? null : 0;
+  }
+  if (job.total > 0) return Math.min(0.999, job.done / job.total);
+  return null;
+}
+
+/** Paint the card's progress bar + state hook from a job line state. */
+function setBar(card: HTMLElement, job: DownloadJobState | undefined, state: string): void {
+  const bar = card.querySelector(".bar") as HTMLElement | null;
+  const fill = card.querySelector(".bar-fill") as HTMLElement | null;
+  if (!bar || !fill) return;
+  card.dataset.state = state === "idle" ? "" : state;
+  if (!job || state === "idle" || state === "cancelled") {
+    bar.hidden = true;
+    bar.classList.remove("indeterminate");
+    bar.removeAttribute("aria-valuenow");
+    return;
+  }
+  bar.hidden = false;
+  const frac = jobFraction(job);
+  if (frac == null) {
+    bar.classList.add("indeterminate");
+    bar.removeAttribute("aria-valuenow");
+  } else {
+    bar.classList.remove("indeterminate");
+    fill.style.width = `${Math.round(frac * 100)}%`;
+    bar.setAttribute("aria-valuenow", String(Math.round(frac * 100)));
+  }
+  if (state === "done") {
+    fill.style.width = "100%";
+    bar.setAttribute("aria-valuenow", "100");
+  }
+  if (state === "error") {
+    const f = jobFraction(job);
+    fill.style.width = f == null ? "100%" : `${Math.round(f * 100)}%`;
+  }
+}
 
 function shortUrl(url: string): string {
   try {
@@ -395,6 +464,22 @@ function jobsForItem(itemUrl: string): DownloadJobState[] {
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+/** The job whose fraction best represents the card (furthest active part). */
+function barJob(related: DownloadJobState[]): DownloadJobState | undefined {
+  const active = related.filter((j) => j.status === "running" || j.status === "paused");
+  const pool = active.length > 0 ? active : related;
+  let best: DownloadJobState | undefined;
+  let bestFrac = -1;
+  for (const j of pool) {
+    const f = jobFraction(j) ?? 0;
+    if (f >= bestFrac) {
+      bestFrac = f;
+      best = j;
+    }
+  }
+  return best;
+}
+
 /**
  * Combined label for cards with two active part-jobs (split A/V two-file
  * downloads share one itemUrl). Without this the card flickers between the
@@ -496,6 +581,8 @@ async function loadMedia(): Promise<void> {
   setStatus("Scanning…");
   listEl.innerHTML = "";
   jobs = [];
+  totalCards = 0;
+  updateCount();
   workerAlive = false;
 
   // 1. Find the tab; bail early on pages extensions can't touch.
@@ -515,8 +602,18 @@ async function loadMedia(): Promise<void> {
       setStatus("");
       const div = document.createElement("div");
       div.className = "empty";
-      div.textContent = blocked;
+      div.appendChild(iconSpan("alert", "empty-icon"));
+      const bt = document.createElement("div");
+      bt.className = "empty-title";
+      bt.textContent = "Can't run here";
+      div.appendChild(bt);
+      const bm = document.createElement("div");
+      bm.className = "url";
+      bm.textContent = blocked;
+      div.appendChild(bm);
       listEl.appendChild(div);
+      totalCards = 0;
+      updateCount();
       return;
     }
     const unsupported = unsupportedHostReason(t.url);
@@ -524,8 +621,18 @@ async function loadMedia(): Promise<void> {
       setStatus("");
       const div = document.createElement("div");
       div.className = "empty";
-      div.textContent = unsupported;
+      div.appendChild(iconSpan("alert", "empty-icon"));
+      const ut = document.createElement("div");
+      ut.className = "empty-title";
+      ut.textContent = "Not supported on this site";
+      div.appendChild(ut);
+      const um = document.createElement("div");
+      um.className = "url";
+      um.textContent = unsupported;
+      div.appendChild(um);
       listEl.appendChild(div);
+      totalCards = 0;
+      updateCount();
       return;
     }
   } catch (err) {
@@ -613,10 +720,25 @@ async function loadMedia(): Promise<void> {
     setStatus("");
     const div = document.createElement("div");
     div.className = "empty";
-    div.textContent = currentHost
-      ? `No video detected on ${currentHost} yet. Play the video, then hit Rescan.`
-      : "No video detected yet. Play the video, then hit Rescan.";
+    div.appendChild(iconSpan("search", "empty-icon"));
+    const title = document.createElement("div");
+    title.className = "empty-title";
+    title.textContent = currentHost ? `No video on ${currentHost} yet` : "No video detected yet";
+    div.appendChild(title);
+    const steps = document.createElement("div");
+    steps.className = "hint-steps";
+    steps.innerHTML = "";
+    const s1 = document.createElement("div");
+    s1.innerHTML = "<b>1.</b> Play the video on the page";
+    const s2 = document.createElement("div");
+    s2.innerHTML = "<b>2.</b> Hit Rescan up top";
+    const s3 = document.createElement("div");
+    s3.innerHTML = "<b>3.</b> Pick a quality and download";
+    steps.append(s1, s2, s3);
+    div.appendChild(steps);
     listEl.appendChild(div);
+    totalCards = 0;
+    updateCount();
     return;
   }
   const downloadable = items.filter((x) => x.type !== "blob").length;
@@ -628,6 +750,52 @@ async function loadMedia(): Promise<void> {
       : "Worker unreachable — showing what the page itself exposes. Direct files can still download; qualities need the worker.",
   );
   for (const item of items) listEl.appendChild(renderCard(item));
+  totalCards = items.length;
+  if (searchEl) searchEl.value = "";
+  applyFilter();
+}
+
+/** Toolbar: live-filter cards by title/URL/type + count pill. */
+function applyFilter(): void {
+  const q = (searchEl?.value ?? "").trim().toLowerCase();
+  let visible = 0;
+  for (const child of Array.from(listEl.children)) {
+    const el = child as HTMLElement;
+    if (!el.dataset?.itemUrl) continue; // banners / empty notes stay as-is
+    const hit = !q || (el.dataset.search ?? "").includes(q);
+    el.hidden = !hit;
+    if (hit) visible++;
+  }
+  updateCount(visible);
+  let none = listEl.querySelector(".empty-filter") as HTMLElement | null;
+  if (visible === 0 && totalCards > 0) {
+    if (!none) {
+      none = document.createElement("div");
+      none.className = "empty empty-filter";
+      none.appendChild(iconSpan("search", "empty-icon"));
+      const t = document.createElement("div");
+      t.className = "empty-title";
+      t.textContent = "No videos match this filter.";
+      none.appendChild(t);
+      listEl.appendChild(none);
+    }
+    none.hidden = false;
+  } else if (none) {
+    none.hidden = true;
+  }
+}
+
+function updateCount(visible?: number): void {
+  if (!countEl) return;
+  if (totalCards <= 0) {
+    countEl.textContent = "";
+    countEl.hidden = true;
+    return;
+  }
+  countEl.hidden = false;
+  const v = visible ?? totalCards;
+  countEl.textContent = v === totalCards ? `${totalCards}` : `${v}/${totalCards}`;
+  countEl.title = `${v} of ${totalCards} videos shown`;
 }
 
 /** Banner (not a dead end): page scan worked, worker didn't. */
@@ -660,9 +828,13 @@ function showWorkerWarning(): void {
 function showFatal(message: string): void {
   setStatus(message);
   listEl.innerHTML = "";
+  totalCards = 0;
+  updateCount();
   const div = document.createElement("div");
   div.className = "empty";
+  div.appendChild(iconSpan("alert", "empty-icon"));
   const p = document.createElement("div");
+  p.className = "empty-title";
   p.textContent = "Could not load detections.";
   div.appendChild(p);
   const hint = document.createElement("div");
@@ -702,22 +874,52 @@ function renderCard(item: MediaItem): HTMLElement {
     const img = document.createElement("img");
     img.className = "thumb";
     img.src = item.poster;
-    img.alt = "";
+    img.alt = item.title ? `Thumbnail for ${item.title}` : "Video thumbnail";
+    img.loading = "lazy";
     card.appendChild(img);
   } else {
     const fb = document.createElement("div");
     fb.className = "thumb-fallback";
-    fb.textContent = "▶";
+    fb.appendChild(iconSpan("play", ""));
     card.appendChild(fb);
   }
 
   const meta = document.createElement("div");
   meta.className = "meta";
 
+  const badgeRow = document.createElement("div");
+  badgeRow.className = "badge-row";
   const badge = document.createElement("span");
   badge.className = "badge";
   badge.textContent = item.type.toUpperCase();
-  meta.appendChild(badge);
+  badgeRow.appendChild(badge);
+
+  if (item.meta) {
+    const chip = document.createElement("span");
+    chip.className = "size-chip";
+    chip.textContent = item.meta;
+    chip.title = item.meta;
+    badgeRow.appendChild(chip);
+  }
+  const spacer = document.createElement("span");
+  spacer.className = "spacer";
+  badgeRow.appendChild(spacer);
+
+  // Copy-link needs a real URL (blob:/capture: rows have none fetchable).
+  if (item.type !== "blob" && item.type !== "capture" && item.type !== "blobfile") {
+    const copy = document.createElement("button");
+    copy.className = "copy-btn";
+    copy.title = "Copy the video URL to the clipboard";
+    copy.setAttribute("aria-label", "Copy the video URL to the clipboard");
+    copy.appendChild(iconSpan("copy", ""));
+    const label = document.createElement("span");
+    label.className = "copy-label";
+    label.textContent = "Copy link";
+    copy.appendChild(label);
+    copy.onclick = () => void copyLink(item.url, copy);
+    badgeRow.appendChild(copy);
+  }
+  meta.appendChild(badgeRow);
 
   if (item.title) {
     const heading = document.createElement("div");
@@ -733,22 +935,8 @@ function renderCard(item: MediaItem): HTMLElement {
   urlDiv.title = item.url;
   meta.appendChild(urlDiv);
 
-  if (item.meta) {
-    const metaLine = document.createElement("div");
-    metaLine.className = "url";
-    metaLine.textContent = item.meta;
-    meta.appendChild(metaLine);
-  }
-
-  // Copy-link needs a real URL (blob:/capture: rows have none fetchable).
-  if (item.type !== "blob" && item.type !== "capture" && item.type !== "blobfile") {
-    const copy = document.createElement("button");
-    copy.className = "ghost";
-    copy.textContent = "Copy link";
-    copy.title = "Copy the video URL to the clipboard";
-    copy.onclick = () => void copyLink(item.url, copy);
-    meta.appendChild(copy);
-  }
+  // Searchable text for the toolbar filter (title + url + type).
+  card.dataset.search = `${item.title ?? ""} ${item.url} ${item.type}`.toLowerCase();
 
   if (item.error && !item.variants?.length && !isDirect(item)) {
     const e = document.createElement("div");
@@ -832,10 +1020,38 @@ function renderCard(item: MediaItem): HTMLElement {
     meta.appendChild(note);
   }
 
+  // Group quality select + download into one action row (styled via .actions).
+  const actionEls = Array.from(meta.children).filter(
+    (el) => el instanceof HTMLSelectElement || (el instanceof HTMLButtonElement && el.classList.contains("dl")),
+  );
+  if (actionEls.length > 0) {
+    const row = document.createElement("div");
+    row.className = "actions";
+    for (const el of actionEls) row.appendChild(el);
+    meta.appendChild(row);
+  }
+
+  const bar = document.createElement("div");
+  bar.className = "bar";
+  bar.hidden = true;
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-label", "Download progress");
+  bar.setAttribute("aria-valuemin", "0");
+  bar.setAttribute("aria-valuemax", "100");
+  const fill = document.createElement("div");
+  fill.className = "bar-fill";
+  bar.appendChild(fill);
+  meta.appendChild(bar);
+
   const prog = document.createElement("div");
   prog.className = "progress";
   prog.hidden = true;
   meta.appendChild(prog);
+
+  // Utility buttons (Cancel / Pause) mount here as a row.
+  const util = document.createElement("div");
+  util.className = "util-row";
+  meta.appendChild(util);
 
   card.appendChild(meta);
   paintJobState(card, item);
@@ -884,7 +1100,7 @@ function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, d
       cancel = document.createElement("button");
       cancel.className = "ghost cancelbtn";
       cancel.textContent = "Cancel";
-      card.querySelector(".meta")?.appendChild(cancel);
+      (card.querySelector(".util-row") ?? card.querySelector(".meta"))?.appendChild(cancel);
     }
     cancel.hidden = false;
     // Rebind every tick: retries create new jobIds for the same card, and
@@ -904,7 +1120,7 @@ function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, d
     if (!pause) {
       pause = document.createElement("button");
       pause.className = "ghost pausebtn";
-      card.querySelector(".meta")?.appendChild(pause);
+      (card.querySelector(".util-row") ?? card.querySelector(".meta"))?.appendChild(pause);
     }
     pause.hidden = false;
     const allPaused = pausable.every((j) => j.status === "paused");
@@ -930,6 +1146,7 @@ function paintJobState(card: HTMLElement, item: MediaItem): void {
   if (!job) {
     prog.hidden = true;
     btn.disabled = false;
+    setBar(card, undefined, "idle");
     return;
   }
   const direct = isDirect(item);
@@ -949,6 +1166,7 @@ function paintJobState(card: HTMLElement, item: MediaItem): void {
     prog.hidden = false;
     prog.textContent = line.label;
   }
+  setBar(card, barJob(related), line.state);
   paintJobButtons(card, job, direct);
 }
 
@@ -979,6 +1197,7 @@ function refreshCard(itemUrl: string): void {
     prog.hidden = false;
     prog.textContent = line.label;
   }
+  setBar(card, barJob(related), line.state);
   paintJobButtons(card, job, direct);
 }
 
@@ -1022,12 +1241,23 @@ async function cancelJob(jobId: string): Promise<void> {
 }
 
 async function copyLink(url: string, btn: HTMLButtonElement): Promise<void> {
+  // The button holds an icon + label span — update only the label so the
+  // icon survives the "Copied!" swap.
+  const label = btn.querySelector(".copy-label") as HTMLElement | null;
   const done = (msg: string) => {
-    const orig = "Copy link";
-    btn.textContent = msg;
-    setTimeout(() => {
-      btn.textContent = orig;
-    }, 1500);
+    if (label) {
+      const orig = label.textContent ?? "Copy link";
+      label.textContent = msg;
+      setTimeout(() => {
+        label.textContent = orig;
+      }, 1500);
+    } else {
+      const orig = "Copy link";
+      btn.textContent = msg;
+      setTimeout(() => {
+        btn.textContent = orig;
+      }, 1500);
+    }
   };
   try {
     await navigator.clipboard.writeText(url);
@@ -1190,5 +1420,7 @@ rescanBtn.onclick = () => {
     }
   })();
 };
+
+searchEl?.addEventListener("input", () => applyFilter());
 
 void loadMedia();
