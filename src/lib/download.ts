@@ -1,5 +1,5 @@
 import { extractHlsSegments } from "./parseHls";
-import type { NetReplay } from "./types";
+import type { MediaItem, NetReplay } from "./types";
 
 export type ProgressCallback = (done: number, total: number, bytesDone?: number) => void;
 
@@ -98,6 +98,21 @@ export function filenameForUrl(url: string, type: string, title?: string): strin
   }
   if (type === "segments") return `video-segments-${ts}.mp4`;
   return `video-${ts}.${ext}`;
+}
+
+/**
+ * Link target for a blob-playing <video>'s poster/title: the newest
+ * non-DRM HLS/DASH row (MSE players expose only a blob: URL, so page
+ * metadata would otherwise never reach the downloadable row).
+ */
+export function pickManifestForBlob(items: MediaItem[]): MediaItem | undefined {
+  let best: MediaItem | undefined;
+  for (const x of items) {
+    if (x.type !== "hls" && x.type !== "dash") continue;
+    if (x.drmProtected) continue;
+    if (!best || x.detectedAt > best.detectedAt) best = x;
+  }
+  return best;
 }
 
 /** Direct file: browser handles it natively (fallback when in-app fetch can't). */
@@ -463,12 +478,16 @@ function sniffKind(head: Uint8Array): SniffedKind {
 }
 
 /** Walk top-level ISOBMFF boxes (bounded) looking for moov/pssh. */
-function scanTopLevel(buf: ArrayBuffer, budget = 262144): { moov: boolean; pssh: boolean } {
+function scanTopLevel(
+  buf: ArrayBuffer,
+  budget = 262144,
+): { moov: boolean; pssh: boolean; media: boolean } {
   const v = new Uint8Array(buf);
   const n = Math.min(v.length, budget);
   let off = 0;
   let moov = false;
   let pssh = false;
+  let media = false;
   while (off + 8 <= n) {
     let size =
       (v[off] * 16777216 + v[off + 1] * 65536 + v[off + 2] * 256 + v[off + 3]) >>> 0;
@@ -491,12 +510,23 @@ function scanTopLevel(buf: ArrayBuffer, budget = 262144): { moov: boolean; pssh:
     if (size < hdr) break; // corrupt
     if (type === "moov") moov = true;
     else if (type === "pssh") pssh = true;
-    if (moov && pssh) break;
+    else if (type === "moof" || type === "mdat") media = true;
+    if (moov && pssh && media) break;
     const next = off + size;
     if (next <= off || next > v.length) break;
     off = next;
   }
-  return { moov, pssh };
+  return { moov, pssh, media };
+}
+
+function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  const va = new Uint8Array(a);
+  const vb = new Uint8Array(b);
+  for (let i = 0; i < va.length; i++) {
+    if (va[i] !== vb[i]) return false;
+  }
+  return true;
 }
 
 /**
@@ -546,9 +576,22 @@ export function orderAndValidateSegmentParts(parts: ArrayBuffer[]): ArrayBuffer[
     );
   }
   if (moovIdx.length > 1) {
-    throw new Error(
-      "Grouped chunks contain multiple stream headers (mixed qualities), so they can't be merged into one file. Try a manifest quality (HLS/DASH row) or the Capture row instead.",
-    );
+    // Safe salvage: some packagers repeat the SAME pure init (ftyp+moov, no
+    // media) per segment block. Dropping byte-identical media-less copies
+    // can never corrupt the file — anything else stays a refusal.
+    const first = parts[moovIdx[0]];
+    const salvageable = moovIdx.slice(1).every((i) => {
+      if (scans[i].media) return false;
+      return buffersEqual(parts[i], first);
+    });
+    if (salvageable) {
+      const drop = new Set(moovIdx.slice(1));
+      parts = parts.filter((_, i) => !drop.has(i));
+    } else {
+      throw new Error(
+        "These segments carry multiple quality headers (the site switches quality mid-stream), so they can't be merged into one file. Try a single quality from the dropdown, the direct-file row if listed, or the Capture row instead.",
+      );
+    }
   }
   if (moovIdx[0] !== 0) {
     // Lone init chunk arrived out of order — init must lead the file.

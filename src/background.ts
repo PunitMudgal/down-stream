@@ -1,6 +1,6 @@
 import { parseHlsManifest } from "./lib/parseHls";
 import { parseDashManifest } from "./lib/parseDash";
-import { cleanTitle, downloadDirect, filenameForUrl, sanitizeStem, sortSegmentsNatural } from "./lib/download";
+import { cleanTitle, downloadDirect, filenameForUrl, pickManifestForBlob, sanitizeStem, sortSegmentsNatural } from "./lib/download";
 import type {
   BlobFileInfo,
   DownloadJobRequest,
@@ -1004,6 +1004,22 @@ async function handleVideoSignals(
             else if (applyTitle(linked, pageTitle, false)) changed = true;
             continue;
           }
+        }
+        // MSE players expose only a blob: URL while the real stream is an
+        // HLS/DASH manifest row — forward this player's poster/title/meta
+        // there so rows show thumbnails and names, not hash URLs.
+        const manifest = pickManifestForBlob(items);
+        if (manifest && (v.poster || v.title || meta)) {
+          if (v.poster && !manifest.poster) {
+            manifest.poster = v.poster;
+            changed = true;
+          }
+          if (meta && !manifest.meta) {
+            manifest.meta = meta;
+            changed = true;
+          }
+          if (applyTitle(manifest, v.title, true)) changed = true;
+          else if (applyTitle(manifest, pageTitle, false)) changed = true;
         }
         const existing = items.find((x) => x.url === src);
         if (!existing) {

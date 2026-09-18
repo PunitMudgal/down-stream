@@ -337,6 +337,10 @@ function findTitle(el: HTMLVideoElement): string | null {
         }
       }
     }
+    // Page-level fallbacks (Pinterest-style pins expose these, not DOM text).
+    const og = document.querySelector('meta[property="og:title"], meta[name="twitter:title"]');
+    const ogTitle = cleanSnippet(og?.getAttribute("content"), 100);
+    if (ogTitle) return ogTitle;
   } catch {
     /* ignore */
   }
@@ -372,6 +376,11 @@ function findPoster(el: HTMLVideoElement): string | null {
       });
       if (best && bestScore >= 3) return best;
     }
+    // Page-level fallback: og:image is the pin/post thumbnail on sites
+    // (Pinterest) whose player DOM carries no usable <img>.
+    const og = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]');
+    const ogSrc = absolutize(og?.getAttribute("content") ?? null);
+    if (ogSrc) return ogSrc;
   } catch {
     /* ignore */
   }

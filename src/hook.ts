@@ -17,6 +17,8 @@
  *   copying the moment a cap hits (pure passthrough afterwards), and frees
  *   buffered bytes as soon as a session is known DRM-tainted.
  */
+import { extractMediaFileUrls } from "./lib/apiUrls";
+
 (function () {
   const w = window as unknown as Record<string, unknown>;
   if (w.__vdgHookInstalled) return;
@@ -148,7 +150,25 @@
   function handleText(text: string): void {
     if (!text || !hasManifestHint(text)) return;
     const cleanText = clean(text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text);
-    emit(extractUrls(cleanText), cleanText);
+    const urls = extractUrls(cleanText);
+    emit(urls, cleanText);
+    // Companion progressive file (same API response often carries BOTH the
+    // HLS manifest and the direct mp4 — Pinterest-style). Same channel: the
+    // background classifies file URLs as direct rows (chunk-guarded there).
+    if (urls.length) {
+      try {
+        const files = extractMediaFileUrls(cleanText).filter((u) => remember("f:" + u));
+        if (files.length) {
+          try {
+            window.postMessage({ __vdg: "manifest-urls", urls: files }, "*");
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch {
+        /* never break page traffic */
+      }
+    }
   }
 
   /**
