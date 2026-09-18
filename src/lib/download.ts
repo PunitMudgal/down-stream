@@ -97,8 +97,13 @@ export async function downloadDirect(
 
 export const MAX_SEGMENTS = 2000;
 export const MAX_BYTES = 1_500_000_000; // 1.5 GB safety cap
-const FETCH_CONCURRENCY = 5;
+// 8 parallel segment fetches: saturates HTTP/2 CDNs without tripping the
+// ~6-connection HTTP/1.1 per-host limit too badly (extras queue in browser).
+// Higher values trigger CDN rate-limiting faster; lower values cap throughput.
+const FETCH_CONCURRENCY = 8;
 const FETCH_RETRIES = 3;
+/** Per-segment attempt timeout — a stalled fetch must not pin a pool slot forever. */
+const SEGMENT_TIMEOUT_MS = 30_000;
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("Download cancelled.");
@@ -136,16 +141,34 @@ async function fetchBuffer(
   const net = pickNet(scope, url);
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= FETCH_RETRIES; attempt++) {
+    // Per-attempt controller: links outer cancel + a timeout so one stalled
+    // segment can't permanently occupy a pool slot (effective concurrency
+    // would decay 8 -> 7 -> … which reads as "speed decreases over time").
+    const ctrl = new AbortController();
+    const onOuterAbort = (): void => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) throw new Error("Download cancelled.");
+      signal.addEventListener("abort", onOuterAbort, { once: true });
+    }
+    const timer = setTimeout(() => ctrl.abort(), SEGMENT_TIMEOUT_MS);
     try {
       // NOTE: headers in `net` were already scoped to this origin by the
       // background lookup — never attach foreign auth here.
-      const res = await fetch(url, netInit(net, signal));
+      const res = await fetch(url, netInit(net, ctrl.signal));
       if (res.status === 403 || res.status === 404 || res.status === 410) {
         // Permanent: signed URL expired/revoked or chunk gone — retrying
         // only wastes minutes before failing the whole job.
         throw new Error(
           `Stream chunk unavailable (${res.status}) — the link likely expired. Replay the video, hit Rescan, and retry right away.`,
         );
+      }
+      if (res.status === 429 || res.status === 503) {
+        // Transient throttle: honor Retry-After when present, else back off.
+        const retryAfter = Number(res.headers.get("retry-after") || "0");
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 30
+          ? retryAfter * 1000
+          : 800 * attempt + Math.random() * 400;
+        throw new ThrottledError(waitMs);
       }
       if (!res.ok) throw new Error(`Segment fetch failed (${res.status}): ${url}`);
       const buf = await res.arrayBuffer();
@@ -157,13 +180,39 @@ async function fetchBuffer(
       if (err instanceof Error && /unavailable \(40|error page instead of video/i.test(err.message)) {
         throw err;
       }
-      lastErr = err;
-      if (attempt < FETCH_RETRIES) {
-        await new Promise((r) => setTimeout(r, 400 * attempt));
+      if (err instanceof ThrottledError) {
+        lastErr = new Error(`Server throttled the download (429/503): ${url}`);
+        if (attempt < FETCH_RETRIES) {
+          await new Promise((r) => setTimeout(r, err.waitMs));
+          continue;
+        }
+        throw lastErr;
       }
+      // Timeout shows up as an AbortError on our inner controller while the
+      // outer signal is still live — retry with a fresh connection.
+      if (err instanceof DOMException && err.name === "AbortError" && !signal?.aborted) {
+        lastErr = new Error(`Segment timed out after ${SEGMENT_TIMEOUT_MS / 1000}s: ${url}`);
+      } else {
+        lastErr = err;
+      }
+      if (attempt < FETCH_RETRIES) {
+        await new Promise((r) => setTimeout(r, 400 * attempt + Math.random() * 300));
+      }
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onOuterAbort);
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(`Segment fetch failed: ${url}`);
+}
+
+/** Internal: transient CDN throttle signal carrying the desired wait. */
+class ThrottledError extends Error {
+  waitMs: number;
+  constructor(waitMs: number) {
+    super("throttled");
+    this.waitMs = waitMs;
+  }
 }
 
 /**
@@ -451,7 +500,7 @@ export async function assembleHlsBlob(
   if (segmentUrls.length === 0)
     throw new Error("No segments found in the HLS variant playlist.");
 
-  // 5-way parallel fetch, order preserved for concat; retries + caps inside.
+  // 8-way parallel fetch, order preserved for concat; retries + caps inside.
   return fetchAllOrdered(segmentUrls, "video/mp2t", onProgress, signal, scope);
 }
 
