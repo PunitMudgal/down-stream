@@ -216,14 +216,21 @@ describe("orderAndValidateSegmentParts", () => {
     expect(() => orderAndValidateSegmentParts([joined.slice().buffer as ArrayBuffer])).toThrow(/Protected content/);
   });
 
-  it("defers pssh-inside-moov to the muxer (validation only scans top level)", () => {
-    // Known limitation: scanTopLevel does not descend into moov; the muxer
-    // throws on such input, so the bytes never reach disk either way.
+  it("refuses pssh nested inside moov (the common packager layout)", () => {
+    // DRM's protection box legally lives inside moov — validation descends
+    // into the container to catch it before any file is assembled.
     const pssh = box("pssh", new Uint8Array(32));
     const init = buildInit({ trackId: 1, handler: "vide", codec4cc: "avc1", timescale: 12800, pssh });
     const frag = buildFragment({ trackId: 1, baseTime: 0, sequence: 1, samples: [{ dur: 2560, size: 100 }] });
     const joined = concat([init, frag]);
-    expect(() => orderAndValidateSegmentParts([joined.slice().buffer as ArrayBuffer])).not.toThrow();
+    expect(() => orderAndValidateSegmentParts([joined.slice().buffer as ArrayBuffer])).toThrow(/Protected content/);
+  });
+
+  it("still accepts clean streams whose moov descends fine", () => {
+    // Descending into moov must not misread nested boxes as pssh/media —
+    // a clean init (trak/mdia/minf/stbl) stays clean.
+    const stream = videoStream(1);
+    expect(() => orderAndValidateSegmentParts([stream.slice().buffer as ArrayBuffer])).not.toThrow();
   });
 
   it("refuses senc-tainted chunks only via the muxer (validation passes them)", () => {
