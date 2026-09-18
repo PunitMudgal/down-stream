@@ -100,6 +100,16 @@ button.ghost:disabled { opacity: 0.5; cursor: not-allowed; }
   word-break: break-all;
   margin: 4px 0;
 }
+.vtitle {
+  font-weight: 600;
+  font-size: 13px;
+  margin: 4px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
 select, button.dl {
   width: 100%;
   margin-top: 6px;

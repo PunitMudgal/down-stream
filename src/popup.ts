@@ -1,4 +1,4 @@
-import { filenameForUrl } from "./lib/download";
+import { cleanTitle, filenameForUrl, sanitizeStem } from "./lib/download";
 import type { DownloadJobState, MediaItem, MediaType, MsSessionMeta, VideoSignal } from "./lib/types";
 
 const listEl = document.getElementById("list") as HTMLElement;
@@ -21,7 +21,16 @@ function shortUrl(url: string): string {
   }
 }
 
+function variantIsAudioOnly(v: { codecs?: string }): boolean {
+  const c = (v.codecs ?? "").toLowerCase();
+  return /(mp4a|opus|ec-3|ac-3|ac-4)/.test(c) && !/(avc|hev|hvc|vp0?9|av0?1)/.test(c);
+}
+
 function variantLabel(v: { resolution?: string; bandwidth?: number; codecs?: string }, idx: number): string {
+  if (variantIsAudioOnly(v)) {
+    const rate = v.bandwidth ? ` • ${Math.round(v.bandwidth / 1000)} kbps` : "";
+    return `Audio only${rate}`;
+  }
   const parts: string[] = [];
   if (v.resolution) {
     // "1920x1080" -> "1080p"
@@ -30,8 +39,24 @@ function variantLabel(v: { resolution?: string; bandwidth?: number; codecs?: str
   } else {
     parts.push(`Variant ${idx + 1}`);
   }
-  if (v.bandwidth) parts.push(`— ${(v.bandwidth / 1_000_000).toFixed(1)} Mbps`);
+  if (v.bandwidth) parts.push(`• ${(v.bandwidth / 1_000_000).toFixed(1)} Mbps`);
   return parts.join(" ");
+}
+
+/** Best quality first: height desc, then bandwidth desc. Audio-only last. */
+function sortVariants<T extends { resolution?: string; bandwidth?: number; codecs?: string }>(list: T[]): T[] {
+  const heightOf = (v: T): number => {
+    const m = /(\d+)x(\d+)/.exec(v.resolution ?? "");
+    return m ? Number(m[2]) : 0;
+  };
+  return [...list].sort((a, b) => {
+    const aa = variantIsAudioOnly(a) ? 1 : 0;
+    const ab = variantIsAudioOnly(b) ? 1 : 0;
+    if (aa !== ab) return aa - ab;
+    const h = heightOf(b) - heightOf(a);
+    if (h !== 0) return h;
+    return (b.bandwidth ?? 0) - (a.bandwidth ?? 0);
+  });
 }
 
 function setStatus(msg: string): void {
@@ -71,11 +96,40 @@ function blockedPageReason(url: string): string | null {
   return null;
 }
 
+/** Local mirror of the worker's chunk rule (page-found URLs need it too). */
+function looksLikeChunkBare(url: string): boolean {
+  let path: string;
+  try {
+    path = new URL(url).pathname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (/\.(ts|m4s|cmfv|cmfa)$/.test(path)) return true;
+  const tokens = path.split("/").filter(Boolean);
+  let score = 0;
+  let digitTokens = 0;
+  for (const raw of tokens) {
+    const t = raw.replace(/\.[a-z0-9]{2,5}$/, "");
+    if (/^\d+$/.test(t)) {
+      digitTokens++;
+      continue;
+    }
+    if (/\d+x\d+/.test(t)) score += 2;
+    if (/^(avc1|mp4a|hev1|hvc1|vp09|av01|ec-3|ec3|ac-3|ac-4|opus)$/.test(t)) score += 2;
+    if (/(seg|chunk|frag|part|range|seq|stream|media|track|video|audio)[-_./]?\d/i.test(t)) score += 2;
+  }
+  score += Math.min(2, digitTokens);
+  if (score >= 3) return true;
+  if (/\.m4v$/.test(path) && score >= 2) return true;
+  return false;
+}
+
 function classifyBare(url: string): MediaType | null {
   const lower = url.toLowerCase().split("?")[0].split("#")[0];
   if (lower.endsWith(".m3u8")) return "hls";
   if (lower.endsWith(".mpd")) return "dash";
   if (url.startsWith("blob:")) return "blob";
+  if (looksLikeChunkBare(url)) return null;
   if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "mp4";
   if (lower.endsWith(".webm")) return "webm";
   if (lower.endsWith(".ogv") || lower.endsWith(".ogg")) return "ogg";
@@ -95,7 +149,7 @@ function classifyBare(url: string): MediaType | null {
  * a one-shot injected collector when the content script isn't present
  * (e.g. tab hasn't reloaded since install). Never throws.
  */
-async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; msSessions: MsSessionMeta[] }> {
+async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; msSessions: MsSessionMeta[]; pageTitle?: string }> {
   try {
     const res = await withTimeout(
       chrome.tabs.sendMessage(tabId, { type: "COLLECT_FOR_POPUP" }),
@@ -106,6 +160,7 @@ async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; m
       return {
         videos: res.videos as VideoSignal[],
         msSessions: Array.isArray(res.msSessions) ? (res.msSessions as MsSessionMeta[]) : [],
+        pageTitle: typeof res.pageTitle === "string" ? res.pageTitle : undefined,
       };
     }
   } catch {
@@ -138,11 +193,13 @@ async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; m
               if (u && !cands.includes(u)) cands.push(u);
             });
             if (!cands.length && !(v as HTMLVideoElement).poster) return [];
+            const al = (v as HTMLVideoElement).getAttribute("aria-label") || (v as HTMLVideoElement).getAttribute("title") || undefined;
             return [
               {
                 currentSrc: cands[0] ?? "",
                 candidates: cands,
                 poster: (v as HTMLVideoElement).poster || undefined,
+                title: al || document.title || undefined,
               },
             ];
           });
@@ -156,9 +213,9 @@ async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; m
       const val = (r as chrome.scripting.InjectionResult)?.result as unknown;
       if (Array.isArray(val)) out.push(...(val as VideoSignal[]));
     }
-    return { videos: out, msSessions: [] };
+    return { videos: out, msSessions: [], pageTitle: undefined };
   } catch {
-    return { videos: [], msSessions: [] };
+    return { videos: [], msSessions: [], pageTitle: undefined };
   }
 }
 
@@ -171,18 +228,29 @@ function mbShort(bytes: number): string {
  * Capture sessions -> display items without any worker (same refusal rules
  * as the background: EME-tainted or DRM-page sessions are refused rows).
  */
-function domSessionsToItems(sessions: MsSessionMeta[], tabId: number): MediaItem[] {
+function domSessionsToItems(
+  sessions: MsSessionMeta[],
+  tabId: number,
+  titleByBlob: Map<string, string>,
+  pageTitle?: string,
+): MediaItem[] {
   const items: MediaItem[] = [];
   const now = Date.now();
+  const pageFallback = cleanTitle(pageTitle);
   for (const s of sessions) {
     if (!s || typeof s.id !== "string") continue;
+    const elTitle = s.blobUrl ? cleanTitle(titleByBlob.get(s.blobUrl)) : "";
+    const title = elTitle || pageFallback;
     for (const t of s.tracks ?? []) {
       const url = `capture:${s.id}:${t.idx}`;
       const kindLabel = t.kind === "video" ? "video" : t.kind === "audio" ? "audio" : "track";
       const sizeLabel = t.bytes > 0 ? ` • ${mbShort(t.bytes)}` : "";
       if (s.eme) {
         items.push({
-          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`, filename: "",
+          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`,
+            captureKind: t.kind, filename: "",
+          title: title || undefined,
+          titleFromPage: title ? !elTitle : undefined,
           detectedAt: now, drmProtected: true,
           drmReason: "Protected content — this player uses an encrypted media path (DRM). Cannot download.",
           meta: `${kindLabel}${sizeLabel} • captured buffer`,
@@ -191,7 +259,10 @@ function domSessionsToItems(sessions: MsSessionMeta[], tabId: number): MediaItem
       }
       if (s.pageEme) {
         items.push({
-          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`, filename: "",
+          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`,
+            captureKind: t.kind, filename: "",
+          title: title || undefined,
+          titleFromPage: title ? !elTitle : undefined,
           detectedAt: now, drmProtected: true,
           drmReason: "This page uses DRM playback, so buffered captures are disabled here to stay safe.",
           meta: `${kindLabel}${sizeLabel} • captured buffer`,
@@ -202,7 +273,11 @@ function domSessionsToItems(sessions: MsSessionMeta[], tabId: number): MediaItem
       const ts = new Date(now).toISOString().replace(/[:.]/g, "-").slice(0, 19);
       items.push({
         url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`,
-        filename: `capture-${kindLabel}-${ts}.mp4`,
+            captureKind: t.kind,
+        filename: title ? `${sanitizeStem(title)}-${kindLabel}-${ts}.mp4` : `capture-${kindLabel}-${ts}.mp4`,
+        title: title || undefined,
+        titleFromPage: title ? !elTitle : undefined,
+        autoNamed: !title,
         detectedAt: now, drmProtected: false,
         meta: `${kindLabel}${sizeLabel} • captured buffer${s.complete === false ? " • partial" : ""}`,
       });
@@ -228,11 +303,14 @@ function describeDomSignal(v: VideoSignal): string | undefined {
 }
 
 /** Turn raw DOM signals into display items (worker results win on merge). */
-function domSignalsToItems(signals: VideoSignal[], tabId: number): MediaItem[] {
+function domSignalsToItems(signals: VideoSignal[], tabId: number, pageTitle?: string): MediaItem[] {
   const items: MediaItem[] = [];
   const seen = new Set<string>();
+  const pageFallback = cleanTitle(pageTitle);
   for (const v of signals) {
     const meta = describeDomSignal(v);
+    const elTitle = cleanTitle(v.title);
+    const title = elTitle || pageFallback;
     for (const src of [v.currentSrc, ...(v.candidates ?? [])]) {
       if (!src || seen.has(src)) continue;
       seen.add(src);
@@ -244,6 +322,8 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number): MediaItem[] {
           tabId,
           type: "blob",
           filename: "",
+          title: title || undefined,
+          titleFromPage: title ? !elTitle : undefined,
           detectedAt: Date.now(),
           drmProtected: false,
           poster: v.poster,
@@ -255,7 +335,10 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number): MediaItem[] {
           url: src,
           tabId,
           type,
-          filename: filenameForUrl(src, type),
+          filename: filenameForUrl(src, type, title || undefined),
+          title: title || undefined,
+          titleFromPage: title ? !elTitle : undefined,
+          autoNamed: !title,
           detectedAt: Date.now(),
           drmProtected: false,
           variants: [],
@@ -268,7 +351,10 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number): MediaItem[] {
           url: src,
           tabId,
           type,
-          filename: filenameForUrl(src, type),
+          filename: filenameForUrl(src, type, title || undefined),
+          title: title || undefined,
+          titleFromPage: title ? !elTitle : undefined,
+          autoNamed: !title,
           detectedAt: Date.now(),
           drmProtected: false,
           poster: v.poster,
@@ -364,10 +450,19 @@ async function loadMedia(): Promise<void> {
 
   const [workerSettled, pageSettled] = await Promise.allSettled([workerPromise, pagePromise]);
   const workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
-  const pageScan = pageSettled.status === "fulfilled" ? pageSettled.value : { videos: [], msSessions: [] };
+  const pageScan = pageSettled.status === "fulfilled"
+    ? pageSettled.value
+    : { videos: [], msSessions: [], pageTitle: undefined };
+  const titleByBlob = new Map<string, string>();
+  for (const v of pageScan.videos) {
+    if (v.currentSrc.startsWith("blob:") && v.title) {
+      const t = cleanTitle(v.title);
+      if (t) titleByBlob.set(v.currentSrc, t);
+    }
+  }
   const pageItems = [
-    ...domSignalsToItems(pageScan.videos, tabId),
-    ...domSessionsToItems(pageScan.msSessions, tabId),
+    ...domSignalsToItems(pageScan.videos, tabId, pageScan.pageTitle),
+    ...domSessionsToItems(pageScan.msSessions, tabId, titleByBlob, pageScan.pageTitle),
   ];
 
   // Merge: worker detections win on exact URL; page-only signals fill gaps.
@@ -379,7 +474,21 @@ async function loadMedia(): Promise<void> {
     if (it.type === "blob" && [...byUrl.values()].some((x) => x.type === "blob")) continue;
     byUrl.set(it.url, it);
   }
-  const items = [...byUrl.values()].sort((a, b) => b.detectedAt - a.detectedAt);
+  const merged = [...byUrl.values()];
+
+  // Production display filter: parsed manifests strictly dominate raw
+  // chunk groups and player-buffer placeholders. When at least one HLS/DASH
+  // item with qualities exists, blob + segments rows are pure noise — hide
+  // them (storage keeps them for manifest-less sites).
+  const hasManifest = merged.some(
+    (x) => (x.type === "hls" || x.type === "dash") && (x.variants?.length ?? 0) > 0 && !x.drmProtected,
+  );
+  const items = merged
+    .filter((x) => {
+      if (!hasManifest) return true;
+      return x.type !== "blob" && x.type !== "segments";
+    })
+    .sort((a, b) => b.detectedAt - a.detectedAt);
 
   if (!workerAlive && pageItems.length > 0) {
     showWorkerWarning();
@@ -499,6 +608,14 @@ function renderCard(item: MediaItem): HTMLElement {
   badge.textContent = item.type.toUpperCase();
   meta.appendChild(badge);
 
+  if (item.title) {
+    const heading = document.createElement("div");
+    heading.className = "vtitle";
+    heading.textContent = item.title;
+    heading.title = item.title;
+    meta.appendChild(heading);
+  }
+
   const urlDiv = document.createElement("div");
   urlDiv.className = "url";
   urlDiv.textContent = shortUrl(item.url);
@@ -547,25 +664,33 @@ function renderCard(item: MediaItem): HTMLElement {
       note.textContent = item.error ?? "Parsing manifest… reopen popup in a moment.";
       meta.appendChild(note);
     } else {
-      const sel = document.createElement("select");
-      item.variants.forEach((v, i) => {
-        const opt = document.createElement("option");
-        opt.value = v.id;
-        opt.textContent = variantLabel(v, i);
-        sel.appendChild(opt);
-      });
-      const existing = jobForItem(item.url);
-      if (existing?.variantId) {
-        const idx = item.variants.findIndex((v) => v.id === existing.variantId);
-        if (idx >= 0) sel.selectedIndex = idx;
-      }
-      meta.appendChild(sel);
-
+      // Best quality first, preselected — one click downloads the best.
+      const ordered = sortVariants(item.variants);
       const btn = document.createElement("button");
       btn.className = "dl";
-      btn.textContent = "Download variant";
-      btn.onclick = () => void handleStartDownload(item, sel.value, btn);
-      meta.appendChild(btn);
+      if (ordered.length === 1) {
+        btn.textContent = `Download (${variantLabel(ordered[0], 0)})`;
+        btn.onclick = () => void handleStartDownload(item, ordered[0].id, btn);
+        meta.appendChild(btn);
+      } else {
+        const sel = document.createElement("select");
+        ordered.forEach((v, i) => {
+          const opt = document.createElement("option");
+          opt.value = v.id;
+          opt.textContent = variantLabel(v, i);
+          sel.appendChild(opt);
+        });
+        const existing = jobForItem(item.url);
+        if (existing?.variantId) {
+          const idx = ordered.findIndex((v) => v.id === existing.variantId);
+          if (idx >= 0) sel.selectedIndex = idx;
+        }
+        meta.appendChild(sel);
+
+        btn.textContent = "Download";
+        btn.onclick = () => void handleStartDownload(item, sel.value, btn);
+        meta.appendChild(btn);
+      }
     }
   } else if (item.type === "segments") {
     const n = item.segments?.length ?? 0;
@@ -775,8 +900,14 @@ async function handleStartDownload(
       }
       const job = res.job as DownloadJobState;
       jobs = [job, ...jobs.filter((j) => j.jobId !== job.jobId)];
-      if (item.type === "hls" || item.type === "dash") {
-        setStatus(`Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`);
+      if (item.type === "hls" || item.type === "dash" || item.type === "segments" || item.type === "capture") {
+        setStatus(
+          res.merged
+            ? "Merging video + audio into one file with sound — you can close this popup."
+            : res.paired
+              ? "Downloading video + audio as 2 files (this stream can't be merged in-app) — you can close this popup."
+              : `Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`,
+        );
       } else {
         setStatus("Download started.");
       }

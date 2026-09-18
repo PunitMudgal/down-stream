@@ -33,6 +33,12 @@ export interface MediaItem {
   tabId: number;
   type: MediaType;
   filename: string;
+  /** Human title for display + file naming (video/post title when found). */
+  title?: string;
+  /** True when the title came from the page title rather than the player. */
+  titleFromPage?: boolean;
+  /** True while filename is still fallback-generated (no real title yet). */
+  autoNamed?: boolean;
   detectedAt: number;
   drmProtected: boolean;
   drmReason?: string;
@@ -41,6 +47,8 @@ export interface MediaItem {
   segments?: string[];
   /** MSE capture reference `msId:trackIdx` for `capture` items. */
   captureRef?: string;
+  /** Track kind for `capture` items (sibling audio lookup for muxing). */
+  captureKind?: "video" | "audio" | "other";
   poster?: string;
   pageTitle?: string;
   /** Short human line, e.g. "1280×720 • 0:34 • playing". */
@@ -59,6 +67,11 @@ export type RuntimeMessage =
       pageTitle?: string;
       msSessions?: MsSessionMeta[];
     }
+  | {
+      type: "MANIFEST_META";
+      tabId: number;
+      pairs: Array<{ manifest: string; thumbs: string[] }>;
+    }
   // --- Background-mediated downloads (survive popup close) ---
   | {
       type: "START_DOWNLOAD";
@@ -71,10 +84,10 @@ export type RuntimeMessage =
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
   | { type: "FETCH_TEXT"; tabId: number; url: string }
   // --- MSE capture transfer (content script <-> hook <-> offscreen) ---
-  | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string }
+  | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string; pairTrackIdx?: number }
   | { type: "MS_CANCEL"; jobId: string }
   | { type: "MS_TRACK_START"; jobId: string; total: number; mime: string; filename: string }
-  | { type: "MS_TRACK_CHUNK"; jobId: string; index: number; total: number; buf: ArrayBuffer }
+  | { type: "MS_TRACK_CHUNK"; jobId: string; which: 0 | 1; index: number; total: number; buf: ArrayBuffer }
   | { type: "MS_TRACK_END"; jobId: string }
   // --- Offscreen <-> background ---
   | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
@@ -92,6 +105,8 @@ export type RuntimeMessage =
 export interface VideoSignal {
   currentSrc: string;
   poster?: string;
+  /** Per-video title found near the player (post text, aria-label, …). */
+  title?: string;
   duration?: number;
   paused?: boolean;
   width?: number;
@@ -120,6 +135,9 @@ export interface DownloadJobRequest {
   /** Resolved URL to fetch: direct file, HLS variant playlist, or "" for DASH (uses segments). */
   url: string;
   segments?: string[];
+  /** Audio sibling for split A/V (HLS variant playlist URL or DASH segments). Muxed into one file. */
+  pairUrl?: string;
+  pairSegments?: string[];
   filename: string;
   mime?: string;
   /** Per-origin replay contexts (auth scoped to capture origin). */

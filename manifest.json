@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Download Grabber (local)",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Detect playable video on the current tab and download it locally. No backend, no third-party calls.",
   "action": {
     "default_popup": "src/popup.html",

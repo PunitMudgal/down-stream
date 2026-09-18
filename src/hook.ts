@@ -17,9 +17,22 @@
 
   const MANIFEST_RE =
     /(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mpd)(?:\?[^\s"'<>\\]*)?|\/\/[^\s"'<>\\]+\.(?:m3u8|mpd)(?:\?[^\s"'<>\\]*)?)/gi;
+  const IMAGE_RE =
+    /https?:\/\/[^\s"'<>\\]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"'<>\\]*)?/gi;
 
   function clean(text: string): string {
     return text.replace(/\\\//g, "/");
+  }
+
+  function extractImages(text: string): string[] {
+    const out: string[] = [];
+    IMAGE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while (out.length < 5 && (m = IMAGE_RE.exec(text)) !== null) {
+      const u = m[0];
+      if (!out.includes(u)) out.push(u);
+    }
+    return out;
   }
 
   function extractUrls(text: string): string[] {
@@ -37,10 +50,25 @@
     return out;
   }
 
-  function emit(urls: string[]): void {
+  function emit(urls: string[], textForThumbs?: string): void {
     if (!urls.length) return;
     try {
       window.postMessage({ __vdg: "manifest-urls", urls }, "*");
+    } catch {
+      /* ignore */
+    }
+    // Same API response often carries the poster next to the manifest URL —
+    // pair them so rows get real thumbnails.
+    try {
+      if (textForThumbs) {
+        const thumbs = extractImages(textForThumbs);
+        if (thumbs.length) {
+          window.postMessage(
+            { __vdg: "manifest-meta", pairs: urls.map((u) => ({ manifest: u, thumbs })) },
+            "*",
+          );
+        }
+      }
     } catch {
       /* ignore */
     }
@@ -105,7 +133,10 @@
             const done = res
               .clone()
               .text()
-              .then((t) => emit(extractUrls(clean(t.slice(0, MAX_BODY)))))
+              .then((t) => {
+                const cleanText = clean(t.slice(0, MAX_BODY));
+                emit(extractUrls(cleanText), cleanText);
+              })
               .catch(() => undefined);
             void Promise.race([
               done,
@@ -161,7 +192,8 @@
               if (!url || mediaish(url, ct) || !apiish(ct)) return;
               const text = typeof this.responseText === "string" ? this.responseText : "";
               if (!text || text.length > MAX_BODY * 2) return;
-              emit(extractUrls(clean(text.slice(0, MAX_BODY))));
+              const cleanText = clean(text.slice(0, MAX_BODY));
+              emit(extractUrls(cleanText), cleanText);
             } catch {
               /* never break page traffic */
             }

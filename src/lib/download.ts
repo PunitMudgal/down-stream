@@ -15,8 +15,63 @@ export function sanitizeFilename(name: string, fallback: string): string {
   return cleaned.slice(0, 180);
 }
 
-export function filenameForUrl(url: string, type: string): string {
+/** Known site suffixes stripped from page/video titles for file naming. */
+const SITE_SUFFIX_RE =
+  /\s*[-–—|/]\s*(YouTube|X\s*\(Twitter\)|Twitter|Facebook|Instagram|TikTok|Vimeo|Dailymotion|Twitch|Rumble|Reddit|X)$/i;
+
+/** Trim + collapse whitespace, strip " - YouTube"-style suffixes. "" if unusable. */
+export function cleanTitle(raw: string | null | undefined, max = 100): string {
+  if (!raw) return "";
+  let s = raw.replace(/\s+/g, " ").trim();
+  s = s.replace(SITE_SUFFIX_RE, "").trim();
+  if (s.length < 3) return "";
+  return s.slice(0, max).trim();
+}
+
+/** Filesystem-safe stem (slashes become underscores — titles contain them). */
+export function sanitizeStem(raw: string, max = 100): string {
+  const s = raw
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/, "");
+  if (!s) return "";
+  return s.slice(0, max).trim().replace(/[. ]+$/, "") || "";
+}
+
+function defaultExtForType(type: string): string {
+  const t = type.toLowerCase();
+  if (t === "hls") return "ts";
+  if (t === "webm") return "webm";
+  if (t === "ogg") return "ogg";
+  if (t === "mov") return "mov";
+  if (t === "mkv") return "mkv";
+  if (t === "avi") return "avi";
+  if (t === "flv") return "flv";
+  if (t === "wmv") return "wmv";
+  if (t === "mpg") return "mpg";
+  return "mp4";
+}
+
+function videoExtFromUrl(url: string): string {
+  try {
+    const last = new URL(url).pathname.split("/").pop() || "";
+    const m = /\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|flv|f4v|wmv|mpg|mpeg|3gp|3g2)$/i.exec(last);
+    if (!m) return "";
+    const ext = m[1].toLowerCase();
+    if (ext === "m4v" || ext === "3gp" || ext === "3g2" || ext === "mpeg" || ext === "ogv" || ext === "f4v") return "mp4";
+    return ext;
+  } catch {
+    return "";
+  }
+}
+
+export function filenameForUrl(url: string, type: string, title?: string): string {
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const stem = title ? sanitizeStem(cleanTitle(title)) : "";
+  const ext = videoExtFromUrl(url) || defaultExtForType(type);
+  // A real title always wins (extension preserved from URL or type default).
+  if (stem) return `${stem}.${ext}`;
   if (type === "hls") return `hls-video-${ts}.ts`;
   if (type === "dash") return `dash-video-${ts}.mp4`;
   try {
@@ -29,10 +84,6 @@ export function filenameForUrl(url: string, type: string): string {
     /* fall through */
   }
   if (type === "segments") return `video-segments-${ts}.mp4`;
-  const lowerType = type.toLowerCase();
-  const ext = ["webm", "ogg", "mov", "mkv", "avi", "flv", "wmv", "mpg"].includes(lowerType)
-    ? lowerType
-    : "mp4";
   return `video-${ts}.${ext}`;
 }
 
@@ -110,6 +161,21 @@ async function fetchAllOrdered(
   signal?: AbortSignal,
   scope?: { byOrigin: Record<string, NetReplay> },
 ): Promise<Blob> {
+  const parts = await fetchSegments(urls, onProgress, signal, scope);
+  throwIfAborted(signal);
+  return new Blob(parts, { type: mime });
+}
+
+/**
+ * Fetch segment URLs with bounded parallelism, retries, and safety caps.
+ * Returns ordered ArrayBuffers (caller decides concat vs mux).
+ */
+export async function fetchSegments(
+  urls: string[],
+  onProgress?: ProgressCallback,
+  signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
+): Promise<ArrayBuffer[]> {
   if (urls.length === 0) throw new Error("No segments to download.");
   if (urls.length > MAX_SEGMENTS) {
     throw new Error(
@@ -139,7 +205,7 @@ async function fetchAllOrdered(
   const pool = Math.min(FETCH_CONCURRENCY, total);
   await Promise.all(Array.from({ length: pool }, () => worker()));
   throwIfAborted(signal);
-  return new Blob(parts, { type: mime });
+  return parts;
 }
 
 /**
