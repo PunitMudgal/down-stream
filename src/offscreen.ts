@@ -10,6 +10,11 @@ import type { DownloadJobRequest, DownloadJobStage } from "./lib/types";
 
 const controllers = new Map<string, AbortController>();
 
+/** Upper bound for one assembled file (matches the fetch-side cap). */
+const MAX_ASSEMBLED_BYTES = 1_500_000_000;
+/** Data-URL fallback ceiling — anything bigger must use direct save. */
+const DIRECT_SAVE_FALLBACK_BYTES = 12_000_000;
+
 interface CaptureAcc {
   parts: ArrayBuffer[];
   pairParts: ArrayBuffer[];
@@ -31,6 +36,62 @@ function report(msg: object): void {
 
 function stage(jobId: string, s: DownloadJobStage): void {
   report({ type: "JOB_STAGE", jobId, stage: s });
+}
+
+/**
+ * Save an assembled file. PRIMARY PATH: anchor download straight from this
+ * document — zero bytes cross extension messaging, so files of any size
+ * work and oversized-payload failures ("corrupt file payload") disappear.
+ * FALLBACK: small files only, via the legacy data-URL worker handoff.
+ */
+async function finalizeJobFile(jobId: string, blob: Blob, filename: string): Promise<void> {
+  if (!blob || blob.size === 0) {
+    throw new Error("Assembled file is empty — nothing was captured.");
+  }
+  stage(jobId, "saving");
+  try {
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      (document.body ?? document.documentElement).appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        /* ignore */
+      }
+      throw err;
+    }
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        /* ignore */
+      }
+    }, 120_000);
+    // Grace period for the browser to claim the blob URL before reporting.
+    await new Promise((r) => setTimeout(r, 1500));
+    report({ type: "DOWNLOAD_DONE", jobId, filename });
+  } catch (err) {
+    if (blob.size > DIRECT_SAVE_FALLBACK_BYTES) throw err;
+    const dataUrl = await blobToDataUrl(blob);
+    try {
+      await chrome.runtime.sendMessage({
+        type: "DOWNLOAD_BLOB",
+        jobId,
+        dataUrl,
+        filename,
+      });
+    } catch (e) {
+      throw new Error(
+        `Assembled ${(blob.size / 1_000_000).toFixed(1)} MB but the handoff to the background worker failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
 }
 
 /**
@@ -191,6 +252,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return false;
     }
     if (m.buf instanceof ArrayBuffer) {
+      if (acc.received + m.buf.byteLength > MAX_ASSEMBLED_BYTES) {
+        captures.delete(m.jobId);
+        report({
+          type: "DOWNLOAD_ERROR",
+          jobId: m.jobId,
+          error: "File exceeds the 1.5 GB safety cap — download stopped.",
+        });
+        try {
+          sendResponse({ ok: true });
+        } catch {
+          /* ignore */
+        }
+        return false;
+      }
       // which: 0 = primary track, 1 = paired audio track (muxed at END).
       if (m.which === 1) acc.pairParts.push(m.buf);
       else acc.parts.push(m.buf);
@@ -245,22 +320,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         acc.parts = [];
         acc.pairParts = [];
-        let dataUrl: string;
-        try {
-          dataUrl = await blobToDataUrl(blob);
-        } catch (err) {
-          throw new Error(
-            `Could not encode ${(blob.size / 1_000_000).toFixed(1)} MB capture for transfer: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        stage(m.jobId, "saving");
-        try {
-          await chrome.runtime.sendMessage({ type: "DOWNLOAD_BLOB", jobId: m.jobId, dataUrl, filename });
-        } catch (err) {
-          throw new Error(
-            `Assembled ${(blob.size / 1_000_000).toFixed(1)} MB but the transfer to the background worker failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+        await finalizeJobFile(m.jobId, blob, filename);
       } catch (err) {
         report({
           type: "DOWNLOAD_ERROR",
@@ -312,30 +372,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
 
       stage(job.jobId, "assembling");
-      let dataUrl: string;
-      try {
-        dataUrl = await blobToDataUrl(blob);
-      } catch (err) {
-        throw new Error(
-          `Could not encode ${(blob.size / 1_000_000).toFixed(1)} MB file for transfer: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
-      stage(job.jobId, "saving");
-      // Awaited delivery: if the payload is too large for messaging this
-      // throws here and becomes a clear DOWNLOAD_ERROR below — never silent.
-      try {
-        await chrome.runtime.sendMessage({
-          type: "DOWNLOAD_BLOB",
-          jobId: job.jobId,
-          dataUrl,
-          filename,
-        });
-      } catch (err) {
-        throw new Error(
-          `Assembled ${(blob.size / 1_000_000).toFixed(1)} MB but the transfer to the background worker failed (message too large?): ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+      await finalizeJobFile(job.jobId, blob, filename);
     } catch (err) {
       report({
         type: "DOWNLOAD_ERROR",

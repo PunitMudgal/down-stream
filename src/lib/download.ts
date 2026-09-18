@@ -140,10 +140,23 @@ async function fetchBuffer(
       // NOTE: headers in `net` were already scoped to this origin by the
       // background lookup — never attach foreign auth here.
       const res = await fetch(url, netInit(net, signal));
+      if (res.status === 403 || res.status === 404 || res.status === 410) {
+        // Permanent: signed URL expired/revoked or chunk gone — retrying
+        // only wastes minutes before failing the whole job.
+        throw new Error(
+          `Stream chunk unavailable (${res.status}) — the link likely expired. Replay the video, hit Rescan, and retry right away.`,
+        );
+      }
       if (!res.ok) throw new Error(`Segment fetch failed (${res.status}): ${url}`);
-      return await res.arrayBuffer();
+      const buf = await res.arrayBuffer();
+      rejectErrorPage(res.headers.get("content-type"), buf);
+      return buf;
     } catch (err) {
       if (signal?.aborted) throw new Error("Download cancelled.");
+      // Permanent failures (and our own validation errors) fail fast.
+      if (err instanceof Error && /unavailable \(40|error page instead of video/i.test(err.message)) {
+        throw err;
+      }
       lastErr = err;
       if (attempt < FETCH_RETRIES) {
         await new Promise((r) => setTimeout(r, 400 * attempt));
@@ -151,6 +164,29 @@ async function fetchBuffer(
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(`Segment fetch failed: ${url}`);
+}
+
+/**
+ * Refuse error pages baked in as "video": expired signed URLs and blocked
+ * requests often return 200 with an XML/HTML/JSON body. Concatenating one
+ * silent-poisons the whole file, so fail here with a clear message.
+ * (No valid video container starts with `<`, `{`, or `[`.)
+ */
+function rejectErrorPage(contentType: string | null, buf: ArrayBuffer): void {
+  if (buf.byteLength === 0) return;
+  const head = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+  const ct = (contentType ?? "").toLowerCase().split(";")[0].trim();
+  const textish =
+    ct.startsWith("text/") ||
+    ct.includes("xml") ||
+    ct.includes("json") ||
+    ct.includes("html") ||
+    ct === "";
+  if (head[0] === 0x3c || ((head[0] === 0x7b || head[0] === 0x5b) && textish)) {
+    throw new Error(
+      "A stream chunk came back as an error page instead of video (link expired or request blocked). Replay the video, hit Rescan, and retry right away.",
+    );
+  }
 }
 
 /** Bounded parallel fetch that preserves segment order for concat. */
@@ -163,7 +199,182 @@ async function fetchAllOrdered(
 ): Promise<Blob> {
   const parts = await fetchSegments(urls, onProgress, signal, scope);
   throwIfAborted(signal);
-  return new Blob(parts, { type: mime });
+  return new Blob(orderAndValidateSegmentParts(parts), { type: mime });
+}
+
+/**
+ * Natural (numeric-aware) ordering for observed chunk URLs. The cluster
+ * engine records URLs in network-arrival order, which breaks on seeks,
+ * retries, and parallel range fetches — sort by the numbers in the path so
+ * `seg-2` precedes `seg-10`. Stable: ties keep arrival order.
+ */
+export function sortSegmentsNatural(urls: string[]): string[] {
+  const tokenize = (s: string): Array<string | number> => {
+    const out: Array<string | number> = [];
+    const re = /\d+|\D+/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(s)) !== null) {
+      out.push(/^\d+$/.test(m[0]) ? Number(m[0]) : m[0]);
+    }
+    return out;
+  };
+  const keys = urls.map((u) => {
+    let s: string;
+    try {
+      const parsed = new URL(u);
+      s = parsed.pathname + parsed.search;
+    } catch {
+      s = u;
+    }
+    return tokenize(s);
+  });
+  return urls
+    .map((_, i) => i)
+    .sort((a, b) => {
+      const ka = keys[a];
+      const kb = keys[b];
+      const n = Math.max(ka.length, kb.length);
+      for (let i = 0; i < n; i++) {
+        const x = ka[i];
+        const y = kb[i];
+        if (x === undefined) return -1;
+        if (y === undefined) return 1;
+        if (typeof x === "number" && typeof y === "number") {
+          if (x !== y) return x - y;
+        } else {
+          const xs = String(x);
+          const ys = String(y);
+          if (xs !== ys) return xs < ys ? -1 : 1;
+        }
+      }
+      return a - b;
+    })
+    .map((i) => urls[i]);
+}
+
+// ---------- grouped-chunk validation (refuse corrupt files, don't make them) ----------
+
+type SniffedKind = "ts" | "fmp4" | "webm" | "ogg" | "mp3" | "text" | "unknown";
+
+/** Identify a container from its first bytes (cheap, per fetched chunk). */
+function sniffKind(head: Uint8Array): SniffedKind {
+  if (head.length === 0) return "unknown";
+  const b0 = head[0];
+  if (b0 === 0x47) return "ts"; // MPEG-TS sync byte
+  if (b0 === 0x3c) return "text"; // '<' — XML/HTML error page
+  if (head.length >= 4) {
+    if (b0 === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return "webm";
+    if (b0 === 0x4f && head[1] === 0x67 && head[2] === 0x67 && head[3] === 0x53) return "ogg";
+    if (b0 === 0x49 && head[1] === 0x44 && head[2] === 0x33) return "mp3";
+  }
+  if (head.length >= 8) {
+    const t = String.fromCharCode(head[4], head[5], head[6], head[7]);
+    if (
+      t === "ftyp" || t === "styp" || t === "sidx" || t === "moof" ||
+      t === "moov" || t === "mdat" || t === "free" || t === "wide" ||
+      t === "emsg" || t === "prft" || t === "mfra" || t === "skip" ||
+      t === "uuid" || t === "pssh"
+    ) {
+      return "fmp4";
+    }
+  }
+  return "unknown";
+}
+
+/** Walk top-level ISOBMFF boxes (bounded) looking for moov/pssh. */
+function scanTopLevel(buf: ArrayBuffer, budget = 262144): { moov: boolean; pssh: boolean } {
+  const v = new Uint8Array(buf);
+  const n = Math.min(v.length, budget);
+  let off = 0;
+  let moov = false;
+  let pssh = false;
+  while (off + 8 <= n) {
+    let size =
+      (v[off] * 16777216 + v[off + 1] * 65536 + v[off + 2] * 256 + v[off + 3]) >>> 0;
+    const type = String.fromCharCode(v[off + 4], v[off + 5], v[off + 6], v[off + 7]);
+    let hdr = 8;
+    if (size === 1) {
+      // 64-bit largesize follows the type.
+      if (off + 16 > n) break;
+      const hi =
+        (v[off + 8] * 16777216 + v[off + 9] * 65536 + v[off + 10] * 256 + v[off + 11]) >>> 0;
+      const lo =
+        (v[off + 12] * 16777216 + v[off + 13] * 65536 + v[off + 14] * 256 + v[off + 15]) >>> 0;
+      const full = hi * 4294967296 + lo;
+      if (!Number.isSafeInteger(full) || full < 16 || full > v.length) break;
+      size = full;
+      hdr = 16;
+    } else if (size === 0) {
+      break; // box extends to end of file — nothing more to learn
+    }
+    if (size < hdr) break; // corrupt
+    if (type === "moov") moov = true;
+    else if (type === "pssh") pssh = true;
+    if (moov && pssh) break;
+    const next = off + size;
+    if (next <= off || next > v.length) break;
+    off = next;
+  }
+  return { moov, pssh };
+}
+
+/**
+ * Validate fetched chunks BEFORE they become a file, and repair what is
+ * safely repairable (moving a lone init chunk first). Throws a clear,
+ * actionable error instead of producing an unplayable download when:
+ * - any chunk is an error page / non-video data,
+ * - chunks mix containers/qualities (can't merge into one file),
+ * - fragmented-MP4 chunks lack their init (`moov`) header,
+ * - chunks carry a `pssh` box (encrypted — undecryptable by design).
+ */
+export function orderAndValidateSegmentParts(parts: ArrayBuffer[]): ArrayBuffer[] {
+  if (parts.length === 0) throw new Error("No segments to download.");
+  const kinds = parts.map((p) =>
+    sniffKind(new Uint8Array(p, 0, Math.min(8, p.byteLength))),
+  );
+  if (kinds.includes("text")) {
+    throw new Error(
+      "A stream chunk came back as an error page instead of video (link expired or request blocked). Replay the video, hit Rescan, and retry right away.",
+    );
+  }
+  const unknownIdx = kinds.findIndex((k) => k === "unknown");
+  if (unknownIdx >= 0) {
+    throw new Error(
+      "A stream chunk isn't video data (the server refused the request or a non-media URL got mixed in). Replay the video from the start, Rescan, and retry.",
+    );
+  }
+  const distinct = new Set(kinds);
+  if (distinct.size > 1) {
+    throw new Error(
+      "Grouped chunks contain mixed formats or qualities, so they can't be merged into one file. Try a manifest quality (HLS/DASH row) or the Capture row instead.",
+    );
+  }
+  if (kinds[0] !== "fmp4") return parts; // TS/WebM/Ogg concat is order-tolerant
+
+  const scans = parts.map((p) => scanTopLevel(p));
+  if (scans.some((s) => s.pssh)) {
+    throw new Error("Protected content — chunks are encrypted and cannot be downloaded.");
+  }
+  const moovIdx: number[] = [];
+  scans.forEach((s, i) => {
+    if (s.moov) moovIdx.push(i);
+  });
+  if (moovIdx.length === 0) {
+    throw new Error(
+      `Couldn't rebuild a playable file from ${parts.length} grouped chunks — the stream's header segment wasn't captured (common after seeking or late detection). Replay the video from the start, then Rescan and retry.`,
+    );
+  }
+  if (moovIdx.length > 1) {
+    throw new Error(
+      "Grouped chunks contain multiple stream headers (mixed qualities), so they can't be merged into one file. Try a manifest quality (HLS/DASH row) or the Capture row instead.",
+    );
+  }
+  if (moovIdx[0] !== 0) {
+    // Lone init chunk arrived out of order — init must lead the file.
+    const [init] = parts.splice(moovIdx[0], 1);
+    parts.unshift(init);
+  }
+  return parts;
 }
 
 /**

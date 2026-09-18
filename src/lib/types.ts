@@ -13,6 +13,7 @@ export type MediaType =
   | "segments"
   | "capture"
   | "blob"
+  | "blobfile"
   | "unknown";
 
 export interface Variant {
@@ -66,6 +67,8 @@ export type RuntimeMessage =
       videos: VideoSignal[];
       pageTitle?: string;
       msSessions?: MsSessionMeta[];
+      /** Blobs the page exposed via URL.createObjectURL (hook-held bytes). */
+      blobs?: BlobFileInfo[];
     }
   | {
       type: "MANIFEST_META";
@@ -86,6 +89,8 @@ export type RuntimeMessage =
   // --- MSE capture transfer (content script <-> hook <-> offscreen) ---
   | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string; pairTrackIdx?: number }
   | { type: "MS_CANCEL"; jobId: string }
+  // --- Blob-file transfer (page Blob object URL -> hook slices -> offscreen) ---
+  | { type: "BLOB_DOWNLOAD"; jobId: string; url: string; filename: string }
   | { type: "MS_TRACK_START"; jobId: string; total: number; mime: string; filename: string }
   | { type: "MS_TRACK_CHUNK"; jobId: string; which: 0 | 1; index: number; total: number; buf: ArrayBuffer }
   | { type: "MS_TRACK_END"; jobId: string }
@@ -99,6 +104,8 @@ export type RuntimeMessage =
       dataUrl: string;
       filename: string;
     }
+  /** Offscreen saved the file itself (anchor download) — no bytes moved. */
+  | { type: "DOWNLOAD_DONE"; jobId: string; filename: string }
   | { type: "DOWNLOAD_ERROR"; jobId: string; error: string }
   | { type: "JOB_UPDATED"; job: DownloadJobState };
 
@@ -113,6 +120,17 @@ export interface VideoSignal {
   height?: number;
   /** Raw src attribute + <source> children (may differ from currentSrc). */
   candidates?: string[];
+}
+
+/**
+ * A Blob the page published via URL.createObjectURL and the MAIN hook
+ * retained. Only blobs actually referenced by a <video> element become
+ * downloadable `blobfile` items — the rest are never surfaced.
+ */
+export interface BlobFileInfo {
+  url: string;
+  size: number;
+  type: string;
 }
 
 export type DownloadKind = "direct" | "hls" | "dash" | "capture";

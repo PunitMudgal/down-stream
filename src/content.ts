@@ -1,6 +1,61 @@
-import type { MsSessionMeta, VideoSignal } from "./lib/types";
+import type { BlobFileInfo, MsSessionMeta, VideoSignal } from "./lib/types";
 
 const MAX_FETCH_BYTES = 5_000_000;
+
+/*
+ * PERFORMANCE CONTRACT (this script is injected into every frame of every
+ * page, including YouTube/Grok-style heavy SPAs):
+ * - No full-document scans on DOM mutations. A live registry of <video>
+ *   elements is maintained incrementally from MutationObserver addedNodes
+ *   (bounded by added-subtree size); one full scan happens once, idle.
+ * - The observer watches childList only. Attribute churn (progress bars,
+ *   framework patches) must never trigger collection.
+ * - No layout-thrashing reads: textContent only, never innerText; expensive
+ *   title/poster lookups are cached per element with a TTL.
+ * - Hidden tabs do no work; subframes stay silent unless they found media.
+ * - If the extension context is gone (reload/update), the script shuts
+ *   itself down instead of burning CPU on doomed sendMessage calls.
+ */
+
+const IN_SUBFRAME = (() => {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+})();
+
+let dead = false;
+
+function noteDead(err: unknown): void {
+  if (
+    err instanceof Error &&
+    /extension context invalidated|context invalidated/i.test(err.message)
+  ) {
+    dead = true;
+    try {
+      observer.disconnect();
+    } catch {
+      /* ignore */
+    }
+    if (reportTimer !== undefined) {
+      window.clearTimeout(reportTimer);
+      reportTimer = undefined;
+    }
+  }
+}
+
+/** Best-effort send; returns false (and shuts down) when the context died. */
+async function bgSend(msg: object): Promise<boolean> {
+  if (dead) return false;
+  try {
+    await chrome.runtime.sendMessage(msg);
+    return true;
+  } catch (err) {
+    noteDead(err);
+    return false;
+  }
+}
 
 // ---- MSE capture bridge (MAIN-world hook <-> extension) ----
 interface MsPending {
@@ -61,6 +116,22 @@ async function queryMsSessions(): Promise<MsSessionMeta[]> {
   return [];
 }
 
+/** Blobs the page published (url/size/type only — bytes stay put). */
+async function queryBlobs(): Promise<BlobFileInfo[]> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = (await askHook({ __vdg: "blob-list" }, 1500)) as any;
+    if (res && res.__vdg === "blob-list-result" && Array.isArray(res.blobs)) {
+      return (res.blobs as BlobFileInfo[]).filter(
+        (b) => b && typeof b.url === "string" && typeof b.size === "number" && b.size > 0,
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+  return [];
+}
+
 function absolutize(raw: string | null): string | null {
   if (!raw) return null;
   const s = raw.trim();
@@ -72,33 +143,103 @@ function absolutize(raw: string | null): string | null {
   }
 }
 
-/** Find <video> even inside shadow DOM and same-origin iframes' documents. */
-function allVideos(root: Document | ShadowRoot): HTMLVideoElement[] {
-  const out: HTMLVideoElement[] = [];
-  const walk = (node: Document | ShadowRoot | Element): void => {
-    const vids =
-      node instanceof Document || node instanceof ShadowRoot
-        ? node.querySelectorAll("video")
-        : node.tagName === "VIDEO"
-          ? [node as HTMLVideoElement]
-          : node.querySelectorAll("video");
-    vids.forEach((v) => out.push(v as HTMLVideoElement));
-    const els =
-      node instanceof Document || node instanceof ShadowRoot
-        ? node.querySelectorAll("*")
-        : node.querySelectorAll("*");
-    els.forEach((el) => {
-      const shadow = (el as HTMLElement).shadowRoot;
-      if (shadow) walk(shadow);
+// ---- Incremental <video> registry ----
+const liveVideos = new Set<HTMLVideoElement>();
+
+function takeVideo(v: HTMLVideoElement): boolean {
+  if (liveVideos.has(v)) return false;
+  if (liveVideos.size >= 100) return false; // absurd pages: bound the set
+  liveVideos.add(v);
+  return true;
+}
+
+/**
+ * Ingest one added node and its descendants (O(added subtree), never
+ * O(document)). Shadow roots are pierced only inside added subtrees.
+ */
+function ingestAdded(node: Node): boolean {
+  let added = false;
+  try {
+    if (node instanceof HTMLVideoElement) {
+      if (takeVideo(node)) added = true;
+    }
+    if (node instanceof Element) {
+      const stack: Element[] = [node];
+      while (stack.length) {
+        const el = stack.pop() as Element;
+        if (el instanceof HTMLVideoElement) {
+          if (takeVideo(el)) added = true;
+        }
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) {
+          try {
+            sr.querySelectorAll("video").forEach((v) => {
+              if (takeVideo(v as HTMLVideoElement)) added = true;
+            });
+          } catch {
+            /* ignore */
+          }
+          try {
+            for (const c of Array.from(sr.children)) stack.push(c);
+          } catch {
+            /* ignore */
+          }
+        }
+        try {
+          for (const c of Array.from(el.children)) stack.push(c);
+        } catch {
+          /* ignore */
+        }
+      }
+    } else if (node instanceof DocumentFragment || node instanceof ShadowRoot) {
+      try {
+        (node as unknown as ParentNode).querySelectorAll?.("video").forEach((v) => {
+          if (takeVideo(v as HTMLVideoElement)) added = true;
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return added;
+}
+
+/**
+ * One-time full scan (idle boot + explicit rescans only): direct videos,
+ * same-origin iframes, and shadow hosts (bounded host count).
+ */
+function fullScan(): boolean {
+  let added = false;
+  try {
+    document.querySelectorAll("video").forEach((v) => {
+      if (takeVideo(v as HTMLVideoElement)) added = true;
     });
-  };
-  walk(root);
+  } catch {
+    /* ignore */
+  }
+  try {
+    const hosts = document.querySelectorAll("*");
+    if (hosts.length <= 15000) {
+      hosts.forEach((el) => {
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr && ingestAdded(sr)) added = true;
+      });
+    }
+  } catch {
+    /* ignore */
+  }
   // Same-origin iframes (cross-origin ones are opaque to us).
   try {
     Array.from(document.querySelectorAll("iframe")).forEach((frame) => {
       try {
         const doc = frame.contentDocument;
-        if (doc) out.push(...allVideos(doc));
+        if (doc) {
+          doc.querySelectorAll("video").forEach((v) => {
+            if (takeVideo(v as HTMLVideoElement)) added = true;
+          });
+        }
       } catch {
         /* cross-origin iframe — skip */
       }
@@ -106,7 +247,7 @@ function allVideos(root: Document | ShadowRoot): HTMLVideoElement[] {
   } catch {
     /* ignore */
   }
-  return out;
+  return added;
 }
 
 function signalFrom(el: HTMLVideoElement): VideoSignal | null {
@@ -123,8 +264,9 @@ function signalFrom(el: HTMLVideoElement): VideoSignal | null {
     const u = absolutize(el.getAttribute(attr));
     if (u && !candidates.includes(u)) candidates.push(u);
   }
-  const poster = el.poster || findPoster(el) || undefined;
-  const title = findTitle(el) || undefined;
+  const cached = cachedExpensiveMeta(el);
+  const poster = cached.poster || undefined;
+  const title = cached.title || undefined;
   if (candidates.length === 0 && !poster && !title) return null;
   return {
     currentSrc: candidates[0] ?? "",
@@ -138,6 +280,23 @@ function signalFrom(el: HTMLVideoElement): VideoSignal | null {
   };
 }
 
+/** Title/poster lookups touch ancestors — cache per element with a TTL. */
+const META_CACHE_MS = 20_000;
+const metaCache = new WeakMap<HTMLVideoElement, { title: string | null; poster: string | null; at: number }>();
+
+function cachedExpensiveMeta(el: HTMLVideoElement): { title: string | null; poster: string | null } {
+  const now = Date.now();
+  const hit = metaCache.get(el);
+  if (hit && now - hit.at < META_CACHE_MS) return hit;
+  const fresh = { title: findTitle(el), poster: findPoster(el), at: now };
+  try {
+    metaCache.set(el, fresh);
+  } catch {
+    /* ignore */
+  }
+  return fresh;
+}
+
 function cleanSnippet(s: string | null | undefined, max = 140): string | null {
   if (!s) return null;
   const t = s.replace(/\s+/g, " ").trim();
@@ -149,6 +308,9 @@ function cleanSnippet(s: string | null | undefined, max = 140): string | null {
  * Best-effort per-video title: player attributes first, then post/caption
  * text near the player (X-style tweet text, figcaptions, nearby headings),
  * so each download can carry the video's name instead of a hash.
+ *
+ * NOTE: textContent only — innerText forces style/layout and janks
+ * streaming pages (Grok token streaming, YouTube comments) on every scan.
  */
 function findTitle(el: HTMLVideoElement): string | null {
   try {
@@ -163,14 +325,14 @@ function findTitle(el: HTMLVideoElement): string | null {
         '[data-testid="tweetText"], figcaption, [class*="caption" i]',
       );
       for (const c of Array.from(safe)) {
-        const t = cleanSnippet((c as HTMLElement).innerText || c.textContent);
+        const t = cleanSnippet((c as HTMLElement).textContent);
         if (t) return t;
       }
       // Headings/named blocks only close to the player (avoids site chrome).
       if (level < 3) {
         const near = node.querySelectorAll("h1, h2, h3, [class*=\"video-title\" i], [class*=\"media-title\" i]");
         for (const c of Array.from(near)) {
-          const t = cleanSnippet((c as HTMLElement).innerText || c.textContent, 100);
+          const t = cleanSnippet((c as HTMLElement).textContent, 100);
           if (t) return t;
         }
       }
@@ -218,63 +380,134 @@ function findPoster(el: HTMLVideoElement): string | null {
 
 function collect(): VideoSignal[] {
   try {
-    return allVideos(document)
-      .map(signalFrom)
-      .filter((s): s is VideoSignal => s !== null);
+    const out: VideoSignal[] = [];
+    liveVideos.forEach((v) => {
+      try {
+        if (!v.isConnected) {
+          liveVideos.delete(v);
+          return;
+        }
+        const s = signalFrom(v);
+        if (s) out.push(s);
+      } catch {
+        /* ignore single-element failures */
+      }
+    });
+    return out;
   } catch {
     return [];
   }
 }
 
-let lastSent = "";
-function report(force = false): void {
-  void (async () => {
-    try {
-      const videos = collect();
-      const sessions = await queryMsSessions();
-      // Session bytes rounded to MB: reports refresh as captures grow,
-      // without spamming on every appended chunk.
-      const sessKey = sessions
-        .map((s) => `${s.id}:${Math.floor(s.bytes / 1_000_000)}:${s.tracks.length}`)
-        .join(",");
-      const key =
-        JSON.stringify(videos.map((v) => [v.currentSrc, v.poster, v.paused, v.title])) + "|" + sessKey;
-      if (!force && (key === lastSent || (videos.length === 0 && sessions.length === 0))) return;
-      lastSent = key;
-      await chrome.runtime.sendMessage({
-        type: "VIDEO_ELEMENTS",
-        tabId: -1, // background resolves the real tab via sender.tab
-        videos,
-        pageTitle: document.title,
-        msSessions: sessions,
-      });
-    } catch {
-      /* extension context may be unavailable — enrichment is best-effort */
-    }
-  })();
+function pageHidden(): boolean {
+  try {
+    return document.hidden;
+  } catch {
+    return false;
+  }
 }
 
-// Initial sweep (force: even an empty page state is worth one report for posters).
-report(true);
+let lastSent = "";
+let lastSessQuery = 0;
+let reportTimer: number | undefined;
+
+function scheduleReport(): void {
+  if (dead || reportTimer !== undefined) return;
+  reportTimer = window.setTimeout(
+    () => {
+      reportTimer = undefined;
+      void report(false);
+    },
+    IN_SUBFRAME ? 3000 : 1500,
+  );
+}
+
+async function report(force: boolean): Promise<void> {
+  if (dead) return;
+  // Hidden tabs do no work — refresh on visibility return instead.
+  if (!force && pageHidden()) return;
+  try {
+    const videos = collect();
+    const now = Date.now();
+    let sessions: MsSessionMeta[] = [];
+    let blobs: BlobFileInfo[] = [];
+    // Session/blob metadata only on demand or at a slow cadence: every
+    // report used to round-trip the MAIN hook, waking both worlds constantly.
+    if (force || now - lastSessQuery > 15000) {
+      lastSessQuery = now;
+      [sessions, blobs] = await Promise.all([queryMsSessions(), queryBlobs()]);
+      if (dead) return;
+    }
+    // Subframes stay silent unless they actually found something worth
+    // reporting (ads/embeds/trackers otherwise chatter on every scan).
+    if (IN_SUBFRAME && !force && videos.length === 0 && sessions.length === 0 && blobs.length === 0) return;
+    // Session bytes rounded to MB: reports refresh as captures grow,
+    // without spamming on every appended chunk.
+    const sessKey = sessions
+      .map((s) => `${s.id}:${Math.floor(s.bytes / 1_000_000)}:${s.tracks.length}`)
+      .join(",");
+    const blobKey = blobs.map((b) => `${b.url}:${b.size}`).join(",");
+    const key =
+      JSON.stringify(videos.map((v) => [v.currentSrc, v.poster, v.paused, v.title])) + "|" + sessKey + "|" + blobKey;
+    if (!force && (key === lastSent || (videos.length === 0 && sessions.length === 0 && blobs.length === 0))) return;
+    lastSent = key;
+    await bgSend({
+      type: "VIDEO_ELEMENTS",
+      tabId: -1, // background resolves the real tab via sender.tab
+      videos,
+      pageTitle: document.title,
+      msSessions: sessions,
+      blobs,
+    });
+  } catch (err) {
+    noteDead(err);
+    /* extension context may be unavailable — enrichment is best-effort */
+  }
+}
 
 // Continuous watch for SPA feeds (X/Twitter timeline, infinite scroll):
-// players mount <video> nodes and swap src/blob URLs long after load.
-let pending = false;
-const observer = new MutationObserver(() => {
-  if (pending) return;
-  pending = true;
-  setTimeout(() => {
-    pending = false;
-    report();
-  }, 1500);
+// players mount <video> nodes long after load. childList only — attribute
+// churn must never schedule work (see header contract).
+const observer = new MutationObserver((records) => {
+  if (dead) return;
+  try {
+    let changed = false;
+    for (const r of records) {
+      if (r.addedNodes.length) {
+        r.addedNodes.forEach((n) => {
+          if (ingestAdded(n)) changed = true;
+        });
+      }
+      if (r.removedNodes.length) {
+        r.removedNodes.forEach((n) => {
+          try {
+            if (n instanceof HTMLVideoElement) {
+              if (liveVideos.delete(n)) changed = true;
+            } else if (
+              n instanceof Element &&
+              (n.querySelector?.("video") || (n as HTMLElement).shadowRoot)
+            ) {
+              // A subtree containing players was removed — prune lazily and
+              // refresh so stale rows disappear.
+              changed = true;
+            }
+          } catch {
+            /* ignore */
+          }
+        });
+      }
+      if (changed) break;
+    }
+    if (changed) scheduleReport();
+  } catch {
+    /* ignore */
+  }
 });
 try {
   if (document.documentElement) {
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
-      attributes: true,
-      attributeFilter: ["src", "poster"],
     });
   }
 } catch {
@@ -283,20 +516,47 @@ try {
 
 // Report the moment anything starts playing (covers players that only set
 // a real URL on play, and refreshes paused/playing + duration metadata).
-document.addEventListener("play", () => report(), true);
-document.addEventListener("loadedmetadata", () => report(), true);
+document.addEventListener("play", () => scheduleReport(), true);
+document.addEventListener("loadedmetadata", () => scheduleReport(), true);
+// Hidden tab did no work while away — catch up once on return.
+document.addEventListener("visibilitychange", () => {
+  if (!dead && !pageHidden()) scheduleReport();
+});
+
+// Deferred boot: never compete with page load. The observer above already
+// tracks anything mounted meanwhile; this just establishes the baseline.
+try {
+  const kick = (): void => {
+    if (dead) return;
+    try {
+      fullScan();
+    } catch {
+      /* ignore */
+    }
+    void report(true);
+  };
+  const ric = (window as unknown as { requestIdleCallback?: unknown }).requestIdleCallback;
+  if (typeof ric === "function") {
+    (ric as (cb: () => void, opts?: { timeout: number }) => void).call(window, kick, { timeout: 4000 });
+  } else {
+    window.setTimeout(kick, 2500);
+  }
+} catch {
+  /* ignore */
+}
 
 // Findings from the MAIN-world API hook (fetch/XHR responses embedding
 // manifest URLs). Only extracted URL strings ever cross into the extension.
 window.addEventListener("message", (event) => {
   try {
+    if (dead) return;
     if (event.source !== window) return;
     const d = event.data as { __vdg?: unknown; urls?: unknown; pairs?: unknown } | null;
     if (!d || typeof d !== "object") return;
     if (d.__vdg === "manifest-urls" && Array.isArray(d.urls)) {
       const urls = (d.urls as unknown[]).filter((u): u is string => typeof u === "string").slice(0, 30);
       if (!urls.length) return;
-      void chrome.runtime.sendMessage({
+      void bgSend({
         type: "VIDEO_ELEMENTS",
         tabId: -1, // background resolves the real tab via sender.tab
         videos: urls.map((u) => ({ currentSrc: u, candidates: [u] })),
@@ -309,7 +569,7 @@ window.addEventListener("message", (event) => {
         .slice(0, 30)
         .map((p) => ({ manifest: p.manifest as string, thumbs: (p.thumbs as unknown[]).filter((t): t is string => typeof t === "string").slice(0, 5) }));
       if (!pairs.length) return;
-      void chrome.runtime.sendMessage({
+      void bgSend({
         type: "MANIFEST_META",
         tabId: -1,
         pairs,
@@ -336,13 +596,7 @@ async function driveMsDownload(
 ): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fail = (error: string): void => {
-    try {
-      void chrome.runtime
-        .sendMessage({ type: "DOWNLOAD_ERROR", jobId, error })
-        .catch(() => undefined);
-    } catch {
-      /* ignore */
-    }
+    void bgSend({ type: "DOWNLOAD_ERROR", jobId, error });
   };
   const pullTrack = async (idx: number, which: 0 | 1, indexStart: number): Promise<number> => {
     const sessions = await queryMsSessions();
@@ -364,7 +618,7 @@ async function driveMsDownload(
         throw new Error(typeof res?.error === "string" ? res.error : "Capture transfer failed.");
       }
       if (res.buf instanceof ArrayBuffer && res.buf.byteLength > 0) {
-        await chrome.runtime.sendMessage({
+        const ok = await bgSend({
           type: "MS_TRACK_CHUNK",
           jobId,
           which,
@@ -372,6 +626,7 @@ async function driveMsDownload(
           total: track.bytes,
           buf: res.buf,
         });
+        if (!ok) throw new Error("Download cancelled.");
         index++;
       }
       cursor = typeof res.next === "number" ? res.next : cursor;
@@ -389,7 +644,7 @@ async function driveMsDownload(
     }
     const pair = pairTrackIdx != null ? session.tracks[pairTrackIdx] : undefined;
     const total = track.bytes + (pair && pair.bytes > 0 ? pair.bytes : 0);
-    await chrome.runtime.sendMessage({
+    await bgSend({
       type: "MS_TRACK_START",
       jobId,
       total,
@@ -401,7 +656,58 @@ async function driveMsDownload(
       index = await pullTrack(pairTrackIdx as number, 1, index);
       void index;
     }
-    await chrome.runtime.sendMessage({ type: "MS_TRACK_END", jobId });
+    await bgSend({ type: "MS_TRACK_END", jobId });
+  } catch (err) {
+    if (msAbort.has(jobId)) {
+      msAbort.delete(jobId);
+      fail("Download cancelled.");
+    } else {
+      fail(err instanceof Error ? err.message : String(err));
+    }
+  } finally {
+    msAbort.delete(jobId);
+  }
+}
+
+// ---- Blob-file download driver ----
+// Streams a page-held Blob (whole-file blob: playback) to the offscreen
+// document in ≤4MB slices, reusing the MS_TRACK_* accumulation + save flow.
+const BLOB_STEP = 4_000_000;
+
+async function driveBlobDownload(jobId: string, blobUrl: string, filename: string): Promise<void> {
+  const fail = (error: string): void => {
+    void bgSend({ type: "DOWNLOAD_ERROR", jobId, error });
+  };
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const info = (await askHook({ __vdg: "blob-info", url: blobUrl }, 8000)) as any;
+    if (!info || info.__vdg !== "blob-info-result" || typeof info.size !== "number" || info.size <= 0) {
+      fail(typeof info?.error === "string" ? info.error : "Blob expired — replay the video and Rescan.");
+      return;
+    }
+    const total: number = info.size;
+    const mime: string = typeof info.type === "string" && info.type ? info.type : "video/mp4";
+    await bgSend({ type: "MS_TRACK_START", jobId, total, mime, filename });
+    let cursor = 0;
+    let index = 0;
+    for (;;) {
+      if (msAbort.has(jobId)) throw new Error("Download cancelled.");
+      if (cursor >= total) break;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const res = (await askHook({ __vdg: "blob-get", url: blobUrl, cursor, len: BLOB_STEP }, 20000)) as any;
+      if (!res || res.__vdg !== "blob-chunk" || res.error) {
+        throw new Error(typeof res?.error === "string" ? res.error : "Blob transfer failed.");
+      }
+      if (res.buf instanceof ArrayBuffer && res.buf.byteLength > 0) {
+        await bgSend({ type: "MS_TRACK_CHUNK", jobId, which: 0, index, total, buf: res.buf });
+        index++;
+      }
+      const next = typeof res.next === "number" ? res.next : cursor;
+      cursor = next <= cursor ? cursor + (res.buf instanceof ArrayBuffer ? res.buf.byteLength : 0) : next;
+      if (res.done || cursor >= total) break;
+      if (index > 500) throw new Error("Blob exceeds the transfer cap.");
+    }
+    await bgSend({ type: "MS_TRACK_END", jobId });
   } catch (err) {
     if (msAbort.has(jobId)) {
       msAbort.delete(jobId);
@@ -420,20 +726,43 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const m = msg as any;
   if (m?.type === "COLLECT_NOW") {
-    report(true);
+    if (!dead) {
+      try {
+        fullScan();
+      } catch {
+        /* ignore */
+      }
+      void report(true);
+    }
     sendResponse({ ok: true });
     return false;
   }
   if (m?.type === "COLLECT_FOR_POPUP") {
     void (async () => {
       try {
-        const [videos, msSessions] = await Promise.all([
+        if (dead) {
+          sendResponse({ ok: false, error: "Content script context invalidated — reload the tab." });
+          return;
+        }
+        try {
+          fullScan();
+        } catch {
+          /* ignore */
+        }
+        lastSessQuery = Date.now();
+        const [videos, msSessions, blobs] = await Promise.all([
           Promise.resolve(collect()),
           queryMsSessions(),
+          queryBlobs(),
         ]);
-        sendResponse({ ok: true, videos, pageTitle: document.title, msSessions });
+        sendResponse({ ok: true, videos, pageTitle: document.title, msSessions, blobs });
       } catch (err) {
-        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        noteDead(err);
+        try {
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        } catch {
+          /* ignore */
+        }
       }
     })();
     return true; // async (session query)
@@ -457,6 +786,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     return false;
   }
+  if (m?.type === "BLOB_DOWNLOAD" && typeof m.jobId === "string" && typeof m.url === "string") {
+    void driveBlobDownload(m.jobId, m.url, String(m.filename ?? "video.mp4"));
+    try {
+      sendResponse({ ok: true, accepted: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
   if (m?.type === "FETCH_TEXT" && typeof m.url === "string") {
     void (async () => {
       try {
@@ -472,7 +810,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         sendResponse({ ok: true, text });
       } catch (err) {
-        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        noteDead(err);
+        try {
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        } catch {
+          /* ignore */
+        }
       }
     })();
     return true; // async response

@@ -84,6 +84,19 @@ async function activeTab(): Promise<{ id: number | null; host: string; url: stri
   return { id: tab?.id ?? null, host, url };
 }
 
+/** Hosts the extension deliberately does not run on (see manifest). */
+function unsupportedHostReason(url: string): string | null {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (/(^|\.)youtube\.com$/.test(h) || /(^|\.)youtu\.be$/.test(h) || /(^|\.)youtube-nocookie\.com$/.test(h)) {
+      return "YouTube isn't supported by this extension (its delivery is encrypted/obfuscated). It works on other video sites — open one and try again.";
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 /** Pages where extensions are forbidden from running at all. */
 function blockedPageReason(url: string): string | null {
   if (!url) return "No page URL available.";
@@ -379,7 +392,7 @@ function mbPair(done: number, total: number): string {
 
 function runningText(job: DownloadJobState): string {
   const tail = "(safe to close popup)";
-  if (job.itemUrl.startsWith("capture:")) {
+  if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
     if (job.stage === "assembling") return `Assembling capture… ${tail}`;
     if (job.stage === "saving") return `Saving download… ${tail}`;
     return `Capturing… ${mbPair(job.done, job.total)} ${tail}`;
@@ -414,6 +427,15 @@ async function loadMedia(): Promise<void> {
       const div = document.createElement("div");
       div.className = "empty";
       div.textContent = blocked;
+      listEl.appendChild(div);
+      return;
+    }
+    const unsupported = unsupportedHostReason(t.url);
+    if (unsupported) {
+      setStatus("");
+      const div = document.createElement("div");
+      div.className = "empty";
+      div.textContent = unsupported;
       listEl.appendChild(div);
       return;
     }
@@ -630,7 +652,7 @@ function renderCard(item: MediaItem): HTMLElement {
   }
 
   // Copy-link needs a real URL (blob:/capture: rows have none fetchable).
-  if (item.type !== "blob" && item.type !== "capture") {
+  if (item.type !== "blob" && item.type !== "capture" && item.type !== "blobfile") {
     const copy = document.createElement("button");
     copy.className = "ghost";
     copy.textContent = "Copy link";
@@ -731,7 +753,7 @@ function renderCard(item: MediaItem): HTMLElement {
   return card;
 }
 
-const DIRECT_BADGES = new Set(["MP4", "WEBM", "OGG", "MOV", "MKV", "AVI", "FLV", "WMV", "MPG"]);
+const DIRECT_BADGES = new Set(["MP4", "WEBM", "OGG", "MOV", "MKV", "AVI", "FLV", "WMV", "MPG", "BLOBFILE"]);
 
 function isDirect(item: MediaItem): boolean {
   return DIRECT_BADGES.has(item.type.toUpperCase());
@@ -747,8 +769,10 @@ function jobLine(job: DownloadJobState, direct: boolean): { label: string; state
 function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, direct: boolean): void {
   let cancel = card.querySelector("button.cancelbtn") as HTMLButtonElement | null;
   // Direct downloads finish near-instantly via the browser — cancel only
-  // makes sense for multi-segment HLS/DASH jobs.
-  const showCancel = job?.status === "running" && !direct;
+  // makes sense for multi-segment HLS/DASH jobs. Page-blob ("blobfile")
+  // downloads stream slices for a while, so they keep Cancel too.
+  const isBlobFile = (card.dataset.itemUrl ?? "").startsWith("blob:");
+  const showCancel = job?.status === "running" && (!direct || isBlobFile);
   if (showCancel) {
     if (!cancel) {
       const jid = job.jobId;
@@ -890,7 +914,7 @@ async function handleStartDownload(
         // surface its reason, but still allow the direct fallback below
         // when the worker simply doesn't know this page-found URL.
         const reason: string = res?.error ?? "unknown error";
-        if (workerAlive && isDirect(item) && /no longer listed|Unknown message/i.test(reason)) {
+        if (workerAlive && isDirect(item) && item.type !== "blobfile" && /no longer listed|Unknown message/i.test(reason)) {
           await downloadDirectFallback(item, btn);
           return;
         }
@@ -920,12 +944,14 @@ async function handleStartDownload(
     }
   }
   // Fallback path (worker unreachable): direct files need no worker —
-  // the popup can hand the URL to chrome.downloads itself.
-  if (isDirect(item)) {
+  // the popup can hand the URL to chrome.downloads itself. Page-held blobs
+  // are NOT fetchable from here (blob: URLs are page-scoped), so blobfile
+  // items always need the worker.
+  if (isDirect(item) && item.type !== "blobfile") {
     await downloadDirectFallback(item, btn);
     return;
   }
-  setStatus("Download failed: background worker isn't answering (needed for HLS/DASH/grouped/capture downloads). Reload the extension and retry.");
+  setStatus("Download failed: background worker isn't answering (needed for HLS/DASH/grouped/capture/page-blob downloads). Reload the extension and retry.");
   btn.disabled = false;
 }
 

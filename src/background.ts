@@ -1,7 +1,8 @@
 import { parseHlsManifest } from "./lib/parseHls";
 import { parseDashManifest } from "./lib/parseDash";
-import { cleanTitle, downloadDirect, filenameForUrl, sanitizeStem } from "./lib/download";
+import { cleanTitle, downloadDirect, filenameForUrl, sanitizeStem, sortSegmentsNatural } from "./lib/download";
 import type {
+  BlobFileInfo,
   DownloadJobRequest,
   DownloadJobState,
   MediaItem,
@@ -20,6 +21,25 @@ const JOBS_KEY = "downloadJobs";
 const OFFSCREEN_URL = "src/offscreen.html";
 const MAX_ITEMS_PER_TAB = 60;
 const MAX_BLOB_PER_TAB = 25;
+
+/**
+ * Hosts the extension never touches (page + network). YouTube is out of
+ * scope by design: ciphered/DRM-protected delivery can't be downloaded, and
+ * its traffic volume only adds noise. googlevideo.com carries that traffic
+ * even for embeds, so it is excluded too.
+ */
+export function isExcludedUrl(url: string): boolean {  try {
+    const h = new URL(url).hostname.toLowerCase();
+    return (
+      /(^|\.)youtube\.com$/.test(h) ||
+      /(^|\.)youtu\.be$/.test(h) ||
+      /(^|\.)youtube-nocookie\.com$/.test(h) ||
+      /(^|\.)googlevideo\.com$/.test(h)
+    );
+  } catch {
+    return false;
+  }
+}
 
 function newJobId(): string {
   return `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -418,6 +438,27 @@ interface Cluster {
 
 const clustersByTab = new Map<number, Cluster[]>();
 
+/**
+ * Global intake guard for the segment-cluster engine. webRequest wakes the
+ * worker for EVERY subresource on media-heavy pages (YouTube fires hundreds
+ * of requests/min: thumbnails, stats, segments). Normal volume passes
+ * through; over budget we keep only extension-obvious chunks (.ts/.m4s/…)
+ * and skip the sequential-URL regex path for the rest.
+ */
+let recWindowStart = 0;
+let recWindowCount = 0;
+function recordAllowed(url: string): boolean {
+  const now = Date.now();
+  if (now - recWindowStart > 1000) {
+    recWindowStart = now;
+    recWindowCount = 0;
+  }
+  recWindowCount++;
+  if (recWindowCount <= 150) return true;
+  const path = url.toLowerCase().split("?")[0].split("#")[0];
+  return /\.(ts|m4s|cmfv|cmfa)$/.test(path);
+}
+
 function segPathExt(pathname: string): string | null {
   const m = /\.([a-z0-9]{2,5})$/.exec(pathname.toLowerCase());
   return m ? m[1] : null;
@@ -465,6 +506,7 @@ function recordCandidate(
   statusCode: number,
   contentLength = 0,
 ): void {
+  if (!recordAllowed(url)) return;
   const ct = contentType.toLowerCase().split(";")[0].trim();
   if (!isSegmentCandidate(url, ct, statusCode)) return;
   const key = clusterKey(url);
@@ -513,18 +555,30 @@ function clusterBytesLabel(bytes: number): string {
 
 async function maybePromoteCluster(tabId: number, cluster: Cluster): Promise<void> {
   if (cluster.urls.length < MIN_CLUSTER_URLS) return;
-  // Throttle republishing: every +8 urls or 10s, whichever first.
+  // Throttle republishing: every +20 urls or 30s, whichever first. Each
+  // publish is a storage read-modify-write + badge update — on segment-heavy
+  // pages (YouTube) the old 8-url/10s cadence kept the worker and storage
+  // churning constantly for rows the user may never open.
   if (
-    cluster.urls.length - cluster.lastPubCount < 8 &&
-    Date.now() - cluster.lastPubTs < 10_000
+    cluster.urls.length - cluster.lastPubCount < 20 &&
+    Date.now() - cluster.lastPubTs < 30_000
   ) {
     return;
   }
   const items = await getTabItems(tabId);
+  // A parsed manifest supersedes raw chunk groups — skip promoting noise on
+  // pages where real qualities already exist.
+  if (
+    items.some(
+      (x) => (x.type === "hls" || x.type === "dash") && (x.variants?.length ?? 0) > 0,
+    )
+  ) {
+    return;
+  }
   // A known item for the canonical URL already covers this stream.
   if (items.some((x) => x.url === cluster.urls[0])) return;
   const existing = items.find((x) => x.type === "segments" && x.url === cluster.urls[0]);
-  const meta = `${cluster.urls.length} segments • auto-grouped from player traffic${cluster.bytes ? ` • ${clusterBytesLabel(cluster.bytes)}` : ""}`;
+  const meta = `${cluster.urls.length} segments • auto-grouped, experimental${cluster.bytes ? ` • ${clusterBytesLabel(cluster.bytes)}` : ""}`;
   if (existing) {
     existing.segments = [...cluster.urls];
     existing.meta = meta;
@@ -605,6 +659,7 @@ function videoishForHeaders(url: string): boolean {
 function onSendHeaders(details: chrome.webRequest.OnSendHeadersDetails): void {
   const { tabId, url } = details;
   if (tabId == null || tabId < 0) return;
+  if (isExcludedUrl(url)) return;
   if (!url.startsWith("http://") && !url.startsWith("https://")) return;
   if (!videoishForHeaders(url)) return;
   const headers: Record<string, string> = {};
@@ -677,6 +732,7 @@ function onHeadersReceived(
 ): chrome.webRequest.BlockingResponse | undefined {
   const { tabId, url } = details;
   if (tabId == null || tabId < 0) return undefined;
+  if (isExcludedUrl(url)) return undefined;
   if (!url.startsWith("http://") && !url.startsWith("https://")) return undefined;
 
   const ct = headerValue(details.responseHeaders, "content-type");
@@ -813,6 +869,71 @@ safeWire("tabs", () => {
   });
 });
 
+/** Extension for a page-held Blob's MIME (defaults to mp4). */
+export function extForBlobMime(t: string): string {
+  const m = t.toLowerCase().split(";")[0].trim();
+  if (m === "video/webm") return "webm";
+  if (m === "video/x-matroska") return "mkv";
+  if (m === "video/quicktime") return "mov";
+  if (m === "video/ogg" || m === "audio/ogg") return "ogv";
+  if (m === "video/mp2t") return "ts";
+  if (m === "audio/mpeg" || m === "audio/mp3") return "mp3";
+  if (m === "audio/mp4" || m === "audio/x-m4a") return "m4a";
+  return "mp4";
+}
+
+/**
+ * Create or refresh the downloadable row for a page-held Blob behind a
+ * <video> element. Returns whether anything changed.
+ */
+function upsertBlobFile(
+  items: MediaItem[],
+  tabId: number,
+  url: string,
+  backing: BlobFileInfo,
+  v: VideoSignal,
+  pageTitle?: string,
+): boolean {
+  const ext = extForBlobMime(backing.type);
+  const elTitle = cleanTitle(v.title);
+  const title = elTitle || cleanTitle(pageTitle);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const filename = title
+    ? `${sanitizeStem(title)}.${ext}`
+    : `video-${ts}.${ext}`;
+  const meta = `${mbLabel(backing.size)} • direct file`;
+  const existing = items.find((x) => x.url === url);
+  if (!existing) {
+    items.push({
+      url,
+      tabId,
+      type: "blobfile",
+      filename,
+      title: title || undefined,
+      titleFromPage: title ? !elTitle : undefined,
+      autoNamed: !title,
+      detectedAt: Date.now(),
+      drmProtected: false,
+      poster: v.poster,
+      pageTitle,
+      meta,
+    });
+    return true;
+  }
+  let dirty = false;
+  if (v.poster && !existing.poster) {
+    existing.poster = v.poster;
+    dirty = true;
+  }
+  if (meta && existing.meta !== meta) {
+    existing.meta = meta;
+    dirty = true;
+  }
+  if (applyTitle(existing, v.title, true)) dirty = true;
+  else if (applyTitle(existing, pageTitle, false)) dirty = true;
+  return dirty;
+}
+
 // Enrichment from content script: attach posters, surface blob: videos,
 // and create items for direct URLs webRequest missed (e.g. cached media).
 async function handleVideoSignals(
@@ -820,8 +941,15 @@ async function handleVideoSignals(
   videos: VideoSignal[],
   pageTitle?: string,
   frameId?: number,
+  blobs?: BlobFileInfo[],
 ): Promise<void> {
   const items = await getTabItems(tabId);
+  const blobMap = new Map<string, BlobFileInfo>();
+  for (const b of blobs ?? []) {
+    if (b && typeof b.url === "string" && typeof b.size === "number" && b.size > 0) {
+      blobMap.set(b.url, b);
+    }
+  }
   let changed = false;
   const touch = (url: string, v: VideoSignal) => {
     const match = items.find(
@@ -847,6 +975,12 @@ async function handleVideoSignals(
     for (const src of candidates) {
       if (!src || src.startsWith("data:")) continue;
       if (src.startsWith("blob:")) {
+        // Whole-file Blob backing this player? Exact bytes, direct save.
+        const backing = blobMap.get(src);
+        if (backing) {
+          if (upsertBlobFile(items, tabId, src, backing, v, pageTitle)) changed = true;
+          continue;
+        }
         // If the player feeding this blob: URL has visible chunk traffic in
         // the same frame, link the poster/meta to the grouped item instead
         // of adding a dead placeholder row.
@@ -1200,6 +1334,38 @@ async function startDownload(
   // pulls bytes from the page hook and streams them to the offscreen
   // document (existing DOWNLOAD_BLOB finalization). A video track pairs
   // with its session's audio track into ONE merged file.
+  if (item.type === "blobfile") {
+    // Page-held Blob: the content script slices the exact bytes out of the
+    // page and streams them to the offscreen document (never re-fetched —
+    // one-time URLs keep working).
+    const jobId = newJobId();
+    const job: DownloadJobState = {
+      jobId,
+      tabId,
+      itemUrl,
+      filename: item.filename || `video-${jobId}.mp4`,
+      status: "running",
+      done: 0,
+      total: 0,
+      stage: "fetching",
+      updatedAt: Date.now(),
+    };
+    await upsertJob(job);
+    await ensureOffscreen();
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: "BLOB_DOWNLOAD",
+        jobId,
+        url: item.url,
+        filename: job.filename,
+      });
+    } catch (err) {
+      job.status = "error";
+      job.error = `Could not reach the page: ${err instanceof Error ? err.message : String(err)} Reload the tab and retry.`;
+      await upsertJob(job);
+    }
+    return { job, paired: false, merged: false };
+  }
   if (item.type === "capture") {
     if (!item.captureRef) throw new Error("Capture reference lost — Rescan while the video plays.");
     const [captureId, trackIdxRaw] = item.captureRef.split(":");
@@ -1347,8 +1513,11 @@ async function startDownload(
     // (encrypted chunks would fail closed at fetch/parse with a clear error).
     if (!item.segments?.length) throw new Error("No grouped segments for this video (group expired — Rescan while it plays).");
     consider(item.url);
-    for (const s of item.segments) consider(s);
-    req = { jobId, tabId, kind: "dash", url: item.url, segments: [...item.segments], filename: item.filename, mime: "video/mp4" };
+    // Observed in network-arrival order (breaks on seeks/retries) — restore
+    // numeric order before dispatch; the assembler validates playability.
+    const orderedSegments = sortSegmentsNatural(item.segments);
+    for (const s of orderedSegments) consider(s);
+    req = { jobId, tabId, kind: "dash", url: item.url, segments: orderedSegments, filename: item.filename, mime: "video/mp4" };
   } else {
     req = { jobId, tabId, kind: "direct", url: item.url, filename: item.filename };
   }
@@ -1471,8 +1640,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             job.error = "Download cancelled.";
             await upsertJob(job);
           }
-          // Capture jobs also stream from the tab — stop the driver too.
-          if (job.itemUrl.startsWith("capture:")) {
+          // Capture + blob-file jobs also stream from the tab — stop the driver too.
+          if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
             try {
               await chrome.tabs.sendMessage(job.tabId, { type: "MS_CANCEL", jobId: m.jobId });
             } catch {
@@ -1492,9 +1661,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       } else if (m?.type === "VIDEO_ELEMENTS" && typeof m.tabId === "number") {
         const fromSender = sender.tab?.id ?? m.tabId;
+        if (fromSender >= 0 && sender.tab?.url && isExcludedUrl(sender.tab.url)) {
+          sendResponse({ ok: true });
+          return;
+        }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const vids = (m.videos ?? []) as any[];
-        await handleVideoSignals(fromSender, vids, m.pageTitle, sender.frameId);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const blobs = Array.isArray(m.blobs) ? (m.blobs as any) : undefined;
+        await handleVideoSignals(fromSender, vids, m.pageTitle, sender.frameId, blobs);
         // Posters/titles keyed by blob: URL for capture-session rows.
         const posterByBlob = new Map<string, string>();
         const titleByBlob = new Map<string, string>();
@@ -1584,6 +1759,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               job.error = err instanceof Error ? err.message : String(err);
             }
           }
+          await upsertJob(job);
+        }
+        void maybeCloseOffscreen();
+        sendResponse({ ok: true });
+      } else if (m?.type === "DOWNLOAD_DONE" && typeof m.jobId === "string") {
+        // The offscreen document saved the file itself (anchor download —
+        // no giant payloads through messaging). Mark the job complete.
+        await ensureJobsLoaded();
+        const job = jobMemory.get(m.jobId);
+        if (job) {
+          if (typeof m.filename === "string" && m.filename) job.filename = m.filename;
+          job.status = "done";
+          job.done = job.total || job.done;
           await upsertJob(job);
         }
         void maybeCloseOffscreen();

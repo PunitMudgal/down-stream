@@ -3,17 +3,81 @@
  *
  * Runs in the page's JS world (no chrome.* APIs here — findings are
  * postMessage'd to the isolated content script). Wrappers are transparent:
- * originals are always called with original args, bodies are only ever read
- * from clones, media/API-excluded traffic is skipped, everything is bounded.
+ * originals are always called with original args.
+ *
+ * PERFORMANCE CONTRACT (this hook runs on every page incl. YouTube/Grok):
+ * - Response bodies are NEVER fully buffered. Inspection uses a bounded
+ *   reader peek (<=MAX_BODY chars, <=PEEK_TIME_MS wait, then cancelled), so
+ *   long-lived streams (chat SSE, live chats) can't hang or bloat memory.
+ * - Peeks are concurrency-capped and rate-limited per time window; over
+ *   budget traffic is skipped, never queued.
+ * - A cheap substring precheck runs before any regex, so ~all non-video
+ *   API traffic costs one indexOf scan and nothing more.
+ * - MSE byte capture is hard-capped per track and per session count, stops
+ *   copying the moment a cap hits (pure passthrough afterwards), and frees
+ *   buffered bytes as soon as a session is known DRM-tainted.
  */
 (function () {
   const w = window as unknown as Record<string, unknown>;
   if (w.__vdgHookInstalled) return;
   w.__vdgHookInstalled = true;
 
-  const MAX_BODY = 400_000;
+  const IS_SUBFRAME = (() => {
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  })();
+
+  // ---- inspection budgets ----
+  const MAX_BODY = 200_000; // max chars inspected per response body
+  const PEEK_TIME_MS = 1200; // max ms spent reading one body
   const MAX_URLS = 30;
+  const MAX_PEEK_INFLIGHT = 2; // concurrent body peeks max
+  // Subframes (ads/embeds/trackers) get a much smaller peek budget.
+  const MAX_PEEK_PER_WINDOW = IS_SUBFRAME ? 10 : 40;
+  const PEEK_WINDOW_MS = 10_000;
+  let peekInflight = 0;
+  let peekWindowStart = Date.now();
+  let peekWindowCount = 0;
+
+  function peekAllowed(): boolean {
+    const now = Date.now();
+    if (now - peekWindowStart > PEEK_WINDOW_MS) {
+      peekWindowStart = now;
+      peekWindowCount = 0;
+    }
+    if (peekInflight >= MAX_PEEK_INFLIGHT || peekWindowCount >= MAX_PEEK_PER_WINDOW) return false;
+    peekWindowCount++;
+    return true;
+  }
+
+  // High-traffic endpoints that never carry manifest URLs (telemetry, ads,
+  // logging, beacons). Skipped before any body work.
+  const SKIP_URL_RE =
+    /(youtubei\/v1\/(log|att|player\/heartbeat)|youtube\/i\/api\/stats|googlevideo\.com\/(ptracking|pagead)|doubleclick\.net|google-analytics\.com|googletagmanager\.com|analytics\.|telemetry|hotjar|fullstory|segment\.(io|com)|sentry|bugsnag|datadog|newrelic|mixpanel|amplitude|facebook\.com\/tr|beacon|___beacon|collect\?|healthz|generate_204|client-registry|heartbeat|crashlog)/i;
+
+  function skippable(url: string): boolean {
+    if (!url || url.length > 4000) return true;
+    return SKIP_URL_RE.test(url);
+  }
+
+  function pageHidden(): boolean {
+    try {
+      return typeof document !== "undefined" && document.hidden;
+    } catch {
+      return false;
+    }
+  }
+
   const sent = new Set<string>();
+  function remember(u: string): boolean {
+    if (sent.has(u)) return false;
+    if (sent.size >= 1000) sent.clear(); // bounded; downstream dedupes by URL anyway
+    sent.add(u);
+    return true;
+  }
 
   const MANIFEST_RE =
     /(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mpd)(?:\?[^\s"'<>\\]*)?|\/\/[^\s"'<>\\]+\.(?:m3u8|mpd)(?:\?[^\s"'<>\\]*)?)/gi;
@@ -22,6 +86,16 @@
 
   function clean(text: string): string {
     return text.replace(/\\\//g, "/");
+  }
+
+  /** Cheap gate before the regex engine: no manifest extension, no match. */
+  function hasManifestHint(text: string): boolean {
+    return (
+      text.indexOf(".m3u8") !== -1 ||
+      text.indexOf(".M3U8") !== -1 ||
+      text.indexOf(".mpd") !== -1 ||
+      text.indexOf(".MPD") !== -1
+    );
   }
 
   function extractImages(text: string): string[] {
@@ -42,10 +116,7 @@
     while (out.length < MAX_URLS && (m = MANIFEST_RE.exec(text)) !== null) {
       let u = m[0];
       if (u.startsWith("//")) u = window.location.protocol + u;
-      if (!sent.has(u)) {
-        sent.add(u);
-        out.push(u);
-      }
+      if (remember(u)) out.push(u);
     }
     return out;
   }
@@ -72,6 +143,75 @@
     } catch {
       /* ignore */
     }
+  }
+
+  function handleText(text: string): void {
+    if (!text || !hasManifestHint(text)) return;
+    const cleanText = clean(text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text);
+    emit(extractUrls(cleanText), cleanText);
+  }
+
+  /**
+   * Bounded body peek: reads at most MAX_BODY chars within PEEK_TIME_MS,
+   * then cancels the clone. The page's original response is untouched and
+   * long-lived streams can never stall us — we take a prefix and walk away.
+   */
+  function peekText(res: Response): Promise<string> {
+    return new Promise((resolve) => {
+      let out = "";
+      let settled = false;
+      const finish = (t: string): void => {
+        if (!settled) {
+          settled = true;
+          resolve(t);
+        }
+      };
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      try {
+        const body = res.clone().body;
+        if (!body) {
+          finish("");
+          return;
+        }
+        reader = body.getReader();
+      } catch {
+        finish("");
+        return;
+      }
+      const r = reader;
+      const timer = setTimeout(() => {
+        try {
+          r.cancel();
+        } catch {
+          /* ignore */
+        }
+        finish(out);
+      }, PEEK_TIME_MS);
+      const dec = new TextDecoder();
+      (async () => {
+        try {
+          for (;;) {
+            const { done, value } = await r.read();
+            if (done) break;
+            out += dec.decode(value, { stream: true });
+            if (out.length >= MAX_BODY) {
+              out = out.slice(0, MAX_BODY);
+              break;
+            }
+          }
+          out += dec.decode();
+        } catch {
+          /* partial prefix is fine */
+        }
+        clearTimeout(timer);
+        try {
+          r.cancel();
+        } catch {
+          /* ignore */
+        }
+        finish(out);
+      })();
+    });
   }
 
   function mediaish(url: string, contentType: string | null): boolean {
@@ -123,26 +263,27 @@
         const method = ((init as { method?: unknown } | undefined)?.method as string | undefined) ?? "GET";
         if (String(method).toUpperCase() !== "GET") return p;
         const url = urlOf(input);
-        if (!url || mediaish(url, null)) return p;
+        if (!url || mediaish(url, null) || skippable(url)) return p;
+        if (pageHidden()) return p; // background tab: never spend its CPU
+        if (!peekAllowed()) return p;
         p.then((res) => {
+          let started = false;
           try {
+            if (!res.ok) return; // error pages never carry manifests
             const ct = res.headers?.get?.("content-type") ?? null;
             if (mediaish(url, ct) || !apiish(ct)) return;
             const len = Number(res.headers?.get?.("content-length") ?? "0");
             if (len > MAX_BODY * 2) return;
-            const done = res
-              .clone()
-              .text()
-              .then((t) => {
-                const cleanText = clean(t.slice(0, MAX_BODY));
-                emit(extractUrls(cleanText), cleanText);
-              })
-              .catch(() => undefined);
-            void Promise.race([
-              done,
-              new Promise((r) => setTimeout(r, 3000)),
-            ]);
+            started = true;
+            peekInflight++;
+            void peekText(res)
+              .then(handleText)
+              .catch(() => undefined)
+              .finally(() => {
+                peekInflight--;
+              });
           } catch {
+            if (started) peekInflight--;
             /* never break page traffic */
           }
         }).catch(() => undefined);
@@ -182,18 +323,23 @@
           this.addEventListener("load", function (this: XMLHttpRequest) {
             try {
               if (this.status < 200 || this.status >= 300) return;
+              // Binary/blob consumers never carry manifest text.
+              const rt = (this as XMLHttpRequest).responseType;
+              if (rt !== "" && rt !== "text") return;
               const rec = this as unknown as Record<string, unknown>;
               if (String(rec.__vdgMethod ?? "GET").toUpperCase() !== "GET") return;
               const url = String(rec.__vdgUrl ?? "");
+              if (!url || mediaish(url, null) || skippable(url)) return;
+              if (pageHidden()) return;
+              if (!peekAllowed()) return;
               const ct: string | null =
                 typeof this.getResponseHeader === "function"
                   ? this.getResponseHeader("content-type")
                   : null;
-              if (!url || mediaish(url, ct) || !apiish(ct)) return;
+              if (mediaish(url, ct) || !apiish(ct)) return;
               const text = typeof this.responseText === "string" ? this.responseText : "";
               if (!text || text.length > MAX_BODY * 2) return;
-              const cleanText = clean(text.slice(0, MAX_BODY));
-              emit(extractUrls(cleanText), cleanText);
+              handleText(text);
             } catch {
               /* never break page traffic */
             }
@@ -208,14 +354,168 @@
     /* XHR not wrappable here */
   }
 
+  // ---- Blob object-URL registry ----
+  // Players that fetch a whole file and play it via URL.createObjectURL(new
+  // Blob(...)) expose no manifest and no MSE traffic — the bytes only exist
+  // as a page Blob. We retain a bounded registry of (url -> Blob) so the
+  // extension can stream the exact bytes out on download. Only blobs that a
+  // <video> element actually references are ever surfaced; entries are
+  // age-pruned and the page's own playback is untouched.
+  const BLOB_MIN_SIZE = 100_000;
+  const BLOB_MAX_ENTRIES = 30;
+  const BLOB_MAX_AGE_MS = 15 * 60_000;
+  const BLOB_SLICE = 4_000_000;
+  interface BlobEntry {
+    blob: Blob;
+    size: number;
+    type: string;
+    at: number;
+  }
+  const blobStore = new Map<string, BlobEntry>();
+
+  function isMediaSourceObj(obj: unknown): boolean {
+    try {
+      const MS = (window as unknown as { MediaSource?: object }).MediaSource;
+      if (MS && obj instanceof (MS as object as new () => object)) return true;
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+
+  function recordBlobUrl(url: string, obj: unknown): void {
+    try {
+      if (isMediaSourceObj(obj)) return;
+      const b = obj as Partial<Blob>;
+      if (!b || typeof b.size !== "number" || typeof b.slice !== "function") return;
+      if (b.size < BLOB_MIN_SIZE) return;
+      if (blobStore.size >= BLOB_MAX_ENTRIES) {
+        // Evict the oldest entry.
+        let oldestKey: string | undefined;
+        let oldestAt = Infinity;
+        blobStore.forEach((e, k) => {
+          if (e.at < oldestAt) {
+            oldestAt = e.at;
+            oldestKey = k;
+          }
+        });
+        if (oldestKey !== undefined) blobStore.delete(oldestKey);
+      }
+      blobStore.set(url, {
+        blob: obj as Blob,
+        size: b.size,
+        type: typeof b.type === "string" ? b.type : "",
+        at: Date.now(),
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function pruneBlobs(now: number): void {
+    try {
+      blobStore.forEach((e, k) => {
+        if (now - e.at > BLOB_MAX_AGE_MS) blobStore.delete(k);
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function blobList(): unknown[] {
+    pruneBlobs(Date.now());
+    const out: unknown[] = [];
+    blobStore.forEach((e, url) => {
+      out.push({ url, size: e.size, type: e.type });
+    });
+    return out;
+  }
+
+  try {
+    window.addEventListener("message", (event) => {
+      try {
+        if (event.source !== window) return;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const d = event.data as any;
+        if (!d || typeof d !== "object" || typeof d.nonce !== "string") return;
+        if (d.__vdg === "blob-list") {
+          window.postMessage({ __vdg: "blob-list-result", nonce: d.nonce, blobs: blobList() }, "*");
+        } else if (d.__vdg === "blob-info" && typeof d.url === "string") {
+          pruneBlobs(Date.now());
+          const e = blobStore.get(d.url);
+          if (!e) {
+            window.postMessage({ __vdg: "blob-info-result", nonce: d.nonce, error: "Blob expired — replay the video and Rescan." }, "*");
+          } else {
+            window.postMessage(
+              { __vdg: "blob-info-result", nonce: d.nonce, size: e.size, type: e.type },
+              "*",
+            );
+          }
+        } else if (d.__vdg === "blob-get" && typeof d.url === "string") {
+          const e = blobStore.get(d.url);
+          if (!e) {
+            window.postMessage({ __vdg: "blob-chunk", nonce: d.nonce, error: "Blob expired — replay the video and Rescan." }, "*");
+            return;
+          }
+          const cursor = Math.max(0, Number(d.cursor) || 0);
+          const len = Math.min(BLOB_SLICE, Math.max(1, Number(d.len) || BLOB_SLICE));
+          if (cursor >= e.size) {
+            window.postMessage({ __vdg: "blob-chunk", nonce: d.nonce, cursor, next: cursor, done: true, total: e.size }, "*");
+            return;
+          }
+          const end = Math.min(e.size, cursor + len);
+          void (async () => {
+            try {
+              const buf = await e.blob.slice(cursor, end).arrayBuffer();
+              const res: Record<string, unknown> = {
+                __vdg: "blob-chunk",
+                nonce: d.nonce,
+                cursor,
+                next: cursor + buf.byteLength,
+                done: cursor + buf.byteLength >= e.size,
+                total: e.size,
+                buf,
+              };
+              try {
+                window.postMessage(res, "*", [buf]);
+              } catch {
+                try {
+                  window.postMessage(res, "*");
+                } catch {
+                  /* ignore */
+                }
+              }
+            } catch {
+              try {
+                window.postMessage({ __vdg: "blob-chunk", nonce: d.nonce, error: "Blob read failed." }, "*");
+              } catch {
+                /* ignore */
+              }
+            }
+          })();
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+  } catch {
+    /* ignore */
+  }
+
   // ---- MediaSource / SourceBuffer capture ----
   // Large players feed segments via MediaSource, so <video> shows only a
   // blob: URL. We copy the exact bytes appended per SourceBuffer (in order),
   // which reassemble into playable per-track files for CLEAR content only.
   // Any EME (Widevine/FairPlay/PlayReady-style) involvement marks the
   // session refused — captured DRM bytes are never offered for download.
+  //
+  // MEMORY BOUNDS (idle pages must not grow): per-track cap, a small max
+  // session count with oldest-first eviction, prompt freeing of DRM-tainted
+  // buffers, and pruning of sessions that never received data. Once a cap
+  // hits, the wrapper degrades to pure passthrough (zero copy).
   try {
-    const TRACK_CAP = 250_000_000; // per-track memory cap
+    const TRACK_CAP = 64_000_000; // per-track memory cap (was 250MB)
+    const MAX_SESSIONS = 4; // oldest session evicted beyond this
     const XFER = 4_000_000; // bytes per postMessage chunk
 
     interface MsTrack {
@@ -231,6 +531,7 @@
       tracks: MsTrack[];
       eme: boolean;
       created: number;
+      lastAppend: number;
     }
 
     const MS = window as unknown as {
@@ -251,12 +552,58 @@
       return "other";
     }
 
+    function freeSession(s: MsSession): void {
+      for (const t of s.tracks) {
+        t.parts = [];
+        t.bytes = 0;
+        t.overflow = true; // refused/complete: wrapper becomes passthrough
+      }
+    }
+
+    function sessionBytes(s: MsSession): number {
+      let n = 0;
+      for (const t of s.tracks) n += t.bytes;
+      return n;
+    }
+
+    function evictOldest(): void {
+      let oldestId: string | undefined;
+      let oldestTs = Infinity;
+      sessions.forEach((s, id) => {
+        if (s.created < oldestTs) {
+          oldestTs = s.created;
+          oldestId = id;
+        }
+      });
+      if (oldestId !== undefined) sessions.delete(oldestId);
+      // blobToMs entries are bounded separately below.
+      while (blobToMs.size > 100) {
+        const first = blobToMs.keys().next().value as string | undefined;
+        if (!first) break;
+        blobToMs.delete(first);
+      }
+    }
+
+    function pruneEmptySessions(now: number): void {
+      sessions.forEach((s, id) => {
+        if (s.tracks.length === 0 && now - s.created > 60_000) sessions.delete(id);
+        else if (sessionBytes(s) === 0 && now - s.created > 120_000) sessions.delete(id);
+      });
+    }
+
     function ensureMs(ms: object): string {
       let id = msByObj.get(ms);
       if (!id) {
+        if (sessions.size >= MAX_SESSIONS) evictOldest();
         id = `ms-${++msSeq}`;
         msByObj.set(ms, id);
-        sessions.set(id, { id, tracks: [], eme: false, created: Date.now() });
+        sessions.set(id, {
+          id,
+          tracks: [],
+          eme: false,
+          created: Date.now(),
+          lastAppend: Date.now(),
+        });
       }
       return id;
     }
@@ -283,6 +630,18 @@
       return undefined;
     }
 
+    function byteLengthOf(data: unknown): number {
+      try {
+        if (data instanceof ArrayBuffer) return data.byteLength;
+        if (ArrayBuffer.isView(data)) {
+          return (data as ArrayBufferView).byteLength;
+        }
+      } catch {
+        /* ignore */
+      }
+      return 0;
+    }
+
     function toBytes(data: unknown): Uint8Array | null {
       try {
         if (data instanceof ArrayBuffer) return new Uint8Array(data).slice();
@@ -305,8 +664,17 @@
           if (MS.MediaSource && obj instanceof MS.MediaSource) {
             const id = ensureMs(obj as object);
             blobToMs.set(url, id);
+            while (blobToMs.size > 100) {
+              const first = blobToMs.keys().next().value as string | undefined;
+              if (!first) break;
+              blobToMs.delete(first);
+            }
             const s = sessions.get(id);
             if (s) s.blobUrl = url;
+          } else {
+            // Whole-file Blob playback (fetch -> Blob -> video.src): retain
+            // for exact-byte download if a <video> picks it up.
+            recordBlobUrl(url, obj);
           }
         } catch {
           /* ignore */
@@ -339,14 +707,19 @@
                 const info = sbInfo.get(sb as object);
                 const sess = info ? sessions.get(info.msId) : undefined;
                 const trk = sess?.tracks[info?.trackIdx ?? -1];
-                if (trk && !trk.overflow) {
-                  const bytes = toBytes(data);
-                  if (bytes && bytes.byteLength > 0) {
-                    if (trk.bytes + bytes.byteLength > TRACK_CAP) {
+                // Fast path: capped/DRM sessions cost one map lookup, zero copy.
+                if (trk && !trk.overflow && sess && !sess.eme && !pageEme) {
+                  const len = byteLengthOf(data);
+                  if (len > 0) {
+                    sess.lastAppend = Date.now();
+                    if (trk.bytes + len > TRACK_CAP) {
                       trk.overflow = true;
                     } else {
-                      trk.parts.push(bytes);
-                      trk.bytes += bytes.byteLength;
+                      const bytes = toBytes(data);
+                      if (bytes && bytes.byteLength > 0) {
+                        trk.parts.push(bytes);
+                        trk.bytes += bytes.byteLength;
+                      }
                     }
                   }
                 }
@@ -366,10 +739,30 @@
     }
 
     // -- EME detection: attribute to sessions, plus page-level flag --
+    // Newly-tainted sessions release buffered bytes immediately.
     function markEme(el: unknown): void {
       try {
+        pageEme = true;
         const s = sessionForElement(el);
-        if (s) s.eme = true;
+        if (s && !s.eme) {
+          s.eme = true;
+          freeSession(s);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    function markPageEme(): void {
+      try {
+        if (!pageEme) {
+          pageEme = true;
+          sessions.forEach((s) => {
+            if (!s.eme) {
+              s.eme = true;
+              freeSession(s);
+            }
+          });
+        }
       } catch {
         /* ignore */
       }
@@ -379,7 +772,7 @@
       if (typeof nav.requestMediaKeySystemAccess === "function") {
         const origRMKSA = (navigator.requestMediaKeySystemAccess as Function).bind(navigator);
         (nav as Record<string, unknown>).requestMediaKeySystemAccess = function (...args: unknown[]): Promise<unknown> {
-          pageEme = true;
+          markPageEme();
           return (origRMKSA as (...a: unknown[]) => Promise<unknown>)(...args);
         };
       }
@@ -413,6 +806,11 @@
 
     // -- Session listing + cursor-based chunk serving --
     function sessionMeta(): unknown[] {
+      try {
+        pruneEmptySessions(Date.now());
+      } catch {
+        /* ignore */
+      }
       const out: unknown[] = [];
       sessions.forEach((s) => {
         let bytes = 0;
