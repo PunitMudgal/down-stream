@@ -1172,13 +1172,19 @@ async function pauseJob(jobId: string): Promise<void> {
 }
 
 async function resumeJob(jobId: string): Promise<void> {
+  // A restart-interrupted job was marked paused with a resume hint, but its
+  // offscreen document is gone — flag-toggling can't revive it. Re-dispatch
+  // it (RETRY_JOB reuses the jobId) so it resumes from OPFS-persisted parts.
+  const interrupted = jobs.find(
+    (j) => j.jobId === jobId && j.status === "paused" && /restart/i.test(j.error ?? ""),
+  );
   try {
     await withTimeout(
-      chrome.runtime.sendMessage({ type: "RESUME_JOB", jobId }),
+      chrome.runtime.sendMessage(interrupted ? { type: "RETRY_JOB", jobId } : { type: "RESUME_JOB", jobId }),
       8000,
       "Resuming",
     );
-    setStatus("Resuming…");
+    setStatus(interrupted ? "Resuming from where it stopped…" : "Resuming…");
   } catch (err) {
     setStatus(`Resume failed: ${err instanceof Error ? err.message : String(err)}`);
   }

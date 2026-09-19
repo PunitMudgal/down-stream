@@ -8,6 +8,8 @@ export interface FetchSegmentsOptions {
   isPaused?: () => boolean;
   /** Pre-filled parts to resume from (holes are undefined). Length must match urls. */
   existingParts?: Array<ArrayBuffer | undefined>;
+  /** Called with each segment as it completes (persistence hook; best-effort). */
+  onSegmentDone?: (index: number, buf: ArrayBuffer) => void;
 }
 
 /** True when a fetch failure looks like expired signed URLs / blocked chunk. */
@@ -853,6 +855,11 @@ export async function fetchSegments(
             firstErr = cap;
           }
           return;
+        }
+        try {
+          opts?.onSegmentDone?.(i, buf);
+        } catch {
+          /* persistence is best-effort */
         }
         done++;
         onProgress?.(done, total, bytes);

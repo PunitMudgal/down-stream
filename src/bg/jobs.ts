@@ -111,6 +111,8 @@ export async function startDownload(
   tabId: number,
   itemUrl: string,
   variantId?: string,
+  /** Reuse an interrupted job's id so its OPFS-persisted segments resume. */
+  resumeJobId?: string,
 ): Promise<{ job: DownloadJobState; paired: boolean; merged: boolean }> {
   const items = await getTabItems(tabId);
   const item = items.find((x) => x.url === itemUrl);
@@ -213,7 +215,7 @@ export async function startDownload(
     return { job, paired: pairTrackIdx !== undefined, merged: pairTrackIdx !== undefined };
   }
 
-  const jobId = newJobId();
+  const jobId = resumeJobId ?? newJobId();
   // Per-origin replay scopes for every host this job will touch (cap 10).
   const scopeUrls: string[] = [];
   const seenOrigins = new Set<string>();
@@ -358,20 +360,32 @@ export async function startDownload(
     }
   }
 
-  const job: DownloadJobState = {
-    jobId,
-    tabId,
-    itemUrl,
-    variantId: variantId ?? (req.kind === "direct" ? undefined : item.variants?.[0]?.id),
-    filename: req.filename,
-    status: "running",
-    done: 0,
-    total: req.kind === "direct" ? 0 : (req.segments?.length ?? 0),
-    unit: req.kind === "direct" ? "bytes" : "segments",
-    bytesDone: 0,
-    startedAt: Date.now(),
-    updatedAt: Date.now(),
-  };
+  // On resume, preserve the original job row (progress, startedAt) so the UI
+  // reflects the continued download; only reset it to running.
+  const existing = resumeJobId ? jobMemory.get(resumeJobId) : undefined;
+  const job: DownloadJobState = existing
+    ? {
+        ...existing,
+        status: "running",
+        error: undefined,
+        expired: undefined,
+        stage: "fetching",
+        updatedAt: Date.now(),
+      }
+    : {
+        jobId,
+        tabId,
+        itemUrl,
+        variantId: variantId ?? (req.kind === "direct" ? undefined : item.variants?.[0]?.id),
+        filename: req.filename,
+        status: "running",
+        done: 0,
+        total: req.kind === "direct" ? 0 : (req.segments?.length ?? 0),
+        unit: req.kind === "direct" ? "bytes" : "segments",
+        bytesDone: 0,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      };
   await upsertJob(job);
 
   // Direct files fetch in-app (offscreen) with the page's auth context so
@@ -425,34 +439,53 @@ export async function dispatchOffscreen(req: DownloadJobRequest, job: DownloadJo
   }
 }
 
-/** Startup recovery: jobs orphaned by a restart can never resume (parts lost). */
+/**
+ * Startup recovery. Ask the live offscreen document (if any) which job it is
+ * actually running; only jobs it is NOT running were orphaned by a restart.
+ * Re-fetchable kinds (HLS/DASH/grouped) resume from OPFS-persisted segments —
+ * they become `paused` with a resume hint. Non-resumable kinds (direct /
+ * capture, whose bytes lived only in the lost page/document) become errors.
+ */
 export async function markInterruptedJobs(): Promise<void> {
   try {
     await ensureJobsLoaded();
-    // An offscreen document from BEFORE the restart holds no fetched parts for
-    // these jobs (they were created in a prior session) — close it so its
-    // existence doesn't wrongly signal "still running" below.
+    let activeJobId: string | null = null;
     if (await offscreenExists()) {
       try {
-        await chrome.offscreen.closeDocument();
+        const res = (await chrome.runtime.sendMessage({ type: "OFFSCREEN_STATUS" })) as
+          | { activeJobId?: string | null }
+          | undefined;
+        activeJobId = res?.activeJobId ?? null;
       } catch {
-        /* best-effort */
+        activeJobId = null; // unreachable doc — treat everything as orphaned
       }
     }
     let dirty = false;
     for (const job of jobMemory.values()) {
-      if (job.status === "running" || job.status === "paused") {
+      if (job.status !== "running" && job.status !== "paused") continue;
+      if (job.jobId === activeJobId) continue; // genuinely still running
+      job.updatedAt = Date.now();
+      dirty = true;
+      if (isResumableKind(job.itemUrl)) {
+        // Segments persisted to OPFS survive; the user resumes without losing
+        // progress. Keep the job resumable rather than dead.
+        job.status = "paused";
+        job.error =
+          "Interrupted by a restart — downloaded segments were kept. Hit Resume to continue where it left off.";
+      } else {
         job.status = "error";
-        job.error = "Interrupted by a browser/extension restart — fetched parts were lost. Hit Retry for fresh URLs.";
+        job.error =
+          "Interrupted by a browser/extension restart — this stream can't be resumed. Hit Retry to start over.";
         job.expired = true;
-        job.updatedAt = Date.now();
-        dirty = true;
       }
     }
-    if (dirty) {
-      await persistJobs();
-    }
+    if (dirty) await persistJobs();
   } catch {
     /* best-effort */
   }
+}
+
+/** HLS/DASH/grouped are re-fetchable; direct/capture/blob streams are not. */
+function isResumableKind(itemUrl: string): boolean {
+  return !itemUrl.startsWith("capture:") && !itemUrl.startsWith("blob:");
 }

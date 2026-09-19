@@ -49,6 +49,12 @@ async function handleCancelJob(m: AnyMsg): Promise<unknown> {
         /* driver ends on its own via abort flag or completion */
       }
     }
+    // A cancelled download won't resume — drop its persisted segments.
+    try {
+      await chrome.runtime.sendMessage({ type: "PURGE_JOB_DATA", jobId: m.jobId });
+    } catch {
+      /* offscreen may be gone */
+    }
     return { ok: true };
   }
   return { ok: false, error: "Job is not running." };
@@ -69,6 +75,22 @@ async function handlePauseJob(m: AnyMsg): Promise<unknown> {
     return { ok: true };
   }
   return { ok: false, error: "Job is not running." };
+}
+
+async function handleRetryJob(m: AnyMsg): Promise<unknown> {
+  if (typeof m.jobId !== "string") return { ok: false, error: "Unknown message" };
+  await ensureJobsLoaded();
+  const job = getJob(m.jobId);
+  if (!job) return { ok: false, error: "Job not found." };
+  if (job.status === "running") return { ok: false, error: "Job is already running." };
+  // Re-dispatch under the SAME jobId so the offscreen resumes from the
+  // segments persisted to OPFS before the interruption (HLS/DASH/grouped).
+  try {
+    const { job: resumed } = await startDownload(job.tabId, job.itemUrl, job.variantId, job.jobId);
+    return { ok: true, job: resumed };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 async function handleResumeJob(m: AnyMsg): Promise<unknown> {
@@ -344,6 +366,7 @@ const HANDLERS: Record<string, Handler> = {
   CANCEL_JOB: handleCancelJob,
   PAUSE_JOB: handlePauseJob,
   RESUME_JOB: handleResumeJob,
+  RETRY_JOB: handleRetryJob,
   START_DOWNLOAD: handleStartDownload,
   VIDEO_ELEMENTS: handleVideoElements,
   MANIFEST_META: handleManifestMeta,
@@ -361,6 +384,9 @@ const HANDLERS: Record<string, Handler> = {
   OFFSCREEN_CANCEL: handleIgnored,
   OFFSCREEN_PAUSE: handleIgnored,
   OFFSCREEN_RESUME: handleIgnored,
+  OFFSCREEN_STATUS: handleIgnored,
+  PURGE_CAPTURE: handleIgnored,
+  PURGE_JOB_DATA: handleIgnored,
 };
 
 /** Dispatch one runtime message to its handler (PING is handled elsewhere). */

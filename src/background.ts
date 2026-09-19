@@ -13,7 +13,8 @@ import { clearHeadersForTab, onSendHeaders } from "./bg/headers";
 import { markInterruptedJobs } from "./bg/jobs";
 import { isExcludedUrl, updateBadge, updateBadgeForActiveTab } from "./bg/media";
 import { routeMessage } from "./bg/router";
-import { forgetTabMedia, lastUrlByTab, persistTab } from "./bg/store";
+import { forgetTabMedia, jobMemory, lastUrlByTab, persistTab } from "./bg/store";
+import { pruneOrphans } from "./lib/persist";
 
 // Re-exported for the legacy import path; new code should import
 // from lib/classify directly (popup.ts does).
@@ -140,8 +141,12 @@ try {
   /* ignore */
 }
 
-// Jobs alive in storage but with no offscreen document lost their fetched
-// parts (offscreen memory is gone) — they can never resume. Mark them so
-// the popup offers Retry instead of a stuck Paused/Running row. Skipped
-// when offscreen is still alive (normal SW suspend during a download).
-void markInterruptedJobs();
+// Jobs alive in storage but not running in the live offscreen document were
+// orphaned by a restart. Re-fetchable kinds keep their OPFS-persisted segments
+// and become resumable; the rest are marked so the popup offers Retry.
+void markInterruptedJobs().then(() => {
+  // Drop OPFS segment caches for jobs that no longer exist (bounded storage).
+  pruneOrphans(new Set([...jobMemory.keys()])).catch(() => {
+    /* best-effort */
+  });
+});

@@ -86,6 +86,8 @@ export type RuntimeMessage =
   | { type: "CANCEL_JOB"; jobId: string }
   | { type: "PAUSE_JOB"; jobId: string }
   | { type: "RESUME_JOB"; jobId: string }
+  /** Re-dispatch an interrupted job under the same id to resume from OPFS. */
+  | { type: "RETRY_JOB"; jobId: string }
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
   | { type: "OFFSCREEN_PAUSE"; jobId: string }
   | { type: "OFFSCREEN_RESUME"; jobId: string }
@@ -100,8 +102,12 @@ export type RuntimeMessage =
   | { type: "MS_TRACK_END"; jobId: string }
   /** Drop a finished capture's buffered parts (bounded offscreen memory). */
   | { type: "PURGE_CAPTURE"; jobId: string }
+  /** Drop a job's OPFS-persisted segments (cancel / superseded download). */
+  | { type: "PURGE_JOB_DATA"; jobId: string }
   // --- Offscreen <-> background ---
   | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
+  /** Worker asks the live offscreen which job it is running (restart recovery). */
+  | { type: "OFFSCREEN_STATUS" }
   | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number; bytesDone?: number }
   | { type: "JOB_STAGE"; jobId: string; stage: DownloadJobStage }
   | {

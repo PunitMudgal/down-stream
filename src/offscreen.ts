@@ -16,11 +16,20 @@ import {
 } from "./lib/download";
 import { extractHlsSegments } from "./lib/parseHls";
 import { muxFmp4 } from "./lib/mp4mux";
+import {
+  clearJob as persistClearJob,
+  loadSegments,
+  persistSupported,
+  saveMeta,
+  saveSegment,
+} from "./lib/persist";
 import type { DownloadJobRequest, DownloadJobStage } from "./lib/types";
 
 const controllers = new Map<string, AbortController>();
 /** Jobs currently paused — fetch workers wait instead of taking new segments. */
 const pausedJobs = new Set<string>();
+/** The job this offscreen document instance is actively running (startup recovery). */
+let activeJobId: string | undefined;
 
 /** Upper bound for one assembled file (matches the fetch-side cap). */
 const MAX_ASSEMBLED_BYTES = 1_500_000_000;
@@ -223,6 +232,10 @@ interface TrackSaveOpts {
   onSegs: (done: number, total: number, bytesDone: number) => void;
   /** When true, even a lone part saves without reporting DONE (caller reports once for several tracks). */
   deferDone?: boolean;
+  /** Persist each fetched segment (absolute index) for restart-resume. */
+  onSegmentDone?: (absIndex: number, buf: ArrayBuffer) => void;
+  /** Segments recovered from a prior session (absolute indices; holes refetch). */
+  resumedParts?: Array<ArrayBuffer | undefined>;
 }
 
 interface TrackSaveResult {
@@ -281,9 +294,29 @@ async function saveTrackInParts(opts: TrackSaveOpts): Promise<TrackSaveResult> {
       fetchSegments(u, prog, opts.signal, opts.scope, {
         isPaused: opts.isPaused,
         existingParts: existing,
+        onSegmentDone: opts.onSegmentDone
+          ? (i, buf) => {
+              try {
+                opts.onSegmentDone!(ropts.start + i, buf);
+              } catch {
+                /* best-effort */
+              }
+            }
+          : undefined,
       });
+    // Overlay any segments recovered from a prior session onto this window so
+    // they are never refetched after a restart.
+    let windowExisting = ropts.existingParts;
+    if (opts.resumedParts) {
+      const slice = opts.resumedParts.slice(ropts.start, ropts.end);
+      if (slice.some(Boolean)) {
+        windowExisting = windowExisting
+          ? windowExisting.map((b, i) => b ?? slice[i])
+          : slice;
+      }
+    }
     try {
-      return await attempt(win, ropts.existingParts);
+      return await attempt(win, windowExisting);
     } catch (err) {
       if (opts.signal.aborted) throw err;
       if (isCapExceeded(err)) throw err; // the splitter binary-searches a fitting range
@@ -409,18 +442,45 @@ async function downloadSingleTrack(
           return fresh.length ? fresh : null;
         }
       : undefined;
-  const r = await saveTrackInParts({
-    jobId: job.jobId,
-    baseFilename: job.filename,
-    mime,
-    fallbackExt,
-    urls,
-    scope,
-    signal,
-    isPaused,
-    refreshUrls,
-    onSegs: (done, total, bytesDone) => onProgress(done, total, bytesDone),
-  });
+  // Resumability: hydrate segments persisted before a restart; write each new
+  // segment to OPFS as it lands. Only re-fetchable kinds persist (direct /
+  // capture streams are not).
+  let onSegmentDone: ((absIndex: number, buf: ArrayBuffer) => void) | undefined;
+  let resumedParts: Array<ArrayBuffer | undefined> | undefined;
+  if (await persistSupported()) {
+    try {
+      resumedParts = await loadSegments(job.jobId, urls.length);
+      await saveMeta(job.jobId, urls.length); // pins count; refreshes staleness
+      onSegmentDone = (absIndex, buf) => void saveSegment(job.jobId, absIndex, buf);
+    } catch {
+      resumedParts = undefined;
+      onSegmentDone = undefined;
+    }
+  }
+  let r: TrackSaveResult;
+  try {
+    r = await saveTrackInParts({
+      jobId: job.jobId,
+      baseFilename: job.filename,
+      mime,
+      fallbackExt,
+      urls,
+      scope,
+      signal,
+      isPaused,
+      refreshUrls,
+      onSegmentDone,
+      resumedParts,
+      onSegs: (done, total, bytesDone) => onProgress(done, total, bytesDone),
+    });
+  } catch (err) {
+    // Keep persisted segments on expiry so a retry resumes; drop them when the
+    // user cancels or the failure is not recoverable.
+    if (signal.aborted) void persistClearJob(job.jobId);
+    throw err;
+  }
+  // Track saved fully — its persisted segments are now dead weight.
+  void persistClearJob(job.jobId);
   if (r.multi) {
     report({
       type: "DOWNLOAD_DONE",
@@ -629,6 +689,16 @@ async function spoolCaptureParts(jobId: string, flushAll = false): Promise<{ fil
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const m = msg as any;
+  // Startup recovery handshake: the worker asks whether THIS document
+  // instance is actually running the job before deciding a job is orphaned.
+  if (m?.type === "OFFSCREEN_STATUS") {
+    try {
+      sendResponse({ ok: true, activeJobId: activeJobId ?? null });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
   if (m?.type === "OFFSCREEN_CANCEL" && typeof m.jobId === "string") {
     controllers.get(m.jobId)?.abort();
     captures.delete(m.jobId);
@@ -665,6 +735,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (m?.type === "PURGE_CAPTURE" && typeof m.jobId === "string") {
     captures.delete(m.jobId);
     cancelledCaptures.delete(m.jobId);
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  // Drop a job's OPFS-persisted segments (cancel, or a superseded download).
+  if (m?.type === "PURGE_JOB_DATA" && typeof m.jobId === "string") {
+    void persistClearJob(m.jobId);
     try {
       sendResponse({ ok: true });
     } catch {
@@ -805,6 +885,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const controller = new AbortController();
   controllers.set(job.jobId, controller);
   const signal = controller.signal;
+  activeJobId = job.jobId;
 
   void (async () => {
     try {
@@ -864,6 +945,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     } finally {
       controllers.delete(job.jobId);
       pausedJobs.delete(job.jobId);
+      if (activeJobId === job.jobId) activeJobId = undefined;
     }
   })();
   return false;
