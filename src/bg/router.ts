@@ -228,9 +228,16 @@ async function handleDownloadDone(m: AnyMsg): Promise<unknown> {
   const job = getJob(m.jobId);
   if (job) {
     if (typeof m.filename === "string" && m.filename) job.filename = m.filename;
+    if (typeof m.note === "string" && m.note) job.note = m.note;
     job.status = "done";
     job.done = job.total || job.done;
     await upsertJob(job);
+    // Drop the capture's buffered parts — a done capture can hold >1 GB.
+    try {
+      await chrome.runtime.sendMessage({ type: "PURGE_CAPTURE", jobId: m.jobId });
+    } catch {
+      /* offscreen already closing */
+    }
   }
   void maybeCloseOffscreen();
   return { ok: true };

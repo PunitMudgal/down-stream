@@ -244,6 +244,38 @@ export async function fetchDirectBlob(
 
 export const MAX_SEGMENTS = 2000;
 export const MAX_BYTES = 1_500_000_000; // 1.5 GB safety cap
+
+/**
+ * Thrown when fetched bytes exceed MAX_BYTES. Carries the buffers fetched
+ * so far as `partials` (holes are undefined) so callers can keep them and
+ * resume the remainder instead of starting over.
+ */
+export class CapExceededError extends Error {
+  partials?: Array<ArrayBuffer | undefined>;
+  constructor(message = "Video exceeds the 1.5 GB safety cap — download stopped.") {
+    super(message);
+    this.name = "CapExceededError";
+  }
+}
+
+/** True when a failure is the in-app safety-cap halt (not a network error). */
+export function isCapExceeded(err: unknown): boolean {
+  if (err instanceof CapExceededError) return true;
+  return err instanceof Error && /safety cap — download stopped/i.test(err.message);
+}
+
+/** Partial buffers attached to a fetch failure (holes are undefined). */
+export function capPartials(err: unknown): Array<ArrayBuffer | undefined> | undefined {
+  const p = (err as unknown as Record<string, unknown> | null)?.partials;
+  return Array.isArray(p) ? (p as Array<ArrayBuffer | undefined>) : undefined;
+}
+
+/** `movie.mp4` + part 2 → `movie.part2.mp4` (extension always supplied). */
+export function partFilename(filename: string, partNo: number, ext: string): string {
+  const stem = filename.replace(/\.[a-z0-9]+$/i, "") || filename;
+  const suffix = ext.startsWith(".") ? ext : `.${ext}`;
+  return `${stem}.part${partNo}${suffix}`;
+}
 // 8 parallel segment fetches: saturates HTTP/2 CDNs without tripping the
 // ~6-connection HTTP/1.1 per-host limit too badly (extras queue in browser).
 // Higher values trigger CDN rate-limiting faster; lower values cap throughput.
@@ -453,7 +485,7 @@ export function sortSegmentsNatural(urls: string[]): string[] {
 type SniffedKind = "ts" | "fmp4" | "webm" | "ogg" | "mp3" | "text" | "unknown";
 
 /** Identify a container from its first bytes (cheap, per fetched chunk). */
-function sniffKind(head: Uint8Array): SniffedKind {
+export function sniffKind(head: Uint8Array): SniffedKind {
   if (head.length === 0) return "unknown";
   const b0 = head[0];
   if (b0 === 0x47) return "ts"; // MPEG-TS sync byte
@@ -475,6 +507,27 @@ function sniffKind(head: Uint8Array): SniffedKind {
     }
   }
   return "unknown";
+}
+
+/**
+ * A concatenated fMP4 stream is playable when the moov header appears in
+ * the very first chunk — anything else (error page, missing init segment,
+ * HTML) is rejected before it becomes a corrupt download. TS streams are
+ * accepted as-is (checked by sync byte in the caller's fallback sniff).
+ */
+export function isPlayableMp4(head: Uint8Array): boolean {
+  if (sniffKind(head) === "fmp4") return findInitChunk([head.buffer as ArrayBuffer]) !== undefined;
+  return false;
+}
+
+/**
+ * Decide how an over-cap capture splits into per-track part sets.
+ * Returns null when every track fits under the cap (no split needed);
+ * otherwise one part-count per track (>= 1 each).
+ */
+export function planCaptureSplit(trackBytes: number[], cap = MAX_BYTES): number[] | null {
+  if (!trackBytes.some((n) => n > cap)) return null;
+  return trackBytes.map((n) => (n > 0 ? Math.ceil(n / cap) : 1));
 }
 
 /**
@@ -621,6 +674,118 @@ export function orderAndValidateSegmentParts(parts: ArrayBuffer[]): ArrayBuffer[
 }
 
 /**
+ * Return the buffer holding the fMP4 init (`moov`) header, if any.
+ * Continuation parts of a split download prepend a copy of it so every
+ * part file is playable on its own.
+ */
+export function findInitChunk(parts: ArrayBuffer[]): ArrayBuffer | undefined {
+  for (const p of parts) {
+    try {
+      if (scanTopLevel(p).moov) return p;
+    } catch {
+      /* ignore corrupt scans — validation reports them */
+    }
+  }
+  return undefined;
+}
+
+/** One contiguous slice of a segment list, with resumable partial progress. */
+export interface SegmentRange {
+  start: number;
+  end: number;
+  partials?: Array<ArrayBuffer | undefined>;
+}
+
+/** A fully fetched range, ready to validate and save. */
+export interface SegmentedPart {
+  start: number;
+  end: number;
+  buffers: ArrayBuffer[];
+}
+
+/**
+ * Fetch one URL window. `existingParts` (same length as `urls`) pre-fills
+ * already-fetched buffers so only holes are fetched. Must attach
+ * `partials` to any thrown error (fetchSegments does) so progress survives.
+ */
+export type FetchRangeFn = (
+  urls: string[],
+  opts: {
+    start: number;
+    end: number;
+    existingParts?: Array<ArrayBuffer | undefined>;
+    onProgress?: ProgressCallback;
+  },
+) => Promise<ArrayBuffer[]>;
+
+/** Persist one fetched part before the next range starts (bounds memory). */
+export type SavePartFn = (part: SegmentedPart, partNo: number, multi: boolean) => Promise<void>;
+
+/**
+ * Fetch a segment list that may exceed MAX_BYTES, splitting it into
+ * sequentially saved parts. Fast path: the whole list is tried first, so
+ * files under the cap behave exactly like a single fetchSegments call
+ * (`multi` is false and the part is the complete file). On a cap halt the
+ * failing range is binary-split (keeping fetched buffers via `partials`)
+ * until every range fits; ranges are fetched and saved strictly in
+ * playlist order, so part N always precedes part N+1.
+ *
+ * Returns `{ parts, multi }`. Throws the original network error for
+ * non-cap failures, or an actionable error when a single segment alone
+ * exceeds the cap.
+ */
+export async function fetchSegmentedParts(
+  urls: string[],
+  fetchRange: FetchRangeFn,
+  onPart: SavePartFn,
+): Promise<{ parts: number; multi: boolean }> {
+  if (urls.length === 0) throw new Error("No segments to download.");
+  const stack: SegmentRange[] = [{ start: 0, end: urls.length }];
+  let saved = 0;
+  let everSplit = false;
+  while (stack.length > 0) {
+    const range = stack.pop() as SegmentRange;
+    const win = urls.slice(range.start, range.end);
+    let buffers: ArrayBuffer[];
+    try {
+      buffers = await fetchRange(win, {
+        start: range.start,
+        end: range.end,
+        existingParts:
+          range.partials?.length === win.length ? range.partials : undefined,
+      });
+    } catch (err) {
+      if (!isCapExceeded(err)) throw err;
+      if (range.end - range.start <= 1) {
+        throw new Error(
+          "A single video chunk is larger than the 1.5 GB safety cap — pick a lower quality from the quality dropdown and retry.",
+        );
+      }
+      everSplit = true;
+      const mid = range.start + Math.ceil((range.end - range.start) / 2);
+      const partials = capPartials(err);
+      // Stack (LIFO): push the second half first so the first half — which
+      // must be saved first for ordered part files — pops next.
+      stack.push({
+        start: mid,
+        end: range.end,
+        partials: partials ? partials.slice(mid - range.start) : undefined,
+      });
+      stack.push({
+        start: range.start,
+        end: mid,
+        partials: partials ? partials.slice(0, mid - range.start) : undefined,
+      });
+      continue;
+    }
+    saved++;
+    const multi = everSplit || stack.length > 0;
+    await onPart({ start: range.start, end: range.end, buffers }, saved, multi);
+  }
+  return { parts: saved, multi: everSplit || saved > 1 };
+}
+
+/**
  * Fetch segment URLs with bounded parallelism, retries, and safety caps.
  * Returns ordered ArrayBuffers (caller decides concat vs mux).
  * Supports pause (workers wait while isPaused) and resume via existingParts.
@@ -683,7 +848,9 @@ export async function fetchSegments(
         bytes += buf.byteLength;
         if (bytes > MAX_BYTES) {
           if (!firstErr) {
-            firstErr = new Error("Video exceeds the 1.5 GB safety cap — download stopped.");
+            const cap = new CapExceededError();
+            (cap as unknown as Record<string, unknown>).partials = parts;
+            firstErr = cap;
           }
           return;
         }

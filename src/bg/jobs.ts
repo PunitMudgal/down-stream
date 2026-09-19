@@ -429,7 +429,16 @@ export async function dispatchOffscreen(req: DownloadJobRequest, job: DownloadJo
 export async function markInterruptedJobs(): Promise<void> {
   try {
     await ensureJobsLoaded();
-    if (await offscreenExists()) return;
+    // An offscreen document from BEFORE the restart holds no fetched parts for
+    // these jobs (they were created in a prior session) — close it so its
+    // existence doesn't wrongly signal "still running" below.
+    if (await offscreenExists()) {
+      try {
+        await chrome.offscreen.closeDocument();
+      } catch {
+        /* best-effort */
+      }
+    }
     let dirty = false;
     for (const job of jobMemory.values()) {
       if (job.status === "running" || job.status === "paused") {

@@ -454,7 +454,8 @@ function combinedLine(related: DownloadJobState[], direct: boolean): { label: st
   // never a premature "Done".
   if (active.length === 1) return jobLine(active[0], direct);
   if (related.length > 1 && related.every((j) => j.status === "done")) {
-    return { label: "Done — check your downloads folder.", state: "done" };
+    const note = related.find((j) => j.note)?.note;
+    return { label: `Done — check your downloads folder.${note ? ` ${note}` : ""}`, state: "done" };
   }
   const job = related[0];
   if (!job) return { label: "", state: "idle" };
@@ -1021,7 +1022,9 @@ function isDirect(item: MediaItem): boolean {
 function jobLine(job: DownloadJobState, direct: boolean): { label: string; state: string } {
   if (job.status === "paused") return { label: runningText(job), state: "paused" };
   if (job.status === "running") return { label: runningText(job), state: "running" };
-  if (job.status === "done") return { label: "Done — check your downloads folder.", state: "done" };
+  if (job.status === "done") {
+    return { label: `Done — check your downloads folder.${job.note ? ` ${job.note}` : ""}`, state: "done" };
+  }
   if (/cancelled/i.test(job.error ?? "")) return { label: "Cancelled.", state: "cancelled" };
   if (job.expired) return { label: `Link expired mid-download: ${job.error ?? ""} Hit Refresh & Retry for fresh URLs.`, state: "error" };
   return { label: `Failed: ${job.error ?? "unknown error"}`, state: "error" };

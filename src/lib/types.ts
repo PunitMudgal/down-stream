@@ -98,6 +98,8 @@ export type RuntimeMessage =
   | { type: "MS_TRACK_START"; jobId: string; total: number; mime: string; filename: string }
   | { type: "MS_TRACK_CHUNK"; jobId: string; which: 0 | 1; index: number; total: number; buf: ArrayBuffer }
   | { type: "MS_TRACK_END"; jobId: string }
+  /** Drop a finished capture's buffered parts (bounded offscreen memory). */
+  | { type: "PURGE_CAPTURE"; jobId: string }
   // --- Offscreen <-> background ---
   | { type: "OFFSCREEN_DOWNLOAD"; job: DownloadJobRequest }
   | { type: "DOWNLOAD_PROGRESS"; jobId: string; done: number; total: number; bytesDone?: number }
@@ -109,7 +111,7 @@ export type RuntimeMessage =
       filename: string;
     }
   /** Offscreen saved the file itself (anchor download) — no bytes moved. */
-  | { type: "DOWNLOAD_DONE"; jobId: string; filename: string }
+  | { type: "DOWNLOAD_DONE"; jobId: string; filename: string; note?: string }
   | { type: "DOWNLOAD_ERROR"; jobId: string; error: string; expired?: boolean; fallbackDirect?: boolean }
   | { type: "JOB_UPDATED"; job: DownloadJobState };
 
@@ -217,6 +219,8 @@ export interface DownloadJobState {
   stage?: DownloadJobStage;
   downloadId?: number;
   error?: string;
+  /** Extra completion detail, e.g. which part files a large download was split into. */
+  note?: string;
   /** True when the failure looks like expired signed URLs (offers Refresh & Retry). */
   expired?: boolean;
   updatedAt: number;
