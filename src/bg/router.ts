@@ -462,6 +462,88 @@ async function handleRetryParse(m: AnyMsg): Promise<unknown> {
   return { ok: true, item: after };
 }
 
+// ---- page-relayed segment bytes (offscreen <-> tab) -----------------------
+
+/** transferId -> the tab a page relay is streaming from (bounded, short-lived). */
+const pageRelayTabs = new Map<string, number>();
+const PAGE_RELAY_TAB_MAX = 16;
+
+/**
+ * Offscreen -> worker: this document is refused a stream chunk, so ask the
+ * job's tab to fetch that one URL with the page's own request context. The
+ * bytes come back as PAGE_BYTES_CHUNK broadcasts (the offscreen assembles
+ * them) — this handler only validates and forwards the request.
+ */
+async function handleRequestPageBytes(m: AnyMsg): Promise<unknown> {
+  if (typeof m.transferId !== "string" || typeof m.url !== "string") {
+    return { ok: false, error: "Unknown message" };
+  }
+  await ensureJobsLoaded();
+  const tabId = typeof m.jobId === "string" ? getJob(m.jobId)?.tabId : undefined;
+  if (tabId == null || tabId < 0) {
+    return { ok: false, error: "No live tab to relay through — re-download from the page." };
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "PAGE_FETCH_BYTES",
+      transferId: m.transferId,
+      url: m.url,
+      jobId: typeof m.jobId === "string" ? m.jobId : undefined,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: `The page can't fetch this chunk (${err instanceof Error ? err.message : String(err)}).`,
+    };
+  }
+  pageRelayTabs.set(m.transferId, tabId);
+  while (pageRelayTabs.size > PAGE_RELAY_TAB_MAX) {
+    const oldest = pageRelayTabs.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    pageRelayTabs.delete(oldest);
+  }
+  return { ok: true };
+}
+
+/** Offscreen -> worker: stop a transfer (cancelled, timed out, or failed). */
+async function handlePageBytesCancel(m: AnyMsg): Promise<unknown> {
+  if (typeof m.transferId !== "string") return { ok: false, error: "Unknown message" };
+  const tabId = pageRelayTabs.get(m.transferId);
+  pageRelayTabs.delete(m.transferId);
+  if (tabId == null) return { ok: true };
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "PAGE_BYTES_CANCEL", transferId: m.transferId });
+  } catch {
+    /* tab closed mid-transfer */
+  }
+  return { ok: true };
+}
+
+/**
+ * Content -> runtime broadcast of relayed slices. The offscreen document owns
+ * the bytes; here we only retire the transfer mapping. (Content scripts cannot
+ * hear runtime broadcasts, so cancels are forwarded to them explicitly.)
+ */
+async function handlePageBytesTraffic(m: AnyMsg): Promise<unknown> {
+  if (typeof m.transferId !== "string") return { ok: false, error: "Unknown message" };
+  if (m.type === "PAGE_BYTES_FAILED" || m.done === true) pageRelayTabs.delete(m.transferId);
+  return { ok: true };
+}
+
+/** Offscreen -> worker: stamp a note on a running job (e.g. page relay used). */
+async function handleJobNote(m: AnyMsg): Promise<unknown> {
+  if (typeof m.jobId !== "string" || typeof m.note !== "string") {
+    return { ok: false, error: "Unknown message" };
+  }
+  await ensureJobsLoaded();
+  const job = getJob(m.jobId);
+  if (job && job.status === "running") {
+    job.note = m.note.slice(0, 200);
+    await upsertJob(job, false);
+  }
+  return { ok: true };
+}
+
 async function handleRescan(m: AnyMsg): Promise<unknown> {
   if (typeof m.tabId !== "number") return { ok: false, error: "Unknown message" };
   // Ask the content script to re-collect <video> elements (covers
@@ -634,6 +716,11 @@ const HANDLERS: Record<string, Handler> = {
   DOWNLOAD_ERROR: handleDownloadError,
   RESCAN: handleRescan,
   RETRY_PARSE: handleRetryParse,
+  REQUEST_PAGE_BYTES: handleRequestPageBytes,
+  PAGE_BYTES_CANCEL: handlePageBytesCancel,
+  PAGE_BYTES_CHUNK: handlePageBytesTraffic,
+  PAGE_BYTES_FAILED: handlePageBytesTraffic,
+  JOB_NOTE: handleJobNote,
   GET_SETTINGS: handleGetSettings,
   SAVE_SETTINGS: handleSaveSettings,
   GET_HISTORY: handleGetHistory,

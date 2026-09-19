@@ -7,12 +7,14 @@ import {
   findInitChunk,
   isCapExceeded,
   isExpiredFailure,
+  isGateFailure,
   isPlayableMp4,
   orderAndValidateSegmentParts,
   partFilename,
   planCaptureSplit,
   probeSpeed,
   sniffKind,
+  type SegmentRelayFn,
   type SegmentedPart,
 } from "./lib/download";
 import { extractHlsSegments } from "./lib/parseHls";
@@ -66,6 +68,140 @@ function report(msg: object): void {
 
 function stage(jobId: string, s: DownloadJobStage): void {
   report({ type: "JOB_STAGE", jobId, stage: s });
+}
+
+// ---- page relay: bytes this document is not allowed to fetch ---------------
+// A CDN can refuse THIS document's request (403/404, an error page served as
+// video, a CORS refusal) while the page fetches the very same URL happily: the
+// token, the Referer/Origin/Sec-Fetch-* context, the cookies, the TLS
+// fingerprint and any bot clearance all belong to the page. So a refused
+// segment (or variant playlist) is re-requested through the page — the worker
+// forwards it to that tab's content script, whose MAIN-world hook fetches it
+// and streams the bytes back in ≤4MB slices over the same broadcast channel
+// the MSE capture already uses.
+const PAGE_RELAY_TIMEOUT_MS = 120_000;
+/** Page-side fetches are serialized: each holds a whole segment in the page. */
+const PAGE_RELAY_CONCURRENCY = 2;
+/** Per-job bound — a fully gated CDN must fail with a reason, not forever. */
+const PAGE_RELAY_MAX_PER_JOB = 40;
+
+interface PageTransfer {
+  chunks: ArrayBuffer[];
+  bytes: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolve: (buf: ArrayBuffer) => void;
+  reject: (err: Error) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+const pageTransfers = new Map<string, PageTransfer>();
+const relayedByJob = new Map<string, number>();
+let relayActive = 0;
+const relayWaiters: Array<() => void> = [];
+
+/** Finish (or fail) one in-flight page transfer exactly once. */
+function relaySettle(transferId: string, err: Error | null, buf?: ArrayBuffer): void {
+  const t = pageTransfers.get(transferId);
+  if (!t) return;
+  pageTransfers.delete(transferId);
+  clearTimeout(t.timer);
+  if (t.onAbort) t.signal?.removeEventListener("abort", t.onAbort);
+  if (!err) {
+    t.resolve(buf ?? new ArrayBuffer(0));
+    return;
+  }
+  // Nobody is waiting for these bytes anymore — tell the page to stop.
+  report({ type: "PAGE_BYTES_CANCEL", transferId });
+  t.reject(err);
+}
+
+async function acquireRelaySlot(signal?: AbortSignal): Promise<void> {
+  while (relayActive >= PAGE_RELAY_CONCURRENCY) {
+    if (signal?.aborted) throw new Error("Download cancelled.");
+    await new Promise<void>((resolve) => relayWaiters.push(resolve));
+  }
+  relayActive++;
+}
+
+function releaseRelaySlot(): void {
+  relayActive = Math.max(0, relayActive - 1);
+  relayWaiters.shift()?.();
+}
+
+/** Ask the page to fetch one URL and collect the slices it streams back. */
+function relaySegmentThroughPage(
+  url: string,
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
+  const transferId = `pg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const timer = setTimeout(
+      () =>
+        relaySettle(
+          transferId,
+          new Error("The page relay timed out — the page stopped sending bytes."),
+        ),
+      PAGE_RELAY_TIMEOUT_MS,
+    );
+    const entry: PageTransfer = { chunks: [], bytes: 0, timer, resolve, reject, signal };
+    const onAbort = (): void => relaySettle(transferId, new Error("Download cancelled."));
+    entry.onAbort = onAbort;
+    pageTransfers.set(transferId, entry);
+    if (signal) {
+      if (signal.aborted) {
+        relaySettle(transferId, new Error("Download cancelled."));
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    void chrome.runtime
+      .sendMessage({ type: "REQUEST_PAGE_BYTES", jobId, transferId, url })
+      .then((res) => {
+        const r = res as { ok?: boolean; error?: string } | undefined;
+        if (!r?.ok) {
+          relaySettle(
+            transferId,
+            new Error(r?.error ?? "The page relay is unavailable for this download."),
+          );
+        }
+      })
+      .catch((err: unknown) =>
+        relaySettle(transferId, err instanceof Error ? err : new Error(String(err))),
+      );
+  });
+}
+
+/** Per-job relay transport: bounded count and bounded concurrency. */
+function pageRelayFor(jobId: string): SegmentRelayFn {
+  return async (url, signal) => {
+    const used = relayedByJob.get(jobId) ?? 0;
+    if (used >= PAGE_RELAY_MAX_PER_JOB) {
+      throw new Error(
+        `This site refused ${PAGE_RELAY_MAX_PER_JOB} stream chunks and the page relay hit its limit — replay the video, hit Rescan, and retry right away.`,
+      );
+    }
+    await acquireRelaySlot(signal);
+    try {
+      const buf = await relaySegmentThroughPage(url, jobId, signal);
+      relayedByJob.set(jobId, used + 1);
+      if (used === 0) {
+        report({
+          type: "JOB_NOTE",
+          jobId,
+          note: "Fetched through this page's own session — the site blocks direct requests.",
+        });
+      }
+      return buf;
+    } finally {
+      releaseRelaySlot();
+    }
+  };
+}
+
+/** Drop per-job relay bookkeeping (called when a job settles). */
+function clearRelayStats(jobId: string): void {
+  relayedByJob.delete(jobId);
 }
 
 // Blob URLs this document created and has not revoked yet (RELEASE_BLOB_URL
@@ -217,6 +353,30 @@ async function textWithNet(url: string, scope: NetScope | undefined, signal: Abo
 }
 
 /**
+ * Read a playlist, falling back to the page's own request context when this
+ * document is refused. The gate that blocks segments usually blocks the
+ * variant playlist too, and nothing downloads if that read fails.
+ */
+async function textWithNetRelayed(
+  job: DownloadJobRequest,
+  url: string,
+  scope: NetScope | undefined,
+  signal: AbortSignal,
+): Promise<string> {
+  try {
+    return await textWithNet(url, scope, signal);
+  } catch (err) {
+    if (signal.aborted || !isGateFailure(err)) throw err;
+    try {
+      const buf = await pageRelayFor(job.jobId)(url, signal);
+      return new TextDecoder().decode(buf);
+    } catch {
+      throw err; // the original, more specific failure
+    }
+  }
+}
+
+/**
  * Resolve the audio sibling's segment list for a paired job.
  * Returns null when this job has no pair (normal single-track path).
  */
@@ -227,7 +387,7 @@ async function resolvePairSegments(
 ): Promise<string[] | null> {
   if (job.pairSegments?.length) return [...job.pairSegments];
   if (job.kind === "hls" && job.pairUrl) {
-    const text = await textWithNet(job.pairUrl, scope, signal);
+    const text = await textWithNetRelayed(job, job.pairUrl, scope, signal);
     const segs = extractHlsSegments(text, job.pairUrl);
     if (!segs.length) throw new Error("Paired audio playlist has no segments.");
     return segs;
@@ -326,6 +486,7 @@ async function saveTrackInParts(opts: TrackSaveOpts): Promise<TrackSaveResult> {
     ): Promise<ArrayBuffer[]> =>
       fetchSegments(u, prog, opts.signal, opts.scope, {
         isPaused: opts.isPaused,
+        relay: pageRelayFor(opts.jobId),
         existingParts: existing,
         onSegmentDone: opts.onSegmentDone
           ? (i, buf) => {
@@ -441,7 +602,7 @@ async function resolveMainUrls(
   signal: AbortSignal,
 ): Promise<string[]> {
   if (job.kind === "hls") {
-    const text = await textWithNet(job.url, scope, signal);
+    const text = await textWithNetRelayed(job, job.url, scope, signal);
     const mainUrls = extractHlsSegments(text, job.url);
     if (!mainUrls.length) throw new Error("No segments found in the HLS variant playlist.");
     return mainUrls;
@@ -470,7 +631,7 @@ async function downloadSingleTrack(
   const refreshUrls =
     job.kind === "hls"
       ? async (): Promise<string[] | null> => {
-          const retryText = await textWithNet(job.url, scope, signal);
+          const retryText = await textWithNetRelayed(job, job.url, scope, signal);
           const fresh = extractHlsSegments(retryText, job.url);
           return fresh.length ? fresh : null;
         }
@@ -557,8 +718,8 @@ async function assembleMuxedBlob(
   };
   // Video first, then audio — order irrelevant, progress combined.
   const [vParts, aParts] = await Promise.all([
-    fetchSegments(mainUrls, progV, signal, scope, { isPaused }),
-    fetchSegments(pairUrls, progA, signal, scope, { isPaused }),
+    fetchSegments(mainUrls, progV, signal, scope, { isPaused, relay: pageRelayFor(job.jobId) }),
+    fetchSegments(pairUrls, progA, signal, scope, { isPaused, relay: pageRelayFor(job.jobId) }),
   ]);
   stage(job.jobId, "assembling");
   let merged: Uint8Array;
@@ -606,7 +767,7 @@ async function downloadMuxed(
     job.kind === "hls"
       ? (playlistUrl: string) =>
         async (): Promise<string[] | null> => {
-          const retryText = await textWithNet(playlistUrl, scope, signal);
+          const retryText = await textWithNetRelayed(job, playlistUrl, scope, signal);
           const fresh = extractHlsSegments(retryText, playlistUrl);
           return fresh.length ? fresh : null;
         }
@@ -771,6 +932,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     captures.delete(m.jobId);
     pausedJobs.delete(m.jobId);
     cancelledCaptures.add(m.jobId);
+    clearRelayStats(m.jobId);
     try {
       sendResponse({ ok: true });
     } catch {
@@ -832,6 +994,39 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       partNo: [1, 1],
       offset: [0, 0],
     });
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  // Page-relayed bytes (sent by the tab's content script, addressed here).
+  if (m?.type === "PAGE_BYTES_CHUNK" && typeof m.transferId === "string") {
+    const t = pageTransfers.get(m.transferId);
+    if (t && m.buf instanceof ArrayBuffer) {
+      t.chunks.push(m.buf);
+      t.bytes += m.buf.byteLength;
+      if (m.done === true) {
+        relaySettle(m.transferId, null, toU8(t.chunks).buffer as ArrayBuffer);
+      }
+    }
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "PAGE_BYTES_FAILED" && typeof m.transferId === "string") {
+    relaySettle(
+      m.transferId,
+      new Error(
+        typeof m.error === "string" && m.error
+          ? m.error
+          : "The page could not fetch this stream chunk.",
+      ),
+    );
     try {
       sendResponse({ ok: true });
     } catch {
@@ -987,7 +1182,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // encrypted-stream refusal); DASH/grouped use stored segment lists.
       // Over-cap lists save as sequential part files instead of failing.
       if (job.kind === "hls") {
-        const text = await textWithNet(job.url, scope, signal);
+        const text = await textWithNetRelayed(job, job.url, scope, signal);
         if (/#EXT-X-KEY\s*:\s*[^\r\n]*METHOD\s*=\s*(?!NONE\b)/i.test(text)) {
           throw new Error("Protected content — cannot download (encrypted HLS).");
         }
@@ -1013,6 +1208,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       controllers.delete(job.jobId);
       pausedJobs.delete(job.jobId);
       activeJobIds.delete(job.jobId);
+      clearRelayStats(job.jobId);
     }
   })();
   return false;

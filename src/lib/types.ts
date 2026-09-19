@@ -108,6 +108,20 @@ export type RuntimeMessage =
   | { type: "OFFSCREEN_PAUSE"; jobId: string }
   | { type: "OFFSCREEN_RESUME"; jobId: string }
   | { type: "FETCH_TEXT"; tabId: number; url: string; captureOnly?: boolean }
+  // Page relay: bytes for a segment this extension is not allowed to fetch
+  // (worker -> content script starts it; the slices come back as
+  // PAGE_BYTES_CHUNK broadcasts that the offscreen document assembles).
+  | { type: "PAGE_FETCH_BYTES"; transferId: string; url: string; jobId?: string }
+  | { type: "PAGE_BYTES_CANCEL"; transferId: string }
+  | {
+      type: "PAGE_BYTES_CHUNK";
+      transferId: string;
+      index: number;
+      total: number;
+      done: boolean;
+      buf: ArrayBuffer;
+    }
+  | { type: "PAGE_BYTES_FAILED"; transferId: string; error: string }
   // --- MSE capture transfer (content script <-> hook <-> offscreen) ---
   | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string; pairTrackIdx?: number }
   | { type: "MS_CANCEL"; jobId: string }
@@ -140,6 +154,8 @@ export type RuntimeMessage =
   | { type: "GET_HISTORY" }
   | { type: "CLEAR_HISTORY" }
   | { type: "REDOWNLOAD"; entryId: string }
+  | { type: "JOB_NOTE"; jobId: string; note: string }
+  | { type: "REQUEST_PAGE_BYTES"; jobId: string; transferId: string; url: string }
   | { type: "START_BATCH"; tabId: number; items: Array<{ itemUrl: string; variantId?: string }> }
   | { type: "GET_BATCH" }
   /** Offscreen -> worker: save an assembled Blob via chrome.downloads (folder-aware). */

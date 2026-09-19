@@ -15,6 +15,42 @@ export interface FetchSegmentsOptions {
   existingParts?: Array<ArrayBuffer | undefined>;
   /** Called with each segment as it completes (persistence hook; best-effort). */
   onSegmentDone?: (index: number, buf: ArrayBuffer) => void;
+  /**
+   * Last-resort transport for a segment this document is not allowed to
+   * fetch: the same URL, issued by the page's own JS world (its cookies,
+   * Referer, Origin, `Sec-Fetch-*` and network fingerprint) and handed back
+   * as bytes. Only used after the direct fetch is refused — see
+   * `isGateFailure`. Supplied by the offscreen document.
+   */
+  relay?: SegmentRelayFn;
+}
+
+/** Fetch one URL with the page's own request context (see FetchSegmentsOptions). */
+export type SegmentRelayFn = (url: string, signal?: AbortSignal) => Promise<ArrayBuffer>;
+
+/** Marks a failure as "the CDN refused this request outright". */
+interface GateMark {
+  gated?: boolean;
+}
+
+function markGated(err: Error): Error {
+  (err as Error & GateMark).gated = true;
+  return err;
+}
+
+/**
+ * True when a failure looks like the request itself was rejected (4xx, an
+ * error page served as video, or a CORS/transport refusal) rather than the
+ * connection being flaky — i.e. a request the page might be allowed to make.
+ * Transient 5xx/timeouts are deliberately excluded: those are not about who is
+ * asking, and relaying them would just burn the page's bandwidth.
+ */
+export function isGateFailure(err: unknown): boolean {
+  if (err instanceof TypeError) return true; // fetch() network/CORS refusal
+  if (!(err instanceof Error)) return false;
+  if ((err as Error & GateMark).gated === true) return true;
+  // "(404)"; 5xx and timeouts are deliberately not relayable.
+  return /unavailable \(40|error page instead of video|failed \(4\d\d\)/i.test(err.message);
 }
 
 /** True when a fetch failure looks like expired signed URLs / blocked chunk. */
@@ -374,7 +410,11 @@ export function pickNet(
   }
 }
 
-async function fetchBuffer(
+/**
+ * Fetch one segment from this document, with retries. Throws a marked error
+ * (see `isGateFailure`) when the CDN refuses the request.
+ */
+async function fetchBufferDirect(
   url: string,
   signal?: AbortSignal,
   scope?: { byOrigin: Record<string, NetReplay> },
@@ -400,8 +440,10 @@ async function fetchBuffer(
       if (res.status === 403 || res.status === 404 || res.status === 410) {
         // Permanent: signed URL expired/revoked or chunk gone — retrying
         // only wastes minutes before failing the whole job.
-        throw new Error(
-          `Stream chunk unavailable (${res.status}) — the link likely expired. Replay the video, hit Rescan, and retry right away.`,
+        throw markGated(
+          new Error(
+            `Stream chunk unavailable (${res.status}) — the link likely expired. Replay the video, hit Rescan, and retry right away.`,
+          ),
         );
       }
       if (res.status === 429 || res.status === 503) {
@@ -412,7 +454,11 @@ async function fetchBuffer(
           : 800 * attempt + Math.random() * 400;
         throw new ThrottledError(waitMs);
       }
-      if (!res.ok) throw new Error(`Segment fetch failed (${res.status}): ${url}`);
+      if (!res.ok) {
+        const err = new Error(`Segment fetch failed (${res.status}): ${url}`);
+        // Other 4xx: the request was refused, not the connection. Relayable.
+        throw res.status >= 400 && res.status < 500 ? markGated(err) : err;
+      }
       const buf = await res.arrayBuffer();
       rejectErrorPage(res.headers.get("content-type"), buf);
       return buf;
@@ -446,6 +492,37 @@ async function fetchBuffer(
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(`Segment fetch failed: ${url}`);
+}
+
+/**
+ * Fetch one segment: direct first, and — only when the CDN refused the
+ * request itself — the same URL through `relay` (the page's own request
+ * context). A relay that also fails surfaces the ORIGINAL error, which is the
+ * one that explains what the server said about this document's request.
+ */
+async function fetchBuffer(
+  url: string,
+  signal?: AbortSignal,
+  scope?: { byOrigin: Record<string, NetReplay> },
+  relay?: SegmentRelayFn,
+): Promise<ArrayBuffer> {
+  try {
+    return await fetchBufferDirect(url, signal, scope);
+  } catch (err) {
+    if (!relay || signal?.aborted || !isGateFailure(err)) throw err;
+    try {
+      const buf = await relay(url, signal);
+      rejectErrorPage(null, buf);
+      return buf;
+    } catch (relayErr) {
+      // A relayed error page is the most specific explanation (and drives the
+      // refresh-and-retry path); anything else keeps the direct refusal.
+      if (relayErr instanceof Error && /error page instead of video/i.test(relayErr.message)) {
+        throw relayErr;
+      }
+      throw err;
+    }
+  }
 }
 
 /** Internal: transient CDN throttle signal carrying the desired wait. */
@@ -852,6 +929,8 @@ export async function fetchSegmentedParts(
  * Fetch segment URLs with bounded parallelism, retries, and safety caps.
  * Returns ordered ArrayBuffers (caller decides concat vs mux).
  * Supports pause (workers wait while isPaused) and resume via existingParts.
+ * A segment this document is refused (`isGateFailure`) is retried through
+ * `opts.relay` — the page's own request context — before the job fails.
  * On failure, partial parts are attached to the thrown error as `partials`
  * so callers can retry only the holes (e.g. after playlist refresh).
  */
@@ -906,7 +985,7 @@ export async function fetchSegments(
       // Skip holes filled by a racing worker after resume mapping.
       if (parts[i]) continue;
       try {
-        const buf = await fetchBuffer(urls[i], signal, scope);
+        const buf = await fetchBuffer(urls[i], signal, scope, opts?.relay);
         parts[i] = buf;
         bytes += buf.byteLength;
         if (bytes > MAX_BYTES) {

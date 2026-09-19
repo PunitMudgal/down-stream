@@ -379,6 +379,54 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
       });
   }
 
+  // ---- page-relayed bytes (segments the extension may not fetch) --------
+  // The CDN treats this world's request and the extension's differently: the
+  // token, Referer/Origin/Sec-Fetch-*, cookies and the network fingerprint all
+  // match the page. So when the extension is refused a segment, it asks here
+  // for that one URL; the bytes are held briefly and served as ≤4MB slices.
+  const SEG_MAX_BYTES = 64_000_000; // one segment; absurd payloads are refused
+  const SEG_SLICE = 4_000_000;
+  const SEG_MAX_ENTRIES = 2;
+  const SEG_TTL_MS = 60_000;
+  const SEG_FETCH_TIMEOUT_MS = 90_000;
+  interface SegEntry {
+    buf: ArrayBuffer;
+    at: number;
+    ctrl: AbortController;
+    /** Fetched and awaiting slices (in-flight entries are never evicted). */
+    ready: boolean;
+  }
+  const segStore = new Map<string, SegEntry>();
+
+  function closeSeg(token: string): void {
+    const e = segStore.get(token);
+    if (!e) return;
+    segStore.delete(token);
+    try {
+      e.ctrl.abort();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function pruneSegs(now: number): void {
+    segStore.forEach((e, k) => {
+      if (e.ready && now - e.at > SEG_TTL_MS) closeSeg(k);
+    });
+  }
+
+  /** Drop idle buffers over the cap; never abort a fetch still in flight. */
+  function evictSegs(keep: string): void {
+    while (segStore.size > SEG_MAX_ENTRIES) {
+      let victim: string | undefined;
+      segStore.forEach((e, k) => {
+        if (victim === undefined && k !== keep && e.ready) victim = k;
+      });
+      if (victim === undefined) return;
+      closeSeg(victim);
+    }
+  }
+
   // ---- page-context service (isolated world asks, page world answers) ----
   window.addEventListener("message", (event) => {
     try {
@@ -400,6 +448,105 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
           },
           "*",
         );
+        return;
+      }
+      if (d.__vdg === "seg-open" && typeof d.url === "string") {
+        const nonce = d.nonce;
+        const token = nonce;
+        const url = String(d.url);
+        void (async () => {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), SEG_FETCH_TIMEOUT_MS);
+          try {
+            pruneSegs(Date.now());
+            segStore.set(token, { buf: new ArrayBuffer(0), at: Date.now(), ctrl, ready: false });
+            const res = await window.fetch(url, { credentials: "include", signal: ctrl.signal });
+            if (!res.ok) {
+              closeSeg(token);
+              window.postMessage(
+                { __vdg: "seg-open-result", nonce, url, ok: false, status: res.status },
+                "*",
+              );
+              return;
+            }
+            const buf = await res.arrayBuffer();
+            if (buf.byteLength === 0 || buf.byteLength > SEG_MAX_BYTES) {
+              closeSeg(token);
+              window.postMessage(
+                {
+                  __vdg: "seg-open-result",
+                  nonce,
+                  url,
+                  ok: false,
+                  error:
+                    buf.byteLength === 0 ? "The page got an empty response." : "Chunk too large.",
+                },
+                "*",
+              );
+              return;
+            }
+            segStore.set(token, { buf, at: Date.now(), ctrl, ready: true });
+            // Keep the page's memory bounded: newest two chunks only.
+            evictSegs(token);
+            window.postMessage(
+              { __vdg: "seg-open-result", nonce, url, ok: true, size: buf.byteLength },
+              "*",
+            );
+          } catch (err) {
+            closeSeg(token);
+            window.postMessage(
+              {
+                __vdg: "seg-open-result",
+                nonce,
+                url,
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              },
+              "*",
+            );
+          } finally {
+            clearTimeout(timer);
+          }
+        })();
+        return;
+      }
+      if (d.__vdg === "seg-slice" && typeof d.token === "string") {
+        const e = segStore.get(d.token);
+        if (!e) {
+          window.postMessage(
+            { __vdg: "seg-slice-result", nonce: d.nonce, error: "Chunk is no longer buffered." },
+            "*",
+          );
+          return;
+        }
+        const cursor = Math.max(0, Math.min(e.buf.byteLength, Number(d.cursor) || 0));
+        const end = Math.min(e.buf.byteLength, cursor + SEG_SLICE);
+        const slice = e.buf.slice(cursor, end);
+        e.at = Date.now();
+        try {
+          window.postMessage(
+            {
+              __vdg: "seg-slice-result",
+              nonce: d.nonce,
+              cursor,
+              next: end,
+              done: end >= e.buf.byteLength,
+              total: e.buf.byteLength,
+              buf: slice,
+            },
+            "*",
+            [slice],
+          );
+        } catch {
+          window.postMessage(
+            { __vdg: "seg-slice-result", nonce: d.nonce, error: "Chunk transfer failed." },
+            "*",
+          );
+        }
+        return;
+      }
+      if (d.__vdg === "seg-close" && typeof d.token === "string") {
+        closeSeg(String(d.token));
         return;
       }
       if (d.__vdg === "page-fetch" && typeof d.url === "string") {

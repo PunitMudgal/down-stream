@@ -868,6 +868,72 @@ async function pageWorldFetch(url: string): Promise<{ text: string; truncated: b
   return { text: String(res.text ?? ""), truncated: res.truncated === true };
 }
 
+// ---- page-relayed segment bytes -------------------------------------------
+// A CDN can refuse the extension's request for a stream chunk while the page
+// fetches the same URL fine. When that happens the offscreen document asks the
+// worker, the worker asks this tab, and the chunk is fetched by the page's own
+// JS world and streamed back to the extension in ≤4MB slices (the same
+// broadcast channel the MSE capture uses).
+
+/** Page fetches + transfers this tab should stop (cancel, or tab teardown). */
+const pageBytesCancelled = new Set<string>();
+
+/** Fetch one URL in the page's world and stream it to the offscreen document. */
+async function drivePageBytes(transferId: string, url: string): Promise<void> {
+  const fail = (error: string): void => {
+    void bgSend({ type: "PAGE_BYTES_FAILED", transferId, error });
+  };
+  // The nonce doubles as the page-side buffer token: even if the open times
+  // out, we can still close it (which aborts the page's fetch).
+  let token = "";
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const opened = (await askHook({ __vdg: "seg-open", url }, 95_000)) as any;
+    token = typeof opened?.token === "string" ? opened.token : String(opened?.nonce ?? "");
+    if (opened?.__vdg !== "seg-open-result" || opened.ok !== true) {
+      fail(
+        String(
+          opened?.error ??
+            (opened?.status ? `The page was refused (${opened.status}).` : "The page could not fetch this chunk."),
+        ),
+      );
+      return;
+    }
+    const total = Number(opened.size) || 0;
+    if (total <= 0) {
+      fail("The page got an empty response.");
+      return;
+    }
+    let cursor = 0;
+    let index = 0;
+    while (cursor < total) {
+      if (dead || pageBytesCancelled.has(transferId)) return; // cancelled
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const slice = (await askHook({ __vdg: "seg-slice", token, cursor }, 25_000)) as any;
+      if (slice?.__vdg !== "seg-slice-result" || !(slice.buf instanceof ArrayBuffer)) {
+        throw new Error(String(slice?.error ?? "The page stopped sending this chunk."));
+      }
+      const next = Number(slice.next) || cursor + slice.buf.byteLength;
+      index++;
+      const sent = await bgSend({
+        type: "PAGE_BYTES_CHUNK",
+        transferId,
+        index,
+        total,
+        done: next >= total,
+        buf: slice.buf,
+      });
+      if (!sent) throw new Error("The extension worker is gone — reopen the popup and retry.");
+      cursor = next;
+    }
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  } finally {
+    pageBytesCancelled.delete(transferId);
+    if (token) void askHook({ __vdg: "seg-close", token }, 1500);
+  }
+}
+
 // Popup paths + worker helpers. FETCH_TEXT runs with the page's cookie jar,
 // so auth-walled manifests unreachable from the worker can still be parsed.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -968,6 +1034,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (m?.type === "BLOB_DOWNLOAD" && typeof m.jobId === "string" && typeof m.url === "string") {
     void driveBlobDownload(m.jobId, m.url, String(m.filename ?? "video.mp4"));
+    try {
+      sendResponse({ ok: true, accepted: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "PAGE_BYTES_CANCEL" && typeof m.transferId === "string") {
+    pageBytesCancelled.add(m.transferId);
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  if (m?.type === "PAGE_FETCH_BYTES" && typeof m.url === "string" && typeof m.transferId === "string") {
+    void drivePageBytes(String(m.transferId), String(m.url));
     try {
       sendResponse({ ok: true, accepted: true });
     } catch {
