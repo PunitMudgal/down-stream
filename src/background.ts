@@ -10,10 +10,11 @@ import type { MediaType } from "./lib/types";
 import { clearClustersForTab } from "./bg/clusters";
 import { onHeadersReceived } from "./bg/detection";
 import { clearHeadersForTab, onSendHeaders } from "./bg/headers";
-import { markInterruptedJobs } from "./bg/jobs";
+import { markInterruptedJobs, ensureItemForUrl, startDownload } from "./bg/jobs";
 import { isExcludedUrl, updateBadge, updateBadgeForActiveTab } from "./bg/media";
 import { routeMessage } from "./bg/router";
-import { forgetTabMedia, jobMemory, lastUrlByTab, persistTab } from "./bg/store";
+import { forgetTabMedia, getTabItems, jobMemory, lastUrlByTab, persistTab } from "./bg/store";
+import { pickBestTabItem, pickCandidateItem, looksLikeBlobPlayer } from "./lib/target";
 import { pruneOrphans } from "./lib/persist";
 
 // Re-exported for the legacy import path; new code should import
@@ -99,6 +100,86 @@ safeWire("webNavigation.history", () => {
       /* malformed URLs etc. must never break the worker */
     }
   });
+});
+
+// Right-click a <video> → "Download this video", or press the keyboard
+// shortcut. Both ask the content script to resolve the target video (cursor
+// position for the menu, best-video heuristic for the key) and then start the
+// download directly — a zero-friction entry point that never needs the popup.
+const CTX_MENU_ID = "vdg-download-video";
+const CMD_DOWNLOAD_BEST = "download-best-video";
+
+async function triggerPageDownload(tabId: number): Promise<boolean> {
+  try {
+    const res = (await chrome.tabs.sendMessage(tabId, { type: "CONTEXT_DOWNLOAD" })) as
+      | { ok?: boolean; candidates?: string[]; title?: string }
+      | undefined;
+    if (!res?.ok || !Array.isArray(res.candidates) || res.candidates.length === 0) return false;
+    const items = await getTabItems(tabId);
+    // 1. The element's own URLs, matched against what we detected (handles
+    //    signed-URL drift, and finds the MSE capture row behind a blob: player).
+    const matched = pickCandidateItem(items, res.candidates);
+    if (matched) {
+      // No variant id: startDownload picks the best quality, exactly like the
+      // popup's default click.
+      await startDownload(tabId, matched.url);
+      return true;
+    }
+    // 2. Nothing matched: register the element's direct/manifest URL ourselves
+    //    (cached media and manifests webRequest never reported).
+    const fresh = await ensureItemForUrl(tabId, res.candidates, res.title);
+    if (fresh) {
+      await startDownload(tabId, fresh.url);
+      return true;
+    }
+    // 3. Only a blob: player and no matching row: the tab's best downloadable
+    //    item is the only way to honour the click.
+    if (looksLikeBlobPlayer(res.candidates)) {
+      const best = pickBestTabItem(items);
+      if (best) {
+        await startDownload(tabId, best.url);
+        return true;
+      }
+    }
+  } catch {
+    /* content script absent (chrome:// pages, store pages) or worker race */
+  }
+  return false;
+}
+
+safeWire("contextMenus", () => {
+  chrome.contextMenus.onClicked.addListener((info, tab) => {
+    if (info.menuItemId !== CTX_MENU_ID || tab?.id == null) return;
+    void triggerPageDownload(tab.id);
+  });
+});
+
+safeWire("commands", () => {
+  chrome.commands.onCommand.addListener((command) => {
+    if (command !== CMD_DOWNLOAD_BEST) return;
+    void (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab?.id != null) await triggerPageDownload(tab.id);
+      } catch {
+        /* ignore */
+      }
+    })();
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  try {
+    chrome.contextMenus.removeAll(() => {
+      chrome.contextMenus.create({
+        id: CTX_MENU_ID,
+        title: "Download this video",
+        contexts: ["video"],
+      });
+    });
+  } catch {
+    /* menu API unavailable */
+  }
 });
 
 safeWire("tabs", () => {

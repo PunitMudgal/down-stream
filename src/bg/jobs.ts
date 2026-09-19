@@ -5,12 +5,13 @@
 // the worker performs the actual chrome.downloads.download(), which
 // offscreen documents cannot call.
 import { parseDashManifest } from "../lib/parseDash";
-import { sortSegmentsNatural } from "../lib/download";
-import type { DownloadJobRequest, DownloadJobState, NetReplay } from "../lib/types";
+import { classify } from "../lib/classify";
+import { cleanTitle, filenameForUrl, sortSegmentsNatural } from "../lib/download";
+import type { DownloadJobRequest, DownloadJobState, MediaItem, NetReplay } from "../lib/types";
 import { lookupNet } from "./headers";
-import { fetchManifestText } from "./manifests";
-import { codecsOf, hasAudioCodec, hasVideoCodec, patchItem } from "./media";
-import { ensureJobsLoaded, getTabItems, jobMemory, persistJobs, upsertJob } from "./store";
+import { fetchManifestText, parseStreamingItem } from "./manifests";
+import { codecsOf, enforceCaps, hasAudioCodec, hasVideoCodec, patchItem, updateBadge } from "./media";
+import { ensureJobsLoaded, getTabItems, jobMemory, persistJobs, persistTab, upsertJob } from "./store";
 
 export const OFFSCREEN_URL = "src/offscreen.html";
 
@@ -243,17 +244,25 @@ export async function startDownload(
       consider(variant.url);
       req = { jobId, tabId, kind: "hls", url: variant.url, filename: item.filename, mime: "video/mp2t" };
       const cc = codecsOf(variant);
-      if (hasVideoCodec(cc) && !hasAudioCodec(cc) && item.variants) {
-        const audio = item.variants.find((v) => {
+      if (hasVideoCodec(cc) && !hasAudioCodec(cc)) {
+        // Audio for a video-only variant comes from either (a) a sibling
+        // audio-only variant in the list, or (b) an #EXT-X-MEDIA audio
+        // rendition playlist attached at parse time (variant.audioUrl).
+        const audioVariant = item.variants?.find((v) => {
           const c = codecsOf(v);
           return hasAudioCodec(c) && !hasVideoCodec(c);
         });
-        if (audio) {
-          consider(audio.url);
+        const audioUrl = audioVariant?.url ?? variant.audioUrl;
+        if (audioUrl) {
+          consider(audioUrl);
           const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
-          if (await probeHlsFmp4(tabId, variant.url)) {
-            // Mux path: single merged .mp4 (offscreen fetches both playlists).
-            req.pairUrl = audio.url;
+          // Mux only when BOTH tracks are fMP4 (TS audio can't merge into mp4).
+          const [vFmp4, aFmp4] = await Promise.all([
+            probeHlsFmp4(tabId, variant.url),
+            probeHlsFmp4(tabId, audioUrl),
+          ]);
+          if (vFmp4 && aFmp4) {
+            req.pairUrl = audioUrl;
             req.filename = `${stem}.mp4`;
           } else {
             // Non-fMP4 pair (e.g. TS): two files, as before.
@@ -262,7 +271,7 @@ export async function startDownload(
               jobId: newJobId(),
               tabId,
               kind: "hls",
-              url: audio.url,
+              url: audioUrl,
               filename: `${stem}-audio.m4a`,
               mime: "video/mp4",
             };
@@ -415,6 +424,50 @@ export async function startDownload(
     paired = true;
   }
   return { job, paired: paired || merged, merged };
+}
+
+/**
+ * Register an item for a URL the worker hasn't seen (e.g. a direct file the
+ * page loaded from cache, or a manifest reached before webRequest recorded
+ * it). Manifests are parsed immediately so the download can start right away.
+ * Returns the usable item, or undefined when the URL isn't downloadable.
+ */
+export async function ensureItemForUrl(
+  tabId: number,
+  candidates: string[],
+  title?: string,
+): Promise<MediaItem | undefined> {
+  const httpish = candidates.filter((u) => /^https?:\/\//i.test(u));
+  for (const url of httpish) {
+    const items = await getTabItems(tabId);
+    const found = items.find((x) => x.url === url);
+    if (found) return found;
+    const type = classify(url, "");
+    if (!type || type === "blob" || type === "capture" || type === "blobfile") continue;
+    const stem = title ? cleanTitle(title) : "";
+    const item: MediaItem = {
+      url,
+      tabId,
+      type,
+      filename: filenameForUrl(url, type, stem || undefined),
+      title: stem || undefined,
+      autoNamed: !stem,
+      detectedAt: Date.now(),
+      drmProtected: false,
+    };
+    items.push(item);
+    await persistTab(tabId, enforceCaps(items));
+    await updateBadge(tabId);
+    if (type === "hls" || type === "dash") {
+      // Populate variants so startDownload can pick a quality immediately.
+      // A parse failure is left on the item — startDownload surfaces its text.
+      await parseStreamingItem(tabId, item);
+      const after = await getTabItems(tabId);
+      return after.find((x) => x.url === url) ?? item;
+    }
+    return item;
+  }
+  return undefined;
 }
 
 /** Deliver one assembled download to the offscreen document (with retries). */

@@ -27,6 +27,8 @@ export interface Variant {
   codecs?: string;
   /** Resolved segment URLs for the chosen variant (populated at download time for HLS). */
   segments?: string[];
+  /** Separate HLS audio-rendition playlist (from #EXT-X-MEDIA:TYPE=AUDIO) to mux in. */
+  audioUrl?: string;
 }
 
 export interface MediaItem {
@@ -69,6 +71,8 @@ export type RuntimeMessage =
       msSessions?: MsSessionMeta[];
       /** Blobs the page exposed via URL.createObjectURL (hook-held bytes). */
       blobs?: BlobFileInfo[];
+      /** Fully formed items supplied by a site adapter. */
+      adapterItems?: MediaItem[];
     }
   | {
       type: "MANIFEST_META";
@@ -83,6 +87,17 @@ export type RuntimeMessage =
       variantId?: string;
     }
   | { type: "GET_JOBS"; tabId: number }
+  /** Worker -> content script: resolve the video under the cursor / the page's best video. */
+  | { type: "CONTEXT_DOWNLOAD" }
+  /** Popup -> worker: measure this item's connection speed and recommend a quality. */
+  | { type: "PROBE_QUALITY"; tabId: number; itemUrl: string }
+  /** Worker -> offscreen: time a small first-segments fetch (bandwidth probe). */
+  | {
+      type: "OFFSCREEN_PROBE";
+      probeId: string;
+      urls: string[];
+      netScope?: { byOrigin: Record<string, NetReplay> };
+    }
   | { type: "CANCEL_JOB"; jobId: string }
   | { type: "PAUSE_JOB"; jobId: string }
   | { type: "RESUME_JOB"; jobId: string }

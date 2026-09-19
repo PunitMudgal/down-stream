@@ -30,6 +30,31 @@ export function sanitizeFilename(name: string, fallback: string): string {
   return cleaned.slice(0, 180);
 }
 
+/**
+ * Pick the variant id a connection measured at `measuredBps` (bytes/sec)
+ * handles comfortably, or undefined when a recommendation can't be made.
+ *
+ * Rule: recommend the highest-bandwidth variant whose declared bitrate fits
+ * inside the share of measured throughput we're willing to use. `utilization`
+ * defaults to 0.7 — the rest absorbs page traffic and protocol overhead, so a
+ * download doesn't saturate the user's link. Pure: the caller measures, this
+ * decides.
+ */
+export function recommendVariant<T extends { id: string; bandwidth?: number; codecs?: string }>(
+  variants: T[],
+  measuredBps: number,
+  utilization = 0.7,
+): string | undefined {
+  if (!Number.isFinite(measuredBps) || measuredBps <= 0) return undefined;
+  const budget = measuredBps * 8 * Math.min(1, Math.max(0, utilization)); // bytes/s -> bits/s
+  const rated = variants.filter((v) => typeof v.bandwidth === "number" && (v.bandwidth as number) > 0);
+  if (rated.length < 2) return undefined; // nothing to choose between
+  // Highest bitrate that fits; if none fit, the lowest (best we can do).
+  const sorted = [...rated].sort((a, b) => (b.bandwidth ?? 0) - (a.bandwidth ?? 0));
+  const fit = sorted.find((v) => (v.bandwidth as number) <= budget);
+  return (fit ?? sorted[sorted.length - 1]).id;
+}
+
 /** Known site suffixes stripped from page/video titles for file naming. */
 const SITE_SUFFIX_RE =
   /\s*[-–—|/]\s*(YouTube|X\s*\(Twitter\)|Twitter|Facebook|Instagram|TikTok|Vimeo|Dailymotion|Twitch|Rumble|Reddit|X)$/i;
@@ -298,6 +323,63 @@ function netInit(net: NetReplay | undefined, signal?: AbortSignal): RequestInit 
     referrer: net?.referrer,
     referrerPolicy: net?.referrer ? "unsafe-url" : undefined,
   };
+}
+
+/**
+ * Measure this connection's throughput using the first few segments of a
+ * stream. Used to recommend a quality the connection can actually sustain.
+ *
+ * Bytes are downloaded and discarded — never saved — and the fetch is
+ * cancelled as soon as the sample budget is reached, so the cost is a few
+ * hundred KB and a second or two. Returns bytes/second, or undefined when
+ * nothing could be measured (caller simply shows no recommendation).
+ */
+export async function probeSpeed(
+  urls: string[],
+  opts?: {
+    signal?: AbortSignal;
+    scope?: { byOrigin: Record<string, NetReplay> };
+    /** How many segments to sample (default 3). */
+    sampleCount?: number;
+    /** Stop once this many bytes have been seen (default 3 MB). */
+    maxBytes?: number;
+  },
+): Promise<number | undefined> {
+  const sample = urls.slice(0, Math.max(1, opts?.sampleCount ?? 3));
+  if (sample.length === 0) return undefined;
+  const maxBytes = opts?.maxBytes ?? 3_000_000;
+  const started = Date.now();
+  let bytes = 0;
+  for (const url of sample) {
+    if (opts?.signal?.aborted) break;
+    if (bytes >= maxBytes) break;
+    const ctrl = new AbortController();
+    const onAbort = (): void => ctrl.abort();
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const res = await fetch(url, netInit(pickNet(opts?.scope, url), ctrl.signal));
+      if (!res.ok || !res.body) continue;
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        bytes += value.byteLength;
+        if (bytes >= maxBytes) {
+          void reader.cancel().catch(() => undefined);
+          break;
+        }
+      }
+    } catch {
+      /* one bad segment shouldn't lose the whole measurement */
+    } finally {
+      clearTimeout(timer);
+      opts?.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+  const seconds = (Date.now() - started) / 1000;
+  if (bytes <= 0 || seconds <= 0) return undefined;
+  return bytes / seconds;
 }
 
 /** Pick the replay context for a URL's origin (headers never cross origins). */

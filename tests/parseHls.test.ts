@@ -98,3 +98,64 @@ describe("extractHlsSegments", () => {
     expect(segs.every((s) => s.startsWith("https://cdn.example.com/hls/video/"))).toBe(true);
   });
 });
+
+describe("parseHlsManifest — audio renditions (#EXT-X-MEDIA:TYPE=AUDIO)", () => {
+  const build = (extra = "", media = "", codecs = "avc1.64001f") => `#EXTM3U
+${media}#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="${codecs}"${extra}
+video/720.m3u8
+`;
+
+  it("attaches the group's audio playlist to a video-only variant", () => {
+    const result = parseHlsManifest(
+      build(
+        ',AUDIO="aud"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/en.m3u8"\n',
+      ),
+      MASTER_URL,
+    );
+    expect(result.variants).toHaveLength(1);
+    expect(result.variants[0].audioUrl).toBe("https://cdn.example.com/hls/audio/en.m3u8");
+  });
+
+  it("prefers the DEFAULT rendition when a group has several", () => {
+    const result = parseHlsManifest(
+      build(
+        ',AUDIO="aud"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Commentary",URI="audio/comm.m3u8"\n' +
+          '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/en.m3u8"\n',
+      ),
+      MASTER_URL,
+    );
+    expect(result.variants[0].audioUrl).toBe("https://cdn.example.com/hls/audio/en.m3u8");
+  });
+
+  it("leaves variants that already carry an audio codec alone", () => {
+    const result = parseHlsManifest(
+      build(
+        ',AUDIO="aud"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/en.m3u8"\n',
+        "avc1.64001f,mp4a.40.2",
+      ),
+      MASTER_URL,
+    );
+    expect(result.variants[0].audioUrl).toBeUndefined();
+  });
+
+  it("does nothing when no audio groups are declared", () => {
+    const result = parseHlsManifest(fixture("master.m3u8"), MASTER_URL);
+    expect(result.variants.every((v) => v.audioUrl === undefined)).toBe(true);
+  });
+
+  it("ignores a group reference that has no matching group", () => {
+    const result = parseHlsManifest(build(',AUDIO="missing"'), MASTER_URL);
+    expect(result.variants[0].audioUrl).toBeUndefined();
+  });
+
+  it("ignores renditions without a URI (muxed into the variant itself)", () => {
+    const result = parseHlsManifest(
+      build(',AUDIO="aud"', '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES\n'),
+      MASTER_URL,
+    );
+    expect(result.variants[0].audioUrl).toBeUndefined();
+  });
+});

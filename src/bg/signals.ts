@@ -81,6 +81,7 @@ export async function handleVideoSignals(
   pageTitle?: string,
   frameId?: number,
   blobs?: BlobFileInfo[],
+  adapterItems?: MediaItem[],
 ): Promise<void> {
   const items = await getTabItems(tabId);
   const blobMap = new Map<string, BlobFileInfo>();
@@ -240,10 +241,58 @@ export async function handleVideoSignals(
       }
     }
   }
+  changed = (await mergeAdapterItems(tabId, items, adapterItems, pageTitle)) || changed;
   if (changed) {
     await persistTab(tabId, enforceCaps(items));
     await updateBadge(tabId);
   }
+}
+
+/**
+ * Merge fully formed site-adapter items into the tab's item list, then
+ * normalize them through the same pipeline as generic detections:
+ * - unknown media types are classified from the URL;
+ * - non-video URLs are rejected;
+ * - manifests are parsed asynchronously before the card renders qualities;
+ * - duplicates are keyed on the exact URL.
+ */
+async function mergeAdapterItems(
+  tabId: number,
+  items: MediaItem[],
+  adapterItems: MediaItem[] | undefined,
+  pageTitle?: string,
+): Promise<boolean> {
+  if (!Array.isArray(adapterItems) || adapterItems.length === 0) return false;
+  let changed = false;
+  for (const raw of adapterItems) {
+    const url = raw?.url;
+    if (typeof url !== "string" || url.length === 0) continue;
+    if (items.some((existing) => existing.url === url)) continue;
+    let type = raw.type;
+    if (type === "unknown" || type === undefined) type = classify(url, "") ?? "unknown";
+    if (type === "unknown") continue;
+    const title = cleanTitle(raw.title) || cleanTitle(pageTitle);
+    const item: MediaItem = {
+      ...raw,
+      tabId,
+      type,
+      filename: raw.filename?.length ? raw.filename : filenameForUrl(url, type, title || undefined),
+      title: title || undefined,
+      titleFromPage: title ? !cleanTitle(raw.title) : undefined,
+      autoNamed: !title,
+      detectedAt: typeof raw.detectedAt === "number" && raw.detectedAt > 0 ? raw.detectedAt : Date.now(),
+      drmProtected: raw.drmProtected ?? false,
+      pageTitle: raw.pageTitle ?? pageTitle,
+    };
+    items.push(item);
+    changed = true;
+    if (type === "hls" || type === "dash") {
+      // Adapter-supplied manifests need variants before the popup renders a
+      // quality menu. The row appears immediately; qualities stream in.
+      void parseStreamingItem(tabId, item);
+    }
+  }
+  return changed;
 }
 
 // Last-seen timestamps for capture keys (prune player teardowns).

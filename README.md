@@ -14,24 +14,38 @@ Detect playable video on any tab and download it locally — no backend, no thir
 - **Header replay**: the exact `Authorization` / custom `X-*` headers and referrer the page used are recorded per request and replayed on re-fetch (auth only to the same origin it came from; cookies are never stored and can't be replayed via fetch — page-context fetch covers manifests instead). This fixes most "found but 403 on download" cases.
 - **API-wrapped manifests**: a MAIN-world hook transparently watches the page's own fetch/XHR for JSON responses embedding `.m3u8`/`.mpd` URLs (size-capped, media traffic skipped, bodies never leave the page — only extracted URLs). No YouTube-specific handling.
 - **Background downloads**: an offscreen document fetches segments (**8 parallel**, per-segment **timeouts + retries**, 2000-segment safety cap) and assembles the file, then saves it **directly via a document download** — bytes never cross extension messaging (legacy data-URL handoff remains as a small-file fallback). Videos past the 1.5 GB in-memory safety cap no longer fail: they save automatically as sequential `name.part1.ext`, `name.part2.ext`, … files (each validated; fMP4 parts carry the init header so every part plays standalone — join them in order for the full video). Direct file URLs (including gated script endpoints like `.php`) are fetched **with the page's own auth context** (cookies + captured same-origin headers + referrer) with error-page validation and byte progress — oversized files hand over to the browser automatically. Split A/V streams (video-only + audio-only variants, MSE capture tracks) are **merged into one playable `.mp4` with sound** by a built-in fMP4 muxer — no ffmpeg, no re-encode, no backend; merges past the cap save as per-track part sets with an ffmpeg one-liner in the completion note. Non-fMP4 pairs fall back to two files with a clear note. Popup can close — progress (`Fetching… n/m` → `Assembling…` → `Saving…`) persists and live-updates on reopen. Jobs are **cancellable**. Output extension is sniffed from bytes (`.ts` vs `.mp4`), not guessed.
+- **Resumable downloads**: fetched segments are written to the extension's origin-private file system (OPFS) as they arrive, so a crash, browser restart, or extension reload no longer loses progress. Interrupted HLS/DASH/grouped jobs come back **paused** with everything already downloaded kept — hit Resume and only the missing segments are fetched (fresh signed URLs are re-resolved, and persisted segments are matched against the playlist's segment count so a stale cache is never reused). Direct-file and page-capture jobs can't be resumed (their bytes only ever existed in the page) and say so instead of pretending. Cancelling a job drops its cached segments, and caches for jobs that no longer exist are pruned at startup.
+- **Hands-free entry points**: right-click any `<video>` → **Download this video** (context menu), or press **Alt+Shift+D** to download the best video on the page without opening the popup (playing video first, then the largest player). **Alt+Shift+V** opens the popup. Both routes resolve the video through the same classifier the popup uses, so the download path, quality selection, muxing and DRM refusal all behave identically.
+- **Site-adapter registry**: coverage for sites whose media never becomes a sniffable request lives in the pluggable `src/lib/adapters/` folder — each adapter declares `{ match: (url) => boolean, extract: (page) => MediaItem[] }` using only pure snapshot data (page URL, title, already-found media URLs). The content script forwards adapter output through `VIDEO_ELEMENTS.adapterItems` / `COLLECT_FOR_POPUP`, and the background worker merges it with the same classify → dedupe → manifest-parse → persist → badge normalization as generic detections. Adapters are hard-blocked on YouTube at the registry level (plus the manifest, content-script, and worker exclusions), run over the same snapshot the generic scan produces, and a throwing adapter is skipped instead of breaking the scan. Adding a site is one adapter module plus one registry entry; the generic engine stays untouched.
+- **Separate-audio HLS masters**: master playlists that keep audio in its own rendition (`#EXT-X-MEDIA:TYPE=AUDIO` + `AUDIO="group"` on the variant — common on premium/CDN setups) are now paired instead of silently downloading a silent video. The audio playlist is attached to the video variant and muxed into one `.mp4` by the same fMP4 muxer used for split A/V; TS pairs fall back to two files, and variants that already carry a `mp4a`/`opus` codec are left alone.
+- **Connection-aware quality hint**: when a manifest offers several qualities, the extension samples the first couple of segments (a few hundred KB, cached per video for 10 minutes, throttled to at most two at a time and three per popup) and badges the highest quality the measured throughput can sustain with **— Recommended**, leaving the user's preselection alone. Nothing is measured when the item has a single quality, and a failed probe simply means no badge.
 - **Popup extras**: parsed manifests dominate the list (raw chunk groups and blob placeholders auto-hide when qualities exist), quality dropdowns sorted best-first with best preselected (single quality = one button, audio-only tracks labeled), split A/V masters download as `*-video.ts` + `*-audio.m4a` with a clear note, per-card **Copy link** (works even with the worker down; direct files can also download worker-free), real thumbnails (video poster → nearby page image → API-bundled poster), per-video **titles** (post text/aria-label near the player, page title as fallback) shown on cards and used for file names, resolution/duration/playing metadata, newest-first list, and a worker-independent page scan so an empty worker never means an empty popup.
 
 ## Load unpacked in Chrome/Brave
 
 1. `npm install`
 2. `npm run build`
-3. Open `chrome://extensions` (or `brave://extensions`) → enable **Developer mode** → **Load unpacked** → select `dist/` (after build). Confirm version **0.8.0**.
+3. Open `chrome://extensions` (or `brave://extensions`) → enable **Developer mode** → **Load unpacked** → select `dist/` (after build). Confirm version **0.9.0**.
 4. **Reload the web page's tab** after installing/updating (content scripts only inject into fresh loads).
 5. Test: MDN `flower.mp4` (direct), `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8` (HLS master), `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd` (DASH), any X/Twitter feed video.
 6. Click the extension icon → pick quality → Download. You can close the popup.
+7. Or skip the popup entirely: right-click a video → **Download this video**, or press **Alt+Shift+D**.
 
 If the popup ever reports the worker unreachable: use **Reload extension now**, reopen — and if it persists, `chrome://extensions` → Developer mode → this extension → **Service worker** shows its log.
 
 ## Permissions
 
-`activeTab, webRequest, downloads, storage, scripting, offscreen, clipboardWrite` + `<all_urls>` hosts (YouTube hosts excluded). No remote servers.
+`activeTab, webRequest, webNavigation, downloads, storage, scripting, offscreen, clipboardWrite, contextMenus` + `<all_urls>` hosts (YouTube hosts excluded). No remote servers.
+
+Keyboard shortcuts (`Alt+Shift+D` download best video, `Alt+Shift+V` open popup) are remappable at `chrome://extensions/shortcuts`.
 
 ## Scripts
 
 - `npm run dev` — Vite dev (limited for MV3; prefer `build` + reload).
 - `npm run build` — `tsc --noEmit && vite build` → `dist/`.
+- `npm test` — Vitest unit suite (`npm run test:watch` to iterate).
+
+## Version history
+
+- **0.9.0** — resumable downloads (OPFS-persisted segments: restart-safe resume, orphan pruning, cancel cleanup) and detection coverage (context menu + keyboard shortcuts with a shared target resolver, site-adapter registry, `#EXT-X-MEDIA` audio-rendition pairing, connection-aware quality recommendation).
+- **0.8.0** — capture-path 1.5 GB cap fixed via auto-split parts, split-A/V muxing hardening, offscreen capture purging, restart-recovery handshake.

@@ -138,6 +138,41 @@ function setStatus(msg: string): void {
   statusEl.textContent = msg;
 }
 
+/**
+ * How many bandwidth probes one popup session may start. Each probe costs a
+ * few hundred KB, and the answer is only a hint — keep it cheap.
+ */
+const MAX_PROBES_PER_SESSION = 3;
+let probesStarted = 0;
+
+/**
+ * Badge the variant this connection can comfortably sustain. The worker
+ * measures the first few segments (cached per item) and recommends the highest
+ * quality that fits; we append a "Recommended" marker to that option without
+ * disturbing the user's preselection. Silent on every failure path — a missing
+ * recommendation must never be an error, just an absent hint.
+ */
+async function markRecommendedQuality(item: MediaItem, sel: HTMLSelectElement): Promise<void> {
+  if (probesStarted >= MAX_PROBES_PER_SESSION) return;
+  probesStarted++;
+  try {
+    const res = (await withTimeout(
+      chrome.runtime.sendMessage({ type: "PROBE_QUALITY", tabId: item.tabId, itemUrl: item.url }),
+      20_000,
+      "Speed check",
+    )) as { ok?: boolean; recommendedId?: string; bps?: number } | undefined;
+    if (!res?.ok || !res.recommendedId) return;
+    const opt = Array.from(sel.options).find((o) => o.value === res.recommendedId);
+    if (!opt || /Recommended/.test(opt.textContent ?? "")) return;
+    opt.textContent = `${opt.textContent} — Recommended`;
+    if (typeof res.bps === "number" && res.bps > 0) {
+      sel.title = `Based on a measured ${mbShort(res.bps)}/s connection`;
+    }
+  } catch {
+    /* no recommendation is a normal outcome (cached/auth-gated/offline) */
+  }
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     p,
@@ -190,7 +225,12 @@ function blockedPageReason(url: string): string | null {
  * a one-shot injected collector when the content script isn't present
  * (e.g. tab hasn't reloaded since install). Never throws.
  */
-async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; msSessions: MsSessionMeta[]; pageTitle?: string }> {
+async function scanPageDirect(tabId: number): Promise<{
+  videos: VideoSignal[];
+  msSessions: MsSessionMeta[];
+  pageTitle?: string;
+  adapterItems: MediaItem[];
+}> {
   try {
     const res = await withTimeout(
       chrome.tabs.sendMessage(tabId, { type: "COLLECT_FOR_POPUP" }),
@@ -202,6 +242,7 @@ async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; m
         videos: res.videos as VideoSignal[],
         msSessions: Array.isArray(res.msSessions) ? (res.msSessions as MsSessionMeta[]) : [],
         pageTitle: typeof res.pageTitle === "string" ? res.pageTitle : undefined,
+        adapterItems: Array.isArray(res.adapterItems) ? (res.adapterItems as MediaItem[]) : [],
       };
     }
   } catch {
@@ -254,9 +295,9 @@ async function scanPageDirect(tabId: number): Promise<{ videos: VideoSignal[]; m
       const val = (r as chrome.scripting.InjectionResult)?.result as unknown;
       if (Array.isArray(val)) out.push(...(val as VideoSignal[]));
     }
-    return { videos: out, msSessions: [], pageTitle: undefined };
+    return { videos: out, msSessions: [], pageTitle: undefined, adapterItems: [] };
   } catch {
-    return { videos: [], msSessions: [], pageTitle: undefined };
+    return { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [] };
   }
 }
 
@@ -625,7 +666,7 @@ async function loadMedia(): Promise<void> {
   const workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
   const pageScan = pageSettled.status === "fulfilled"
     ? pageSettled.value
-    : { videos: [], msSessions: [], pageTitle: undefined };
+    : { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [] };
   const titleByBlob = new Map<string, string>();
   for (const v of pageScan.videos) {
     if (v.currentSrc.startsWith("blob:") && v.title) {
@@ -639,6 +680,9 @@ async function loadMedia(): Promise<void> {
   ];
 
   // Merge: worker detections win on exact URL; page-only signals fill gaps.
+  // Adapter items are authoritative rows from a specialized extractor (they
+  // already passed the worker's merge/classify/parse normalization), so they
+  // join the merge last and cannot be overwritten by generic rows.
   // Extra blob placeholders collapse to one row (all mean "player buffer").
   const byUrl = new Map<string, MediaItem>();
   for (const it of workerItems) byUrl.set(it.url, it);
@@ -646,6 +690,19 @@ async function loadMedia(): Promise<void> {
     if (byUrl.has(it.url)) continue;
     if (it.type === "blob" && [...byUrl.values()].some((x) => x.type === "blob")) continue;
     byUrl.set(it.url, it);
+  }
+  const adapterIds = new Set<string>();
+  for (const it of pageScan.adapterItems ?? []) {
+    if (!it || typeof it.url !== "string" || adapterIds.has(it.url)) continue;
+    adapterIds.add(it.url);
+    const row: MediaItem = {
+      ...it,
+      tabId,
+      pageTitle: it.pageTitle ?? pageScan.pageTitle,
+    };
+    // Pre-parsed adapter manifests (variants already populated, typically
+    // after a worker normalization pass) must not be clobbered by page rows.
+    byUrl.set(it.url, row);
   }
   const merged = [...byUrl.values()];
 
@@ -940,6 +997,10 @@ function renderCard(item: MediaItem): HTMLElement {
           if (idx >= 0) sel.selectedIndex = idx;
         }
         meta.appendChild(sel);
+        // Ask the worker to measure this connection and badge the quality it
+        // can sustain (async — the select renders immediately, the badge
+        // appears when the probe returns).
+        void markRecommendedQuality(item, sel);
 
         btn.textContent = "Download";
         btn.onclick = () => void handleStartDownload(item, sel.value, btn);

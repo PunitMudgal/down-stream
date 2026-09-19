@@ -1,4 +1,6 @@
-import type { BlobFileInfo, MsSessionMeta, VideoSignal } from "./lib/types";
+import { extractWithAdapters, matchAdapters, type AdapterPage } from "./lib/adapters";
+import { pickShortcutVideo, type ShortcutVideoSnapshot } from "./lib/pickVideo";
+import type { BlobFileInfo, MediaItem, MsSessionMeta, VideoSignal } from "./lib/types";
 
 const MAX_FETCH_BYTES = 5_000_000;
 
@@ -145,6 +147,21 @@ function absolutize(raw: string | null): string | null {
 
 // ---- Incremental <video> registry ----
 const liveVideos = new Set<HTMLVideoElement>();
+
+/** The <video> under the cursor when the context menu opened (for CONTEXT_DOWNLOAD). */
+let contextVideo: HTMLVideoElement | null = null;
+try {
+  document.addEventListener(
+    "contextmenu",
+    (e) => {
+      const t = e.target;
+      contextVideo = t instanceof HTMLVideoElement ? t : null;
+    },
+    true,
+  );
+} catch {
+  /* ignore */
+}
 
 function takeVideo(v: HTMLVideoElement): boolean {
   if (liveVideos.has(v)) return false;
@@ -387,6 +404,37 @@ function findPoster(el: HTMLVideoElement): string | null {
   return null;
 }
 
+/**
+ * The video a keyboard shortcut should act on (deterministic priority lives in
+ * `pickShortcutVideo` — see lib/pickVideo.ts). Returns null when the page has
+ * no <video> at all.
+ */
+function bestVideoForShortcut(): HTMLVideoElement | null {
+  try {
+    const candidates: Array<{ el: HTMLVideoElement; snap: ShortcutVideoSnapshot }> = [];
+    liveVideos.forEach((v) => {
+      try {
+        if (!v.isConnected) return;
+        const r = v.getBoundingClientRect();
+        candidates.push({
+          el: v,
+          snap: {
+            playing: !v.paused && !v.ended,
+            area: Math.max(0, r.width) * Math.max(0, r.height),
+            hasSource: !!(v.currentSrc || v.getAttribute("src")),
+          },
+        });
+      } catch {
+        /* ignore */
+      }
+    });
+    const idx = pickShortcutVideo(candidates.map((c) => c.snap));
+    return idx >= 0 ? candidates[idx].el : null;
+  } catch {
+    return null;
+  }
+}
+
 function collect(): VideoSignal[] {
   try {
     const out: VideoSignal[] = [];
@@ -403,6 +451,40 @@ function collect(): VideoSignal[] {
       }
     });
     return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Stable content script fingerprint for adapter extraction results. */
+let lastAdapterKey = "";
+
+/**
+ * Run registered site adapters against this frame's media snapshot. Adapters
+ * return complete media items; classification, manifest parsing, persistence,
+ * and deduplication happen downstream in the background worker. Failures and
+ * empty results are indistinguishable downstream, so this is strictly
+ * additive to generic detection.
+ */
+function collectAdapterItems(videos: VideoSignal[]): MediaItem[] {
+  if (matchAdapters(location.href).length === 0) return [];
+  try {
+    const mediaUrls: string[] = [];
+    for (const signal of videos) {
+      if (signal.currentSrc) mediaUrls.push(signal.currentSrc);
+      for (const candidate of signal.candidates ?? []) mediaUrls.push(candidate);
+    }
+    const page: AdapterPage = { url: location.href, title: document.title, mediaUrls };
+    const items = extractWithAdapters(page);
+    if (items.length === 0) {
+      lastAdapterKey = "";
+      return [];
+    }
+    lastAdapterKey = items
+      .map((item) => item.url)
+      .sort()
+      .join("|");
+    return items;
   } catch {
     return [];
   }
@@ -437,6 +519,8 @@ async function report(force: boolean): Promise<void> {
   if (!force && pageHidden()) return;
   try {
     const videos = collect();
+    const adapterItems = collectAdapterItems(videos);
+    const hasAdapterItems = adapterItems.length > 0;
     const now = Date.now();
     let sessions: MsSessionMeta[] = [];
     let blobs: BlobFileInfo[] = [];
@@ -449,7 +533,7 @@ async function report(force: boolean): Promise<void> {
     }
     // Subframes stay silent unless they actually found something worth
     // reporting (ads/embeds/trackers otherwise chatter on every scan).
-    if (IN_SUBFRAME && !force && videos.length === 0 && sessions.length === 0 && blobs.length === 0) return;
+    if (IN_SUBFRAME && !force && videos.length === 0 && sessions.length === 0 && blobs.length === 0 && !hasAdapterItems) return;
     // Session bytes rounded to MB: reports refresh as captures grow,
     // without spamming on every appended chunk.
     const sessKey = sessions
@@ -457,8 +541,23 @@ async function report(force: boolean): Promise<void> {
       .join(",");
     const blobKey = blobs.map((b) => `${b.url}:${b.size}`).join(",");
     const key =
-      JSON.stringify(videos.map((v) => [v.currentSrc, v.poster, v.paused, v.title])) + "|" + sessKey + "|" + blobKey;
-    if (!force && (key === lastSent || (videos.length === 0 && sessions.length === 0 && blobs.length === 0))) return;
+      JSON.stringify(videos.map((v) => [v.currentSrc, v.poster, v.paused, v.title])) +
+      "|" +
+      sessKey +
+      "|" +
+      blobKey +
+      "|" +
+      (hasAdapterItems ? lastAdapterKey : "");
+    if (
+      !force &&
+      key === lastSent &&
+      videos.length === 0 &&
+      sessions.length === 0 &&
+      blobs.length === 0 &&
+      !hasAdapterItems
+    ) {
+      return;
+    }
     lastSent = key;
     await bgSend({
       type: "VIDEO_ELEMENTS",
@@ -467,6 +566,7 @@ async function report(force: boolean): Promise<void> {
       pageTitle: document.title,
       msSessions: sessions,
       blobs,
+      adapterItems: hasAdapterItems ? adapterItems : undefined,
     });
   } catch (err) {
     noteDead(err);
@@ -746,6 +846,37 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  // Right-click → "Download this video": report the element's candidate media
+  // URLs (best-first) so the worker resolves them against the tab's detected
+  // items — the element alone can't name the file on MSE players. Also serves
+  // the keyboard shortcut, where there is no cursor: falls back to the most
+  // relevant video on the page (playing > largest > first).
+  if (m?.type === "CONTEXT_DOWNLOAD") {
+    try {
+      const v = contextVideo && contextVideo.isConnected ? contextVideo : bestVideoForShortcut();
+      if (!v || !v.isConnected) {
+        sendResponse({ ok: false, error: "No video on this page." });
+        return false;
+      }
+      const s = signalFrom(v);
+      const candidates = Array.from(
+        new Set(
+          [s?.currentSrc ?? v.currentSrc, ...(s?.candidates ?? [])]
+            .map((u) => (typeof u === "string" ? u.trim() : ""))
+            .filter((u) => u.length > 0),
+        ),
+      );
+      if (candidates.length === 0) {
+        sendResponse({ ok: false, error: "This video exposes no source URL." });
+        return false;
+      }
+      const title = typeof s?.title === "string" && s.title ? s.title : undefined;
+      sendResponse({ ok: true, candidates, title });
+    } catch (err) {
+      sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+    return false;
+  }
   if (m?.type === "COLLECT_FOR_POPUP") {
     void (async () => {
       try {
@@ -764,7 +895,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           queryMsSessions(),
           queryBlobs(),
         ]);
-        sendResponse({ ok: true, videos, pageTitle: document.title, msSessions, blobs });
+        const adapterItems = collectAdapterItems(videos);
+        sendResponse({ ok: true, videos, pageTitle: document.title, msSessions, blobs, adapterItems });
       } catch (err) {
         noteDead(err);
         try {

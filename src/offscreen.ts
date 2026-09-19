@@ -11,6 +11,7 @@ import {
   orderAndValidateSegmentParts,
   partFilename,
   planCaptureSplit,
+  probeSpeed,
   sniffKind,
   type SegmentedPart,
 } from "./lib/download";
@@ -689,6 +690,29 @@ async function spoolCaptureParts(jobId: string, flushAll = false): Promise<{ fil
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const m = msg as any;
+  // Bandwidth probe: sample the first few segments and report the measured
+  // throughput so the popup can recommend a quality. Bytes are discarded.
+  if (m?.type === "OFFSCREEN_PROBE" && typeof m.probeId === "string" && Array.isArray(m.urls)) {
+    void (async () => {
+      try {
+        // Bounded by probeSpeed itself (n segments, byte budget, per-fetch
+        // timeout) — no external cancel needed.
+        const bps = await probeSpeed(m.urls as string[], { scope: m.netScope });
+        try {
+          sendResponse({ ok: true, bps });
+        } catch {
+          /* channel closed (popup dismissed) */
+        }
+      } catch (err) {
+        try {
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        } catch {
+          /* ignore */
+        }
+      }
+    })();
+    return true; // async response
+  }
   // Startup recovery handshake: the worker asks whether THIS document
   // instance is actually running the job before deciding a job is orphaned.
   if (m?.type === "OFFSCREEN_STATUS") {

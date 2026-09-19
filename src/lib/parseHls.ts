@@ -65,6 +65,7 @@ export function parseHlsManifest(
         codecs: attrs?.CODECS,
       };
     });
+    pairHlsAudioRenditions(variants, manifest, manifestUrl);
     return { variants, drmProtected, drmReason, isMaster: true };
   }
 
@@ -116,5 +117,49 @@ function safeResolve(maybeRelative: unknown, base: string): string {
     return new URL(maybeRelative, base).toString();
   } catch {
     return base;
+  }
+}
+
+/**
+ * Pair master-playlist AUDIO renditions (#EXT-X-MEDIA:TYPE=AUDIO) onto
+ * video-only variants. Many sites (most HLS muxed-A/V setups) put audio in a
+ * separate rendition playlist referenced by the variant's `AUDIO` group id —
+ * distinct from a variant that itself carries an audio codec. A variant whose
+ * CODECS already includes audio is left alone; a video-only variant gets its
+ * group's audio playlist attached as `audioUrl` so the downloader muxes them
+ * (same path as split A/V pairs). Pure — mutates `variants` in place.
+ */
+export function pairHlsAudioRenditions(
+  variants: Variant[],
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  manifest: any,
+  manifestUrl: string,
+): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const playlists: any[] = manifest?.playlists ?? [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const audioGroups: Record<string, Record<string, any>> =
+    manifest?.mediaGroups?.AUDIO ?? {};
+  if (!Object.keys(audioGroups).length) return;
+
+  const hasAudioCodec = (codecs?: string): boolean =>
+    /mp4a|ac-3|ac-4|ec-3|opus|vorbis|flac/i.test(codecs ?? "");
+
+  for (let i = 0; i < variants.length; i++) {
+    const v = variants[i];
+    if (hasAudioCodec(v.codecs)) continue; // already has sound
+    const groupId: unknown = playlists[i]?.attributes?.AUDIO;
+    if (typeof groupId !== "string" || !groupId) continue;
+    const group = audioGroups[groupId];
+    if (!group) continue;
+    // Prefer the rendition marked default/autoselect, else the first.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const renditions: any[] = Object.values(group);
+    const pick =
+      renditions.find((r) => r?.default || r?.autoselect) ?? renditions[0];
+    const uri: unknown = pick?.uri;
+    if (typeof uri !== "string" || !uri) continue;
+    const abs = safeResolve(uri, manifestUrl);
+    if (abs && abs !== manifestUrl) v.audioUrl = abs;
   }
 }

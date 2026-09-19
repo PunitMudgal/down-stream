@@ -2,8 +2,12 @@
 // Each message type has a focused handler in HANDLERS; routeMessage
 // dispatches by type. Logic moved verbatim from background.ts —
 // zero behavior change, only the routing structure is new.
-import { cleanTitle, downloadDirect } from "../lib/download";
-import { maybeCloseOffscreen, startDownload } from "./jobs";
+import { cleanTitle, downloadDirect, recommendVariant } from "../lib/download";
+import { extractHlsSegments } from "../lib/parseHls";
+import type { MediaItem, NetReplay } from "../lib/types";
+import { lookupNet } from "./headers";
+import { fetchManifestText } from "./manifests";
+import { ensureOffscreen, maybeCloseOffscreen, newJobId, startDownload } from "./jobs";
 import { getTabItems, getTabJobs, getMemoryItems, persistTab } from "./store";
 import { ensureJobsLoaded, getJob, upsertJob } from "./store";
 import { handleCaptureSessions, handleVideoSignals } from "./signals";
@@ -13,6 +17,105 @@ import { isExcludedUrl } from "./media";
 type AnyMsg = any;
 type Sender = chrome.runtime.MessageSender;
 type Handler = (m: AnyMsg, sender: Sender) => Promise<unknown>;
+
+/**
+ * Bandwidth-aware quality suggestion. Resolves the item's first few segment
+ * URLs, has the offscreen document time a small sample fetch, then recommends
+ * the best variant the connection can sustain. Results are cached per item for
+ * a short window so reopening the popup doesn't re-probe.
+ */
+const SPEED_TTL_MS = 10 * 60_000;
+const speedCache = new Map<string, { bps: number; at: number }>();
+/** Probes are throttled: bounded concurrency + bounded queue (bandwidth cost). */
+const MAX_PROBE_CONCURRENT = 2;
+const MAX_PROBE_PENDING = 4;
+let probesActive = 0;
+const probeWaiters: Array<() => void> = [];
+
+/**
+ * Run a probe inside the throttle. When the queue is full the caller gets
+ * `skip` immediately — a missing recommendation is always acceptable, a
+ * bandwidth stampede is not.
+ */
+async function withProbeSlot<T>(fn: () => Promise<T>, skip: T): Promise<T> {
+  if (probesActive >= MAX_PROBE_CONCURRENT) {
+    if (probeWaiters.length >= MAX_PROBE_PENDING) return skip;
+    await new Promise<void>((resolve) => probeWaiters.push(resolve));
+  }
+  probesActive++;
+  try {
+    return await fn();
+  } finally {
+    probesActive--;
+    probeWaiters.shift()?.();
+    // Only tidy the offscreen document once the LAST probe is done — closing
+    // it mid-probe would drop another item's measurement.
+    if (probesActive === 0) void maybeCloseOffscreen();
+  }
+}
+
+async function sampleUrlsFor(tabId: number, item: MediaItem, variantId?: string): Promise<string[]> {
+  const variant =
+    item.variants?.find((v) => v.id === variantId) ?? item.variants?.[0];
+  if (!variant) return [];
+  if (variant.segments?.length) return variant.segments.slice(0, 3);
+  if (item.type !== "hls") return [];
+  // HLS: the variant URL is a media playlist — read it and take its first
+  // segments (the same resolving path the downloader uses).
+  try {
+    const text = await fetchManifestText(tabId, variant.url);
+    return extractHlsSegments(text, variant.url).slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
+async function probeQuality(tabId: number, item: MediaItem): Promise<{ bps: number } | null> {
+  const cached = speedCache.get(item.url);
+  if (cached && Date.now() - cached.at < SPEED_TTL_MS) return { bps: cached.bps };
+  const urls = await sampleUrlsFor(tabId, item);
+  if (urls.length === 0) return null;
+  // Reuse the page's auth context so gated sample segments answer.
+  const byOrigin: Record<string, NetReplay> = {};
+  for (const u of urls) {
+    const net = lookupNet(tabId, u);
+    if (!net) continue;
+    try {
+      byOrigin[new URL(u).origin] = net;
+    } catch {
+      /* ignore */
+    }
+  }
+  await ensureOffscreen();
+  const res = (await chrome.runtime.sendMessage({
+    type: "OFFSCREEN_PROBE",
+    probeId: newJobId(),
+    urls,
+    netScope: Object.keys(byOrigin).length ? { byOrigin } : undefined,
+  })) as { ok?: boolean; bps?: number } | undefined;
+  if (!res?.ok || typeof res.bps !== "number" || res.bps <= 0) return null;
+  speedCache.set(item.url, { bps: res.bps, at: Date.now() });
+  return { bps: res.bps };
+}
+
+async function handleProbeQuality(m: AnyMsg): Promise<unknown> {
+  if (typeof m.tabId !== "number" || typeof m.itemUrl !== "string") {
+    return { ok: false, error: "Unknown message" };
+  }
+  const items = getMemoryItems(m.tabId) ?? (await getTabItems(m.tabId));
+  const item = items.find((x) => x.url === m.itemUrl);
+  if (!item) return { ok: false, error: "Video no longer listed for this tab." };
+  if (!item.variants || item.variants.length < 2) return { ok: true, recommendedId: undefined };
+  try {
+    const probed = await withProbeSlot(() => probeQuality(m.tabId, item), null);
+    if (!probed) return { ok: true, recommendedId: undefined };
+    const recommendedId = recommendVariant(item.variants, probed.bps);
+    return { ok: true, recommendedId, bps: Math.round(probed.bps) };
+  } catch (err) {
+    // A failed probe is not a failure of the item — just no recommendation.
+    return { ok: true, recommendedId: undefined, error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 async function handleGetMedia(m: AnyMsg): Promise<unknown> {
   if (typeof m.tabId !== "number") return { ok: false, error: "Unknown message" };
@@ -132,7 +235,9 @@ async function handleVideoElements(m: AnyMsg, sender: Sender): Promise<unknown> 
   const vids = (m.videos ?? []) as any[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const blobs = Array.isArray(m.blobs) ? (m.blobs as any) : undefined;
-  await handleVideoSignals(fromSender, vids, m.pageTitle, sender.frameId, blobs);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const adapterItems = Array.isArray(m.adapterItems) ? (m.adapterItems as any) : undefined;
+  await handleVideoSignals(fromSender, vids, m.pageTitle, sender.frameId, blobs, adapterItems);
   // Posters/titles keyed by blob: URL for capture-session rows.
   const posterByBlob = new Map<string, string>();
   const titleByBlob = new Map<string, string>();
@@ -363,6 +468,7 @@ async function handleIgnored(): Promise<unknown> {
 const HANDLERS: Record<string, Handler> = {
   GET_MEDIA: handleGetMedia,
   GET_JOBS: handleGetJobs,
+  PROBE_QUALITY: handleProbeQuality,
   CANCEL_JOB: handleCancelJob,
   PAUSE_JOB: handlePauseJob,
   RESUME_JOB: handleResumeJob,
@@ -385,6 +491,8 @@ const HANDLERS: Record<string, Handler> = {
   OFFSCREEN_PAUSE: handleIgnored,
   OFFSCREEN_RESUME: handleIgnored,
   OFFSCREEN_STATUS: handleIgnored,
+  OFFSCREEN_PROBE: handleIgnored,
+  CONTEXT_DOWNLOAD: handleIgnored,
   PURGE_CAPTURE: handleIgnored,
   PURGE_JOB_DATA: handleIgnored,
 };
