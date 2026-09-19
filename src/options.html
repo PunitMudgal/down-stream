@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DownStream — Settings &amp; History</title>
+    <link rel="stylesheet" href="./options.css" />
+  </head>
+  <body>
+    <header class="page-head">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <img src="/downstream.png" alt="" width="20" height="20" />
+        </span>
+        <span class="brand-text">
+          <h1>DownStream</h1>
+          <span class="subtitle">Fully local video downloader — settings &amp; history</span>
+        </span>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="Sections">
+        <button id="tab-settings" class="tab" role="tab" aria-selected="true" aria-controls="panel-settings" type="button">Settings</button>
+        <button id="tab-history" class="tab" role="tab" aria-selected="false" aria-controls="panel-history" type="button">History</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings">
+        <div class="card">
+          <h2>File name</h2>
+          <p class="help">
+            Pattern for saved files. Placeholders:
+            <code>{title}</code>, <code>{quality}</code>, <code>{ext}</code>,
+            <code>{host}</code>, <code>{type}</code>, <code>{date}</code>.
+            Leave empty to keep the name detected on the page.
+          </p>
+          <label class="field">
+            <span class="field-label">Name pattern</span>
+            <input id="template" type="text" spellcheck="false" autocomplete="off"
+              placeholder="{title} [{quality}]" />
+          </label>
+          <div id="template-preview" class="preview" aria-live="polite"></div>
+        </div>
+
+        <div class="card">
+          <h2>Destination</h2>
+          <p class="help">
+            Subfolder inside your browser's download folder. Use
+            <code>/</code> for nesting (for example <code>Videos/down-stream</code>).
+            Leave empty to save straight to the download folder.
+          </p>
+          <label class="field">
+            <span class="field-label">Subfolder</span>
+            <input id="subfolder" type="text" spellcheck="false" autocomplete="off" placeholder="DownStream" />
+          </label>
+          <div id="path-preview" class="preview" aria-live="polite"></div>
+        </div>
+
+        <div class="card">
+          <h2>Downloads</h2>
+          <label class="row">
+            <input id="notify" type="checkbox" />
+            <span>
+              <b>Notify when a download finishes</b>
+              <small>Shows a system notification with a “Show in folder” action.</small>
+            </span>
+          </label>
+          <label class="row">
+            <input id="concurrency" type="number" min="1" max="4" step="1" inputmode="numeric" />
+            <span>
+              <b>Downloads at once (batch)</b>
+              <small>How many selected videos download in parallel — 1 to 4.</small>
+            </span>
+          </label>
+        </div>
+
+        <div class="footer-actions">
+          <button id="reset" class="ghost" type="button">Reset to defaults</button>
+          <span id="settings-status" class="status" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="panel-history" class="panel" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <div class="history-head">
+          <span id="history-count" class="count"></span>
+          <div class="history-actions">
+            <button id="history-refresh" class="ghost" type="button">Refresh</button>
+            <button id="history-clear" class="ghost danger" type="button">Clear history</button>
+          </div>
+        </div>
+        <div id="history-status" class="status" role="status" aria-live="polite"></div>
+        <div id="history-list" class="history-list"></div>
+      </section>
+    </main>
+
+    <script type="module" src="./options.ts"></script>
+  </body>
+</html>

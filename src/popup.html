@@ -17,10 +17,19 @@
           <span class="subtitle">Videos on this page</span>
         </span>
       </div>
-      <button id="rescan" type="button" title="Re-scan the page for videos">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-        <span>Rescan</span>
-      </button>
+      <div class="head-actions">
+        <button id="select-toggle" type="button" aria-pressed="false" title="Select several videos and download them together">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 11 12 14 20 6"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          <span>Select</span>
+        </button>
+        <button id="settings" type="button" title="Settings &amp; download history" aria-label="Settings and download history">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6h.09A1.65 1.65 0 0 0 10 3.09V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <button id="rescan" type="button" title="Re-scan the page for videos">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          <span>Rescan</span>
+        </button>
+      </div>
     </header>
     <div class="toolbar">
       <div class="searchbar">
@@ -29,6 +38,15 @@
       </div>
       <span id="count" class="count" role="status" aria-label="Video count"></span>
     </div>
+    <div id="batch" class="batch" hidden>
+      <span id="batch-count" class="batch-count" role="status" aria-live="polite"></span>
+      <div class="batch-actions">
+        <button id="batch-all" class="ghost" type="button">Select all</button>
+        <button id="batch-clear" class="ghost" type="button">Clear</button>
+        <button id="batch-start" class="dl" type="button" disabled>Download selected</button>
+      </div>
+    </div>
+    <div id="queue" class="queue" role="status" aria-live="polite" hidden></div>
     <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
     <main id="list"></main>
     <script type="module" src="./popup.ts"></script>

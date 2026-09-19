@@ -16,6 +16,7 @@ import {
   type SegmentedPart,
 } from "./lib/download";
 import { extractHlsSegments } from "./lib/parseHls";
+import { basenameOf, withExtPreservingDir } from "./lib/filename";
 import { muxFmp4 } from "./lib/mp4mux";
 import {
   clearJob as persistClearJob,
@@ -29,8 +30,9 @@ import type { DownloadJobRequest, DownloadJobStage } from "./lib/types";
 const controllers = new Map<string, AbortController>();
 /** Jobs currently paused — fetch workers wait instead of taking new segments. */
 const pausedJobs = new Set<string>();
-/** The job this offscreen document instance is actively running (startup recovery). */
-let activeJobId: string | undefined;
+/** Jobs this offscreen document instance is actively running (startup recovery).
+ *  A Set because batch mode can run more than one download at once. */
+const activeJobIds = new Set<string>();
 
 /** Upper bound for one assembled file (matches the fetch-side cap). */
 const MAX_ASSEMBLED_BYTES = 1_500_000_000;
@@ -66,46 +68,76 @@ function stage(jobId: string, s: DownloadJobStage): void {
   report({ type: "JOB_STAGE", jobId, stage: s });
 }
 
+// Blob URLs this document created and has not revoked yet (RELEASE_BLOB_URL
+// arrives once chrome.downloads has finished streaming them).
+const liveBlobUrls = new Set<string>();
+
+function revokeBlobUrl(url: string): void {
+  liveBlobUrls.delete(url);
+  try {
+    URL.revokeObjectURL(url);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Safety valve: never leak a blob URL if a completion event goes missing. */
+function revokeLater(url: string, ms: number): void {
+  liveBlobUrls.add(url);
+  setTimeout(() => revokeBlobUrl(url), ms);
+}
+
 /**
- * Stream a Blob to the user's downloads via an anchor click straight from
- * this document — zero bytes cross extension messaging, so files of any
- * size work and oversized-payload failures ("corrupt file payload")
- * disappear. Callers report DOWNLOAD_DONE themselves (single files and
- * multi-part sets report differently).
+ * Save an assembled Blob and return its chrome.downloads id (when tracked).
+ *
+ * PRIMARY: hand the blob URL to the background worker, which owns
+ * `chrome.downloads.download` — that is what makes the configured subfolder AND
+ * templated filename apply, and yields a download id for "Show in folder". The
+ * worker revokes the URL once the transfer finishes, so the URL (and this
+ * document) stay alive until then.
+ *
+ * FALLBACK (worker unreachable): anchor download from this document. Chrome
+ * ignores path separators in the `download` attribute, so only the basename is
+ * honoured — the bytes still land, just at the downloads root.
  */
-async function anchorSaveBlob(blob: Blob, filename: string): Promise<void> {
+async function saveBlob(jobId: string, blob: Blob, filename: string): Promise<number | undefined> {
   if (!blob || blob.size === 0) {
     throw new Error("Assembled file is empty — nothing was captured.");
   }
   const url = URL.createObjectURL(blob);
   try {
+    const res = (await chrome.runtime.sendMessage({
+      type: "SAVE_BLOB_URL",
+      jobId,
+      blobUrl: url,
+      filename,
+    })) as { ok?: boolean; downloadId?: number } | undefined;
+    if (res?.ok && typeof res.downloadId === "number") {
+      revokeLater(url, 6 * 3_600_000);
+      return res.downloadId;
+    }
+  } catch {
+    /* worker unreachable — fall through to the anchor */
+  }
+  try {
     const a = document.createElement("a");
     a.href = url;
-    a.download = filename;
+    a.download = basenameOf(filename);
     (document.body ?? document.documentElement).appendChild(a);
     a.click();
     a.remove();
   } catch (err) {
-    try {
-      URL.revokeObjectURL(url);
-    } catch {
-      /* ignore */
-    }
+    revokeBlobUrl(url);
     throw err;
   }
   // The browser streams the download FROM the blob URL for the whole
   // transfer — revoking early aborts slow/large downloads. A 1.5 GB file
   // at 0.5 Mbps needs ~7h; keep the URL alive 12h (the offscreen document
   // closing reclaims it sooner anyway).
-  setTimeout(() => {
-    try {
-      URL.revokeObjectURL(url);
-    } catch {
-      /* ignore */
-    }
-  }, 12 * 3_600_000);
+  revokeLater(url, 12 * 3_600_000);
   // Grace period for the browser to claim the blob URL before reporting.
   await new Promise((r) => setTimeout(r, 1500));
+  return undefined;
 }
 
 /**
@@ -122,8 +154,8 @@ async function finalizeJobFile(
 ): Promise<void> {
   stage(jobId, "saving");
   try {
-    await anchorSaveBlob(blob, filename);
-    report({ type: "DOWNLOAD_DONE", jobId, filename, note });
+    const downloadId = await saveBlob(jobId, blob, filename);
+    report({ type: "DOWNLOAD_DONE", jobId, filename, note, downloadId });
   } catch (err) {
     if (blob.size > DIRECT_SAVE_FALLBACK_BYTES) throw err;
     const dataUrl = await blobToDataUrl(blob);
@@ -159,9 +191,9 @@ async function sniffExtension(blob: Blob, fallback: string): Promise<string> {
   return fallback;
 }
 
+/** Swap the extension while keeping the configured subfolder intact. */
 function withExtension(filename: string, ext: string): string {
-  if (filename.toLowerCase().endsWith(ext)) return filename;
-  return filename.replace(/\.[a-z0-9]+$/i, "") + ext;
+  return withExtPreservingDir(filename, ext);
 }
 
 type NetScope = NonNullable<DownloadJobRequest["netScope"]>;
@@ -387,7 +419,7 @@ async function saveTrackInParts(opts: TrackSaveOpts): Promise<TrackSaveResult> {
       await finalizeJobFile(opts.jobId, blob, filename);
     } else {
       stage(opts.jobId, "saving");
-      await anchorSaveBlob(blob, filename);
+      await saveBlob(opts.jobId, blob, filename);
     }
     if (!firstFile) firstFile = filename;
     lastFile = filename;
@@ -676,7 +708,7 @@ async function spoolCaptureParts(jobId: string, flushAll = false): Promise<{ fil
         t.idx === 1 ? `${stem}-audio` : acc.pairParts.length ? `${stem}-video` : stem;
       const filename = partFilename(label, acc.partNo[t.idx], ext);
       stage(jobId, "saving");
-      await anchorSaveBlob(blob, filename);
+      await saveBlob(jobId, blob, filename);
       files.push(filename);
       acc.partNo[t.idx]++;
     }
@@ -717,7 +749,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // instance is actually running the job before deciding a job is orphaned.
   if (m?.type === "OFFSCREEN_STATUS") {
     try {
-      sendResponse({ ok: true, activeJobId: activeJobId ?? null });
+      const ids = [...activeJobIds];
+      sendResponse({ ok: true, activeJobIds: ids, activeJobId: ids[ids.length - 1] ?? null });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  // The worker finished streaming a saved blob — release its URL now.
+  if (m?.type === "RELEASE_BLOB_URL" && typeof m.blobUrl === "string") {
+    revokeBlobUrl(m.blobUrl);
+    try {
+      sendResponse({ ok: true });
     } catch {
       /* ignore */
     }
@@ -909,7 +952,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const controller = new AbortController();
   controllers.set(job.jobId, controller);
   const signal = controller.signal;
-  activeJobId = job.jobId;
+  activeJobIds.add(job.jobId);
 
   void (async () => {
     try {
@@ -969,7 +1012,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     } finally {
       controllers.delete(job.jobId);
       pausedJobs.delete(job.jobId);
-      if (activeJobId === job.jobId) activeJobId = undefined;
+      activeJobIds.delete(job.jobId);
     }
   })();
   return false;

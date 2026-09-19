@@ -4,10 +4,16 @@
 // zero behavior change, only the routing structure is new.
 import { cleanTitle, downloadDirect, recommendVariant } from "../lib/download";
 import { extractHlsSegments } from "../lib/parseHls";
-import type { MediaItem, NetReplay } from "../lib/types";
+import { appendHistory, clearHistory, entryFromJob, getHistoryEntry, loadHistory } from "../lib/history";
+import { getSettings, normalizeSettings, saveSettings } from "../lib/settings";
+import type { DownloadJobState, MediaItem, NetReplay } from "../lib/types";
 import { lookupNet } from "./headers";
 import { fetchManifestText } from "./manifests";
-import { ensureOffscreen, maybeCloseOffscreen, newJobId, startDownload } from "./jobs";
+import { ensureOffscreen, maybeCloseOffscreen, newJobId, redownloadHistoryEntry, startDownload } from "./jobs";
+import { notifyDownloadComplete } from "./notifications";
+import { batchQueue } from "./queue";
+import { dropRate, noteProgress } from "./rate";
+import { rememberSave } from "./saves";
 import { getTabItems, getTabJobs, getMemoryItems, persistTab } from "./store";
 import { ensureJobsLoaded, getJob, upsertJob } from "./store";
 import { handleCaptureSessions, handleVideoSignals } from "./signals";
@@ -143,6 +149,8 @@ async function handleCancelJob(m: AnyMsg): Promise<unknown> {
       job.status = "error";
       job.error = "Download cancelled.";
       await upsertJob(job);
+      dropRate(job.jobId);
+      await afterJobSettled(job, "cancelled");
     }
     // Capture + blob-file jobs also stream from the tab — stop the driver too.
     if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
@@ -275,6 +283,24 @@ async function handleManifestMeta(m: AnyMsg, sender: Sender): Promise<unknown> {
   return { ok: true };
 }
 
+/**
+ * Shared post-settlement bookkeeping: advance the batch queue, record the
+ * history row, and raise a completion notification. Every terminal path funnels
+ * through here so the three stay consistent (and DRY).
+ */
+async function afterJobSettled(
+  job: DownloadJobState,
+  status: "done" | "error" | "cancelled",
+): Promise<void> {
+  batchQueue.onJobSettled(job.jobId);
+  try {
+    await appendHistory(entryFromJob(job, status));
+  } catch {
+    /* history is best-effort */
+  }
+  if (status === "done") await notifyDownloadComplete(job);
+}
+
 async function handleDownloadProgress(m: AnyMsg): Promise<unknown> {
   if (typeof m.jobId !== "string") return { ok: false, error: "Unknown message" };
   await ensureJobsLoaded();
@@ -282,7 +308,13 @@ async function handleDownloadProgress(m: AnyMsg): Promise<unknown> {
   if (job) {
     job.done = m.done ?? job.done;
     job.total = m.total ?? job.total;
-    if (typeof m.bytesDone === "number") job.bytesDone = m.bytesDone;
+    if (typeof m.bytesDone === "number") {
+      job.bytesDone = m.bytesDone;
+      // Rolling window rate — a cumulative average lags and never recovers
+      // after a stall; this reflects the speed right now.
+      const rate = noteProgress(m.jobId, m.bytesDone);
+      if (rate && rate > 0) job.rateBps = rate;
+    }
     if (!job.startedAt) job.startedAt = Date.now();
     await upsertJob(job, false);
   }
@@ -342,6 +374,8 @@ async function handleDownloadBlob(m: AnyMsg): Promise<unknown> {
       }
     }
     await upsertJob(job);
+    dropRate(job.jobId);
+    await afterJobSettled(job, job.status === "done" ? "done" : "error");
   }
   void maybeCloseOffscreen();
   return { ok: true };
@@ -349,16 +383,20 @@ async function handleDownloadBlob(m: AnyMsg): Promise<unknown> {
 
 async function handleDownloadDone(m: AnyMsg): Promise<unknown> {
   if (typeof m.jobId !== "string") return { ok: false, error: "Unknown message" };
-  // The offscreen document saved the file itself (anchor download —
-  // no giant payloads through messaging). Mark the job complete.
+  // The offscreen document saved the file itself (no giant payloads through
+  // messaging). Mark the job complete, then record + announce it.
   await ensureJobsLoaded();
   const job = getJob(m.jobId);
   if (job) {
     if (typeof m.filename === "string" && m.filename) job.filename = m.filename;
     if (typeof m.note === "string" && m.note) job.note = m.note;
+    if (typeof m.downloadId === "number") job.downloadId = m.downloadId;
     job.status = "done";
     job.done = job.total || job.done;
+    job.rateBps = undefined;
     await upsertJob(job);
+    dropRate(job.jobId);
+    await afterJobSettled(job, "done");
     // Drop the capture's buffered parts — a done capture can hold >1 GB.
     try {
       await chrome.runtime.sendMessage({ type: "PURGE_CAPTURE", jobId: m.jobId });
@@ -379,8 +417,7 @@ async function handleDownloadError(m: AnyMsg): Promise<unknown> {
     // memory cap — the download still completes, just without progress.
     if (m.fallbackDirect === true && job.unit === "bytes") {
       try {
-        const downloadId = await downloadDirect(job.itemUrl, job.filename);
-        void downloadId;
+        job.downloadId = await downloadDirect(job.itemUrl, job.filename);
         job.status = "done";
         job.done = job.total || job.done;
       } catch (err) {
@@ -388,6 +425,8 @@ async function handleDownloadError(m: AnyMsg): Promise<unknown> {
         job.error = err instanceof Error ? err.message : String(err);
       }
       await upsertJob(job);
+      dropRate(job.jobId);
+      await afterJobSettled(job, job.status === "done" ? "done" : "error");
     } else {
       // A pause-then-cancel race can deliver a late abort after resume;
       // only terminal states from a non-paused job finalize as error.
@@ -395,6 +434,8 @@ async function handleDownloadError(m: AnyMsg): Promise<unknown> {
       job.error = m.error ?? "Download failed.";
       job.expired = m.expired === true;
       await upsertJob(job);
+      dropRate(job.jobId);
+      await afterJobSettled(job, /cancelled/i.test(job.error ?? "") ? "cancelled" : "error");
     }
   }
   void maybeCloseOffscreen();
@@ -460,6 +501,93 @@ async function handleRescan(m: AnyMsg): Promise<unknown> {
   return { ok: true };
 }
 
+// ---- settings, history, batch ---------------------------------------------
+
+async function handleGetSettings(): Promise<unknown> {
+  return { ok: true, settings: await getSettings() };
+}
+
+async function handleSaveSettings(m: AnyMsg): Promise<unknown> {
+  const patch = normalizeSettings(m.settings);
+  return { ok: true, settings: await saveSettings(patch) };
+}
+
+async function handleGetHistory(): Promise<unknown> {
+  return { ok: true, entries: await loadHistory() };
+}
+
+async function handleClearHistory(): Promise<unknown> {
+  await clearHistory();
+  return { ok: true };
+}
+
+async function handleRedownload(m: AnyMsg): Promise<unknown> {
+  if (typeof m.entryId !== "string") return { ok: false, error: "Unknown message" };
+  const entry = await getHistoryEntry(m.entryId);
+  if (!entry) return { ok: false, error: "That history entry no longer exists." };
+  try {
+    const job = await redownloadHistoryEntry(entry);
+    // A direct re-download finishes synchronously (the browser fetches it), so
+    // it needs its history row and notification here; manifest re-downloads
+    // settle later through the normal DOWNLOAD_DONE path.
+    if (job.status === "done") {
+      await appendHistory(entryFromJob(job, "done"));
+      await notifyDownloadComplete(job);
+    }
+    return { ok: true, job };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function handleStartBatch(m: AnyMsg): Promise<unknown> {
+  if (typeof m.tabId !== "number" || !Array.isArray(m.items)) {
+    return { ok: false, error: "Unknown message" };
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const items = (m.items as any[])
+    .filter((x) => x && typeof x.itemUrl === "string")
+    .map((x) => ({
+      itemUrl: x.itemUrl as string,
+      variantId: typeof x.variantId === "string" ? (x.variantId as string) : undefined,
+    }));
+  if (items.length === 0) return { ok: false, error: "Nothing selected." };
+  const known = getMemoryItems(m.tabId) ?? (await getTabItems(m.tabId));
+  const titleByUrl = new Map(known.map((i) => [i.url, i.title]));
+  await batchQueue.add(
+    m.tabId,
+    items.map((i) => ({ ...i, title: titleByUrl.get(i.itemUrl) })),
+  );
+  return { ok: true, snapshot: batchQueue.snapshot() };
+}
+
+async function handleGetBatch(): Promise<unknown> {
+  await ensureJobsLoaded();
+  return { ok: true, snapshot: batchQueue.snapshot() };
+}
+
+/**
+ * Offscreen -> worker: save an assembled Blob through chrome.downloads so the
+ * configured subfolder/filename apply and the file is tracked (download id for
+ * "Show in folder"). The blob URL stays alive until the transfer completes.
+ */
+async function handleSaveBlobUrl(m: AnyMsg): Promise<unknown> {
+  if (typeof m.blobUrl !== "string" || typeof m.filename !== "string") {
+    return { ok: false, error: "Unknown message" };
+  }
+  try {
+    const downloadId = await chrome.downloads.download({
+      url: m.blobUrl,
+      filename: m.filename,
+      saveAs: false,
+    });
+    rememberSave(downloadId, m.blobUrl);
+    return { ok: true, downloadId };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 async function handleIgnored(): Promise<unknown> {
   // Broadcast/offscreen traffic not addressed to the worker — ignore.
   return { ok: true };
@@ -485,6 +613,15 @@ const HANDLERS: Record<string, Handler> = {
   DOWNLOAD_DONE: handleDownloadDone,
   DOWNLOAD_ERROR: handleDownloadError,
   RESCAN: handleRescan,
+  GET_SETTINGS: handleGetSettings,
+  SAVE_SETTINGS: handleSaveSettings,
+  GET_HISTORY: handleGetHistory,
+  CLEAR_HISTORY: handleClearHistory,
+  REDOWNLOAD: handleRedownload,
+  START_BATCH: handleStartBatch,
+  GET_BATCH: handleGetBatch,
+  SAVE_BLOB_URL: handleSaveBlobUrl,
+  RELEASE_BLOB_URL: handleIgnored,
   JOB_UPDATED: handleIgnored,
   OFFSCREEN_DOWNLOAD: handleIgnored,
   OFFSCREEN_CANCEL: handleIgnored,

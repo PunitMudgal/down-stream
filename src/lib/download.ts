@@ -1,5 +1,10 @@
 import { extractHlsSegments } from "./parseHls";
+import { cleanTitle, sanitizeStem } from "./text";
 import type { MediaItem, NetReplay } from "./types";
+
+// Re-exported for existing callers (the helpers live in ./text so UI code can
+// use them without pulling the segment downloader into its bundle).
+export { cleanTitle, sanitizeStem } from "./text";
 
 export type ProgressCallback = (done: number, total: number, bytesDone?: number) => void;
 
@@ -55,31 +60,7 @@ export function recommendVariant<T extends { id: string; bandwidth?: number; cod
   return (fit ?? sorted[sorted.length - 1]).id;
 }
 
-/** Known site suffixes stripped from page/video titles for file naming. */
-const SITE_SUFFIX_RE =
-  /\s*[-–—|/]\s*(YouTube|X\s*\(Twitter\)|Twitter|Facebook|Instagram|TikTok|Vimeo|Dailymotion|Twitch|Rumble|Reddit|X)$/i;
-
-/** Trim + collapse whitespace, strip " - YouTube"-style suffixes. "" if unusable. */
-export function cleanTitle(raw: string | null | undefined, max = 100): string {
-  if (!raw) return "";
-  let s = raw.replace(/\s+/g, " ").trim();
-  s = s.replace(SITE_SUFFIX_RE, "").trim();
-  if (s.length < 3) return "";
-  return s.slice(0, max).trim();
-}
-
-/** Filesystem-safe stem (slashes become underscores — titles contain them). */
-export function sanitizeStem(raw: string, max = 100): string {
-  const s = raw
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/[. ]+$/, "");
-  if (!s) return "";
-  return s.slice(0, max).trim().replace(/[. ]+$/, "") || "";
-}
-
-function defaultExtForType(type: string): string {
+export function defaultExtForType(type: string): string {
   const t = type.toLowerCase();
   if (t === "hls") return "ts";
   if (t === "webm") return "webm";
@@ -142,12 +123,10 @@ export function pickManifestForBlob(items: MediaItem[]): MediaItem | undefined {
   return best;
 }
 
-/** Direct file: browser handles it natively (fallback when in-app fetch can't). */
-export async function downloadDirect(
-  url: string,
-  filename: string,
-): Promise<void> {
-  await chrome.downloads.download({ url, filename, saveAs: false });
+/** Direct file: browser handles it natively (fallback when in-app fetch can't).
+ *  Returns the chrome.downloads id so callers can reveal it in the folder. */
+export async function downloadDirect(url: string, filename: string): Promise<number> {
+  return chrome.downloads.download({ url, filename, saveAs: false });
 }
 
 /** Byte progress for single-stream direct downloads (received, total|0). */

@@ -1,12 +1,29 @@
 import { classify as classifyBare } from "./lib/classify";
 import { cleanTitle, filenameForUrl, sanitizeStem } from "./lib/download";
-import type { DownloadJobState, MediaItem, MediaType, MsSessionMeta, VideoSignal } from "./lib/types";
+import { basenameOf } from "./lib/filename";
+import { formatBytes, formatDuration, formatEta, formatProgressPair, formatSpeed } from "./lib/format";
+import type {
+  BatchSnapshot,
+  DownloadJobState,
+  MediaItem,
+  MediaType,
+  MsSessionMeta,
+  VideoSignal,
+} from "./lib/types";
 
 const listEl = document.getElementById("list") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 const rescanBtn = document.getElementById("rescan") as HTMLButtonElement;
 const searchEl = document.getElementById("search") as HTMLInputElement | null;
 const countEl = document.getElementById("count") as HTMLElement | null;
+const selectToggleBtn = document.getElementById("select-toggle") as HTMLButtonElement;
+const settingsBtn = document.getElementById("settings") as HTMLButtonElement;
+const batchEl = document.getElementById("batch") as HTMLElement;
+const batchCountEl = document.getElementById("batch-count") as HTMLElement;
+const batchStartBtn = document.getElementById("batch-start") as HTMLButtonElement;
+const batchAllBtn = document.getElementById("batch-all") as HTMLButtonElement;
+const batchClearBtn = document.getElementById("batch-clear") as HTMLButtonElement;
+const queueEl = document.getElementById("queue") as HTMLElement;
 
 let currentTabId: number | null = null;
 let currentHost = "";
@@ -14,6 +31,13 @@ let currentUrl = "";
 let workerAlive = false;
 let jobs: DownloadJobState[] = [];
 let totalCards = 0;
+
+/** Batch selection mode + which item URLs are ticked. */
+let selectMode = false;
+const selected = new Set<string>();
+/** Latest queue aggregate from the worker (drives the queue line). */
+let batchSnapshot: BatchSnapshot | null = null;
+let lastQueueActive = false;
 
 /** Inline SVG icons (no emoji, no remote assets — extension sandbox safe). */
 const ICONS: Record<string, string> = {
@@ -166,7 +190,7 @@ async function markRecommendedQuality(item: MediaItem, sel: HTMLSelectElement): 
     if (!opt || /Recommended/.test(opt.textContent ?? "")) return;
     opt.textContent = `${opt.textContent} — Recommended`;
     if (typeof res.bps === "number" && res.bps > 0) {
-      sel.title = `Based on a measured ${mbShort(res.bps)}/s connection`;
+      sel.title = `Based on a measured ${formatSpeed(res.bps)} connection`;
     }
   } catch {
     /* no recommendation is a normal outcome (cached/auth-gated/offline) */
@@ -301,11 +325,6 @@ async function scanPageDirect(tabId: number): Promise<{
   }
 }
 
-function mbShort(bytes: number): string {
-  if (bytes < 1_000_000) return `${Math.max(1, Math.round(bytes / 1000))} KB`;
-  return `${(bytes / 1_000_000).toFixed(1)} MB`;
-}
-
 /**
  * Capture sessions -> display items without any worker (same refusal rules
  * as the background: EME-tainted or DRM-page sessions are refused rows).
@@ -326,7 +345,7 @@ function domSessionsToItems(
     for (const t of s.tracks ?? []) {
       const url = `capture:${s.id}:${t.idx}`;
       const kindLabel = t.kind === "video" ? "video" : t.kind === "audio" ? "audio" : "track";
-      const sizeLabel = t.bytes > 0 ? ` • ${mbShort(t.bytes)}` : "";
+      const sizeLabel = t.bytes > 0 ? ` • ${formatBytes(t.bytes)}` : "";
       if (s.eme) {
         items.push({
           url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`,
@@ -372,14 +391,8 @@ function domSessionsToItems(
 function describeDomSignal(v: VideoSignal): string | undefined {
   const parts: string[] = [];
   if (v.width && v.height) parts.push(`${v.width}×${v.height}`);
-  if (v.duration != null && Number.isFinite(v.duration) && v.duration > 0) {
-    const s = Math.floor(v.duration);
-    parts.push(
-      s >= 3600
-        ? `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
-        : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`,
-    );
-  }
+  const duration = formatDuration(v.duration);
+  if (duration) parts.push(duration);
   if (v.paused === false) parts.push("playing");
   return parts.length ? parts.join(" • ") : undefined;
 }
@@ -486,7 +499,7 @@ function combinedLine(related: DownloadJobState[], direct: boolean): { label: st
     const anyRunning = active.some((j) => j.status === "running");
     const segs = active.map((j) => `${j.done}/${j.total}`).join(" + ");
     const bytes = active.reduce((n, j) => n + (j.bytesDone ?? 0), 0);
-    const mb = bytes > 0 ? ` • ${(bytes / 1_000_000).toFixed(1)} MB` : "";
+    const mb = bytes > 0 ? ` • ${formatBytes(bytes)}` : "";
     const tail = "(safe to close popup)";
     if (!anyRunning) return { label: `Paused (${segs} segments) — resume to continue.`, state: "paused" };
     return { label: `Fetching 2 parts… ${segs} segments${mb} ${tail}`, state: "running" };
@@ -503,40 +516,27 @@ function combinedLine(related: DownloadJobState[], direct: boolean): { label: st
   return jobLine(job, direct);
 }
 
-function mbPair(done: number, total: number): string {
-  const f = (b: number) =>
-    b < 1_000_000 ? `${Math.max(0, Math.round(b / 1000))} KB` : `${(b / 1_000_000).toFixed(1)} MB`;
-  return total > 0 ? `${f(done)}/${f(total)}` : f(done);
-}
-
-function formatSpeed(bps: number): string {
-  if (!Number.isFinite(bps) || bps <= 0) return "";
-  if (bps < 1_000_000) return `${Math.max(1, Math.round(bps / 1000))} KB/s`;
-  return `${(bps / 1_000_000).toFixed(1)} MB/s`;
-}
-
-function formatEta(sec: number): string {
-  if (!Number.isFinite(sec) || sec < 0) return "";
-  const s = Math.round(sec);
-  if (s < 5) return "~a few sec left";
-  if (s < 60) return `~${s}s left`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `~${m}m ${s % 60}s left`;
-  return `~${Math.floor(m / 60)}h ${m % 60}m left`;
-}
-
-/** Speed + ETA from bytesDone/startedAt; segment-average estimates the remainder. */
+/**
+ * Speed + ETA for the progress line. Prefers the worker's rolling rate
+ * (`rateBps`, a short sliding window) so the number reflects the transfer right
+ * now; falls back to a cumulative average for rows from older sessions. ETA is
+ * exact for byte streams and an average-segment extrapolation for playlists.
+ */
 function speedEta(job: DownloadJobState): string {
   const bytes = job.bytesDone ?? 0;
-  const start = job.startedAt ?? job.updatedAt ?? Date.now();
-  const elapsed = Math.max(1, (Date.now() - start) / 1000);
   if (bytes < 50_000) return "";
-  const speed = bytes / elapsed;
-  const speedStr = formatSpeed(speed);
-  if (!speedStr || job.done < 3 || job.total <= job.done) return speedStr ? ` • ${speedStr}` : "";
-  const avg = bytes / Math.max(1, job.done);
-  const remainingBytes = avg * (job.total - job.done);
-  const eta = formatEta(remainingBytes / Math.max(1, speed));
+  const elapsed = Math.max(1, (Date.now() - (job.startedAt ?? job.updatedAt ?? Date.now())) / 1000);
+  const rate = job.rateBps && job.rateBps > 0 ? job.rateBps : bytes / elapsed;
+  const speedStr = formatSpeed(rate);
+  if (!speedStr) return "";
+  let remaining: number | undefined;
+  if (job.unit === "bytes") {
+    if (job.total > 0) remaining = Math.max(0, job.total - (job.bytesDone ?? job.done));
+  } else if (job.done >= 2 && job.total > job.done) {
+    remaining = (bytes / job.done) * (job.total - job.done);
+  }
+  if (remaining == null || remaining <= 0) return ` • ${speedStr}`;
+  const eta = formatEta(remaining / rate);
   return ` • ${speedStr}${eta ? ` • ${eta}` : ""}`;
 }
 
@@ -549,25 +549,21 @@ function runningText(job: DownloadJobState): string {
   if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
     if (job.stage === "assembling") return `Assembling capture… ${tail}`;
     if (job.stage === "saving") return `Saving download… ${tail}`;
-    return `Capturing… ${mbPair(job.done, job.total)} ${tail}`;
+    return `Capturing… ${formatProgressPair(job.done, job.total)} ${tail}`;
   }
   // Direct single-stream downloads report raw bytes (done/total are bytes,
   // total may be 0 when the server omits content-length).
   if (job.unit === "bytes") {
     if (job.stage === "assembling") return `Assembling file… ${tail}`;
     if (job.stage === "saving") return `Saving download… ${tail}`;
-    const f = (b: number): string =>
-      b < 1_000_000 ? `${Math.max(0, Math.round(b / 1000))} KB` : `${(b / 1_000_000).toFixed(1)} MB`;
-    const have = f(job.bytesDone ?? job.done);
-    const want = job.total > 0 ? `/${f(job.total)}` : "";
+    const have = formatBytes(job.bytesDone ?? job.done);
+    const want = job.total > 0 ? `/${formatBytes(job.total)}` : "";
     return `Downloading… ${have}${want}${speedEta(job)} ${tail}`;
   }
   if (job.stage === "assembling") return `Assembling file… ${tail}`;
   if (job.stage === "saving") return `Saving download… ${tail}`;
   if (job.total > 1) {
-    const mb = job.bytesDone && job.bytesDone > 0
-      ? ` • ${(job.bytesDone / 1_000_000).toFixed(1)} MB`
-      : "";
+    const mb = job.bytesDone && job.bytesDone > 0 ? ` • ${formatBytes(job.bytesDone)}` : "";
     return `Fetching… ${job.done}/${job.total} segments${mb}${speedEta(job)} ${tail}`;
   }
   return `Downloading… ${tail}`;
@@ -580,6 +576,11 @@ async function loadMedia(): Promise<void> {
   totalCards = 0;
   updateCount();
   workerAlive = false;
+  selected.clear();
+  batchSnapshot = null;
+  lastQueueActive = false;
+  renderQueue();
+  updateBatchBar();
 
   // 1. Find the tab; bail early on pages extensions can't touch.
   let id: number | null;
@@ -877,10 +878,172 @@ function showFatal(message: string): void {
   listEl.appendChild(div);
 }
 
+// ---- batch selection ------------------------------------------------------
+
+/** Items that make sense in a batch: real downloads, never DRM or blob rows. */
+function isSelectable(item: MediaItem): boolean {
+  if (item.drmProtected || item.type === "blob") return false;
+  if (item.type === "hls" || item.type === "dash") return (item.variants?.length ?? 0) > 0;
+  if (item.type === "segments") return (item.segments?.length ?? 0) > 0;
+  return true;
+}
+
+function cards(): HTMLElement[] {
+  return Array.from(listEl.querySelectorAll<HTMLElement>(".card[data-item-url]"));
+}
+
+function cardFor(url: string): HTMLElement | null {
+  return listEl.querySelector<HTMLElement>(`[data-item-url="${CSS.escape(url)}"]`);
+}
+
+function updateBatchBar(): void {
+  if (!selectMode) return;
+  const n = selected.size;
+  batchCountEl.textContent =
+    n === 0 ? "Select videos to download together" : `${n} selected`;
+  batchStartBtn.disabled = n === 0;
+  batchStartBtn.textContent = n > 0 ? `Download ${n} selected` : "Download selected";
+}
+
+function setSelectMode(on: boolean): void {
+  selectMode = on;
+  selectToggleBtn.setAttribute("aria-pressed", String(on));
+  batchEl.hidden = !on;
+  if (!on) selected.clear();
+  for (const card of cards()) {
+    const pick = card.querySelector<HTMLInputElement>("input.pick");
+    if (!pick) continue;
+    pick.hidden = !on;
+    pick.checked = selected.has(card.dataset.itemUrl ?? "");
+    card.classList.toggle("pickable", on);
+    card.classList.toggle("selected", pick.checked);
+  }
+  if (on) setStatus("Pick the videos you want, then hit Download selected. They queue 2 at a time.");
+  updateBatchBar();
+}
+
+function toggleSelected(url: string, on: boolean): void {
+  if (on) selected.add(url);
+  else selected.delete(url);
+  const card = cardFor(url);
+  if (card) {
+    card.classList.toggle("selected", on);
+    const pick = card.querySelector<HTMLInputElement>("input.pick");
+    if (pick) pick.checked = on;
+  }
+  updateBatchBar();
+}
+
+function renderQueue(): void {
+  const snap = batchSnapshot;
+  if (!snap || !snap.active) {
+    queueEl.hidden = true;
+    return;
+  }
+  const parts = [`${snap.running} downloading`, `${snap.queued} waiting`];
+  if (snap.done) parts.push(`${snap.done} done`);
+  if (snap.failed) parts.push(`${snap.failed} failed`);
+  queueEl.textContent = `Queue: ${parts.join(" • ")}`;
+  queueEl.hidden = false;
+}
+
+/** Poll the worker's queue aggregate while a batch is in flight. */
+async function pollQueue(): Promise<void> {
+  try {
+    const res = (await chrome.runtime.sendMessage({ type: "GET_BATCH" })) as
+      | { ok?: boolean; snapshot?: BatchSnapshot }
+      | undefined;
+    if (!res?.ok || !res.snapshot) return;
+    batchSnapshot = res.snapshot;
+    renderQueue();
+    if (lastQueueActive && !batchSnapshot.active) {
+      const { done, total, failed } = batchSnapshot;
+      setStatus(`Batch finished: ${done}/${total} saved${failed ? `, ${failed} failed` : ""}.`);
+      batchStartBtn.disabled = selected.size === 0;
+      void refreshJobs();
+    }
+    lastQueueActive = batchSnapshot.active;
+  } catch {
+    /* worker restarting — keep the last known state */
+  }
+}
+
+/** Re-read job rows and repaint (used after a batch starts/finishes). */
+async function refreshJobs(): Promise<void> {
+  if (currentTabId == null) return;
+  try {
+    const res = await withTimeout(
+      chrome.runtime.sendMessage({ type: "GET_JOBS", tabId: currentTabId }),
+      5000,
+      "Reading download jobs",
+    );
+    jobs = (res?.jobs ?? []) as DownloadJobState[];
+    for (const j of jobs) refreshCard(j.itemUrl);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Queue every ticked video; the worker runs them a few at a time. */
+async function startBatch(): Promise<void> {
+  if (currentTabId == null) {
+    setStatus("No active tab found.");
+    return;
+  }
+  if (selected.size === 0) return;
+  const items = [...selected].map((url) => ({
+    itemUrl: url,
+    variantId: cardFor(url)?.querySelector<HTMLSelectElement>("select")?.value,
+  }));
+  batchStartBtn.disabled = true;
+  try {
+    const res = (await withTimeout(
+      chrome.runtime.sendMessage({ type: "START_BATCH", tabId: currentTabId, items }),
+      15000,
+      "Starting batch",
+    )) as { ok?: boolean; error?: string; snapshot?: BatchSnapshot } | undefined;
+    if (!res?.ok) {
+      setStatus(`Batch failed: ${res?.error ?? "unknown error"}`);
+      batchStartBtn.disabled = false;
+      return;
+    }
+    batchSnapshot = res.snapshot ?? null;
+    lastQueueActive = batchSnapshot?.active ?? false;
+    renderQueue();
+    setStatus(
+      `Queued ${items.length} download${items.length > 1 ? "s" : ""} — running ${batchSnapshot?.concurrency ?? 2} at a time. You can close this popup.`,
+    );
+    window.setTimeout(() => void refreshJobs(), 700);
+  } catch (err) {
+    setStatus(`Batch failed: ${err instanceof Error ? err.message : String(err)}`);
+    batchStartBtn.disabled = false;
+  }
+}
+
 function renderCard(item: MediaItem): HTMLElement {
   const card = document.createElement("div");
   card.className = "card";
   card.dataset.itemUrl = item.url;
+
+  if (isSelectable(item)) {
+    card.dataset.selectable = "1";
+    card.classList.toggle("pickable", selectMode);
+    const pick = document.createElement("input");
+    pick.type = "checkbox";
+    pick.className = "pick";
+    pick.hidden = !selectMode;
+    pick.checked = selected.has(item.url);
+    pick.setAttribute("aria-label", `Select ${item.title ?? item.type} for batch download`);
+    pick.onchange = () => toggleSelected(item.url, pick.checked);
+    // In select mode the whole card is a big tap target (except its controls).
+    card.addEventListener("click", (e) => {
+      if (!selectMode) return;
+      if ((e.target as HTMLElement).closest("button, select, input, a")) return;
+      pick.checked = !pick.checked;
+      toggleSelected(item.url, pick.checked);
+    });
+    card.appendChild(pick);
+  }
 
   if (item.poster) {
     const img = document.createElement("img");
@@ -1346,12 +1509,10 @@ async function handleStartDownload(
             ? "Merging video + audio into one file with sound — you can close this popup."
             : res.paired
               ? "Downloading video + audio as 2 files (this stream can't be merged in-app) — you can close this popup."
-              : `Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`,
+              : `Download running in background for ${basenameOf(job.filename)} — you can close this popup.`,
         );
       } else {
-        setStatus(
-          `Download running in background for ${item.filename || filenameForUrl(item.url, item.type)} — you can close this popup.`,
-        );
+        setStatus(`Download running in background for ${basenameOf(job.filename)} — you can close this popup.`);
       }
       refreshCard(item.url);
       return;
@@ -1407,16 +1568,41 @@ chrome.runtime.onMessage.addListener((msg) => {
   return false;
 });
 
-// 1s ticker so speed/ETA on running jobs stays live even between segments.
+// 1s ticker so speed/ETA on running jobs stays live even between segments,
+// and the batch queue aggregate stays current alongside the cards.
 setInterval(() => {
   try {
     for (const j of jobs) {
       if (j.status === "running" || j.status === "paused") refreshCard(j.itemUrl);
     }
+    if (batchSnapshot?.active) void pollQueue();
   } catch {
     /* ignore */
   }
 }, 1000);
+
+selectToggleBtn.onclick = () => setSelectMode(!selectMode);
+
+settingsBtn.onclick = () => {
+  try {
+    void chrome.runtime.openOptionsPage();
+  } catch (err) {
+    setStatus(`Could not open settings: ${err instanceof Error ? err.message : String(err)}`);
+  }
+};
+
+batchStartBtn.onclick = () => void startBatch();
+
+batchAllBtn.onclick = () => {
+  for (const card of cards()) {
+    if (card.hidden || card.dataset.selectable !== "1") continue;
+    toggleSelected(card.dataset.itemUrl ?? "", true);
+  }
+};
+
+batchClearBtn.onclick = () => {
+  for (const url of [...selected]) toggleSelected(url, false);
+};
 
 rescanBtn.onclick = () => {
   void (async () => {

@@ -131,8 +131,20 @@ export type RuntimeMessage =
       dataUrl: string;
       filename: string;
     }
-  /** Offscreen saved the file itself (anchor download) — no bytes moved. */
-  | { type: "DOWNLOAD_DONE"; jobId: string; filename: string; note?: string }
+  /** Offscreen saved the file itself (chooser/anchor download) — no bytes moved. */
+  | { type: "DOWNLOAD_DONE"; jobId: string; filename: string; note?: string; downloadId?: number }
+  // --- Settings, history and batch (options page + popup) ---
+  | { type: "GET_SETTINGS" }
+  | { type: "SAVE_SETTINGS"; settings: Record<string, unknown> }
+  | { type: "GET_HISTORY" }
+  | { type: "CLEAR_HISTORY" }
+  | { type: "REDOWNLOAD"; entryId: string }
+  | { type: "START_BATCH"; tabId: number; items: Array<{ itemUrl: string; variantId?: string }> }
+  | { type: "GET_BATCH" }
+  /** Offscreen -> worker: save an assembled Blob via chrome.downloads (folder-aware). */
+  | { type: "SAVE_BLOB_URL"; jobId: string; blobUrl: string; filename: string }
+  /** Worker -> offscreen: the download finished, release the blob URL. */
+  | { type: "RELEASE_BLOB_URL"; blobUrl: string }
   | { type: "DOWNLOAD_ERROR"; jobId: string; error: string; expired?: boolean; fallbackDirect?: boolean }
   | { type: "JOB_UPDATED"; job: DownloadJobState };
 
@@ -222,6 +234,29 @@ export interface MsSessionMeta {
   pageEme: boolean;
 }
 
+export type BatchStatus = "queued" | "running" | "done" | "failed";
+
+/** One queued/active batch download (popup shows the aggregate). */
+export interface BatchTaskState {
+  itemUrl: string;
+  title?: string;
+  filename?: string;
+  status: BatchStatus;
+  error?: string;
+}
+
+/** Aggregate queue progress for the popup's batch bar. */
+export interface BatchSnapshot {
+  total: number;
+  queued: number;
+  running: number;
+  done: number;
+  failed: number;
+  concurrency: number;
+  active: boolean;
+  tasks: BatchTaskState[];
+}
+
 export interface DownloadJobState {
   jobId: string;
   tabId: number;
@@ -235,8 +270,18 @@ export interface DownloadJobState {
   unit?: "segments" | "bytes";
   /** Bytes assembled so far (for speed/ETA). Segments vary in size. */
   bytesDone?: number;
+  /** Rolling transfer rate in bytes/second (worker-computed sliding window). */
+  rateBps?: number;
   /** Wall-clock start of the job (for speed calc). */
   startedAt?: number;
+  /** Display title of the source video (history rows). */
+  title?: string;
+  /** Page the video was detected on (re-download resolution). */
+  pageUrl?: string;
+  /** Human quality label of the chosen variant, e.g. "1080p" (history rows). */
+  quality?: string;
+  /** Media type of the source item (history rows). */
+  mediaType?: MediaType;
   stage?: DownloadJobStage;
   downloadId?: number;
   error?: string;

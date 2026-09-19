@@ -10,8 +10,10 @@ import type { MediaType } from "./lib/types";
 import { clearClustersForTab } from "./bg/clusters";
 import { onHeadersReceived } from "./bg/detection";
 import { clearHeadersForTab, onSendHeaders } from "./bg/headers";
-import { markInterruptedJobs, ensureItemForUrl, startDownload } from "./bg/jobs";
+import { markInterruptedJobs, maybeCloseOffscreen, ensureItemForUrl, startDownload } from "./bg/jobs";
 import { isExcludedUrl, updateBadge, updateBadgeForActiveTab } from "./bg/media";
+import { wireNotifications } from "./bg/notifications";
+import { onDownloadChanged } from "./bg/saves";
 import { routeMessage } from "./bg/router";
 import { forgetTabMedia, getTabItems, jobMemory, lastUrlByTab, persistTab } from "./bg/store";
 import { pickBestTabItem, pickCandidateItem, looksLikeBlobPlayer } from "./lib/target";
@@ -180,6 +182,18 @@ chrome.runtime.onInstalled.addListener(() => {
   } catch {
     /* menu API unavailable */
   }
+});
+
+// Completion notifications ("Show in folder") for finished downloads.
+wireNotifications();
+
+// A tracked blob download finishing lets the offscreen document release the
+// blob URL (and possibly close once nothing else is running).
+safeWire("downloads.onChanged", () => {
+  chrome.downloads.onChanged.addListener((delta) => {
+    onDownloadChanged(delta);
+    void maybeCloseOffscreen();
+  });
 });
 
 safeWire("tabs", () => {
