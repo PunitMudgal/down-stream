@@ -829,6 +829,45 @@ async function driveBlobDownload(jobId: string, blobUrl: string, filename: strin
   }
 }
 
+// ---- page-context manifest access ----------------------------------------
+// The worker's fetch is a chrome-extension:// request: it cannot present the
+// page's Referer/Origin/Sec-Fetch-* headers, its cookie jar, or its network
+// fingerprint — and token-gated CDNs answer that with 403/404 even while the
+// video plays fine. So we go through the page itself, in two steps:
+//   1. reuse the playlist bytes the player already downloaded (no request);
+//   2. otherwise have the MAIN world fetch it — a request the CDN has already
+//      proven it accepts.
+
+/** Playlist bytes the page's own player already fetched (no network). */
+async function pageCapturedManifest(url: string): Promise<string | undefined> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = (await askHook({ __vdg: "manifest-text", url }, 900)) as any;
+    if (
+      res?.__vdg === "manifest-text-result" &&
+      res.found === true &&
+      typeof res.text === "string" &&
+      res.text.length > 0
+    ) {
+      return res.text;
+    }
+  } catch {
+    /* hook absent (older injection, odd frame) — fall through */
+  }
+  return undefined;
+}
+
+/** Fetch from the page's JS world: the request context the site itself uses. */
+async function pageWorldFetch(url: string): Promise<{ text: string; truncated: boolean }> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const res = (await askHook({ __vdg: "page-fetch", url }, 13_000)) as any;
+  if (res?.__vdg !== "page-fetch-result") throw new Error("Page fetch unavailable on this page.");
+  if (!res?.ok) {
+    throw new Error(res?.status ? `Page fetch failed (${res.status})` : String(res?.error ?? "Page fetch failed"));
+  }
+  return { text: String(res.text ?? ""), truncated: res.truncated === true };
+}
+
 // Popup paths + worker helpers. FETCH_TEXT runs with the page's cookie jar,
 // so auth-walled manifests unreachable from the worker can still be parsed.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -938,18 +977,59 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (m?.type === "FETCH_TEXT" && typeof m.url === "string") {
     void (async () => {
+      const url = String(m.url);
+      const reply = (payload: object): void => {
+        try {
+          sendResponse(payload);
+        } catch {
+          /* popup gone */
+        }
+      };
+      const ok = (text: string, source: string): void => {
+        if (text.length > MAX_FETCH_BYTES) reply({ ok: true, text: "", truncated: true });
+        else reply({ ok: true, text, source });
+      };
       try {
-        const res = await fetch(m.url, { credentials: "include" });
-        if (!res.ok) {
-          sendResponse({ ok: false, error: `Page fetch failed (${res.status})` });
+        // 1. The player already loaded this playlist — reuse those exact bytes.
+        const captured = await pageCapturedManifest(url);
+        if (captured !== undefined) {
+          ok(captured, "page-capture");
           return;
         }
-        const text = await res.text();
-        if (text.length > MAX_FETCH_BYTES) {
-          sendResponse({ ok: true, text: "", truncated: true });
+        if (m.captureOnly === true) {
+          // Cheap probe: the worker asks this first because it costs no
+          // network at all when the player has the playlist in hand.
+          reply({ ok: false, error: "No captured copy in the page." });
           return;
         }
-        sendResponse({ ok: true, text });
+        // 2. Page-world fetch: the site's own request context (cookies,
+        //    Referer, Origin, Sec-Fetch-*, fingerprint).
+        try {
+          const page = await pageWorldFetch(url);
+          if (page.truncated) {
+            reply({ ok: false, error: "Manifest too large to parse (>5 MB)." });
+            return;
+          }
+          ok(page.text, "page-world");
+          return;
+        } catch (pageErr) {
+          // 3. Isolated-world fetch (extension-origin request, host permission):
+          //    weaker context, but occasionally the only thing that works.
+          try {
+            const res = await fetch(url, { credentials: "include" });
+            if (!res.ok) throw new Error(`Page fetch failed (${res.status})`);
+            ok(await res.text(), "page-isolated");
+            return;
+          } catch (isolatedErr) {
+            throw new Error(
+              pageErr instanceof Error && pageErr.message
+                ? `${pageErr.message}; ${isolatedErr instanceof Error ? isolatedErr.message : String(isolatedErr)}`
+                : isolatedErr instanceof Error
+                  ? isolatedErr.message
+                  : String(isolatedErr),
+            );
+          }
+        }
       } catch (err) {
         noteDead(err);
         try {

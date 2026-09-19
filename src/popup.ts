@@ -51,6 +51,58 @@ const ICONS: Record<string, string> = {
     '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
 };
 
+/**
+ * Failed state row. `retry` adds a button that re-reads the manifest forcing a
+ * fresh attempt — the worker tries the page's own request context first, which
+ * is the path that works on Referer/Origin/token-gated CDNs.
+ */
+function errorRow(message: string, retry?: MediaItem): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "error";
+  const text = document.createElement("span");
+  text.className = "error-text";
+  text.textContent = message;
+  row.appendChild(text);
+  if (retry) {
+    const btn = document.createElement("button");
+    btn.className = "retry-btn";
+    btn.textContent = "Retry";
+    btn.title = "Read the stream list again using this page's own session";
+    btn.onclick = () => void retryParseManifest(retry, btn, text);
+    row.appendChild(btn);
+  }
+  return row;
+}
+
+/** Re-read one item's manifest (fresh read) and repaint on success. */
+async function retryParseManifest(
+  item: MediaItem,
+  btn: HTMLButtonElement,
+  label: HTMLElement,
+): Promise<void> {
+  if (currentTabId == null) return;
+  btn.disabled = true;
+  label.textContent = "Re-reading the stream list…";
+  try {
+    const res = (await withTimeout(
+      chrome.runtime.sendMessage({ type: "RETRY_PARSE", tabId: currentTabId, itemUrl: item.url }),
+      25000,
+      "Retry",
+    )) as { ok?: boolean; error?: string } | undefined;
+    if (res?.ok) {
+      setStatus("Stream list loaded.");
+      await loadMedia();
+      return;
+    }
+    label.textContent =
+      res?.error ?? "Still unreadable — play the video for a few seconds, then Retry again.";
+  } catch (err) {
+    label.textContent = `Retry failed: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function iconSpan(name: string, cls: string): HTMLElement {
   const s = document.createElement("span");
   s.className = cls;
@@ -1113,13 +1165,8 @@ function renderCard(item: MediaItem): HTMLElement {
   // Searchable text for the toolbar filter (title + url + type).
   card.dataset.search = `${item.title ?? ""} ${item.url} ${item.type}`.toLowerCase();
 
-  if (item.error && !item.variants?.length && !isDirect(item)) {
-    const e = document.createElement("div");
-    e.className = "error";
-    e.textContent = item.error;
-    meta.appendChild(e);
-  }
-
+  // One error row per card: the type branches below render their own state
+  // (previously a failed HLS row painted the same message twice).
   if (item.drmProtected) {
     const p = document.createElement("div");
     p.className = "protected";
@@ -1133,10 +1180,9 @@ function renderCard(item: MediaItem): HTMLElement {
     meta.appendChild(btn);
   } else if (item.type === "hls" || item.type === "dash") {
     if (!item.variants || item.variants.length === 0) {
-      const note = document.createElement("div");
-      note.className = "error";
-      note.textContent = item.error ?? "Parsing manifest… reopen popup in a moment.";
-      meta.appendChild(note);
+      meta.appendChild(
+        errorRow(item.error ?? "Parsing manifest… reopen popup in a moment.", item),
+      );
     } else {
       // Best quality first, preselected — one click downloads the best.
       const ordered = sortVariants(item.variants);
@@ -1173,10 +1219,9 @@ function renderCard(item: MediaItem): HTMLElement {
   } else if (item.type === "segments") {
     const n = item.segments?.length ?? 0;
     if (n === 0) {
-      const note = document.createElement("div");
-      note.className = "error";
-      note.textContent = item.error ?? "Grouped player chunks expired — play the video, then Rescan.";
-      meta.appendChild(note);
+      meta.appendChild(
+        errorRow(item.error ?? "Grouped player chunks expired — play the video, then Rescan."),
+      );
     } else {
       const btn = document.createElement("button");
       btn.className = "dl";
@@ -1193,10 +1238,10 @@ function renderCard(item: MediaItem): HTMLElement {
     btn.onclick = () => void handleStartDownload(item, undefined, btn);
     meta.appendChild(btn);
   } else if (item.type === "blob") {
-    const note = document.createElement("div");
-    note.className = "error";
-    note.textContent = item.error ?? "Blob stream — not directly downloadable.";
-    meta.appendChild(note);
+    meta.appendChild(errorRow(item.error ?? "Blob stream — not directly downloadable."));
+  } else if (item.error) {
+    // Any other type that failed to resolve — surface it rather than hide it.
+    meta.appendChild(errorRow(item.error));
   }
 
   // Group quality select + download into one action row (styled via .actions).

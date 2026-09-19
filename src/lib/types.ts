@@ -63,6 +63,7 @@ export type RuntimeMessage =
   | { type: "PING" }
   | { type: "GET_MEDIA"; tabId: number }
   | { type: "RESCAN"; tabId: number }
+  | { type: "RETRY_PARSE"; tabId: number; itemUrl: string }
   | {
       type: "VIDEO_ELEMENTS";
       tabId: number;
@@ -106,7 +107,7 @@ export type RuntimeMessage =
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
   | { type: "OFFSCREEN_PAUSE"; jobId: string }
   | { type: "OFFSCREEN_RESUME"; jobId: string }
-  | { type: "FETCH_TEXT"; tabId: number; url: string }
+  | { type: "FETCH_TEXT"; tabId: number; url: string; captureOnly?: boolean }
   // --- MSE capture transfer (content script <-> hook <-> offscreen) ---
   | { type: "MS_DOWNLOAD"; jobId: string; captureId: string; trackIdx: number; filename: string; pairTrackIdx?: number }
   | { type: "MS_CANCEL"; jobId: string }

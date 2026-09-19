@@ -8,7 +8,7 @@ import { appendHistory, clearHistory, entryFromJob, getHistoryEntry, loadHistory
 import { getSettings, normalizeSettings, saveSettings } from "../lib/settings";
 import type { DownloadJobState, MediaItem, NetReplay } from "../lib/types";
 import { lookupNet } from "./headers";
-import { fetchManifestText } from "./manifests";
+import { fetchManifestText, parseStreamingItem } from "./manifests";
 import { ensureOffscreen, maybeCloseOffscreen, newJobId, redownloadHistoryEntry, startDownload } from "./jobs";
 import { notifyDownloadComplete } from "./notifications";
 import { batchQueue } from "./queue";
@@ -442,6 +442,26 @@ async function handleDownloadError(m: AnyMsg): Promise<unknown> {
   return { ok: true };
 }
 
+/**
+ * Retry one item's manifest read (popup "Retry" on a failed row). The read is
+ * forced past the cache so a fresh page-context fetch is attempted — the layer
+ * that actually works on Referer/Origin/token-gated CDNs.
+ */
+async function handleRetryParse(m: AnyMsg): Promise<unknown> {
+  if (typeof m.tabId !== "number" || typeof m.itemUrl !== "string") {
+    return { ok: false, error: "Unknown message" };
+  }
+  const items = getMemoryItems(m.tabId) ?? (await getTabItems(m.tabId));
+  const item = items.find((x) => x.url === m.itemUrl);
+  if (!item) return { ok: false, error: "Video no longer listed for this tab." };
+  await parseStreamingItem(m.tabId, item, { forceNetwork: true });
+  const after =
+    (getMemoryItems(m.tabId) ?? (await getTabItems(m.tabId))).find((x) => x.url === m.itemUrl) ??
+    item;
+  if (after.error && !after.variants?.length) return { ok: false, error: after.error };
+  return { ok: true, item: after };
+}
+
 async function handleRescan(m: AnyMsg): Promise<unknown> {
   if (typeof m.tabId !== "number") return { ok: false, error: "Unknown message" };
   // Ask the content script to re-collect <video> elements (covers
@@ -613,6 +633,7 @@ const HANDLERS: Record<string, Handler> = {
   DOWNLOAD_DONE: handleDownloadDone,
   DOWNLOAD_ERROR: handleDownloadError,
   RESCAN: handleRescan,
+  RETRY_PARSE: handleRetryParse,
   GET_SETTINGS: handleGetSettings,
   SAVE_SETTINGS: handleSaveSettings,
   GET_HISTORY: handleGetHistory,

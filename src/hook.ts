@@ -16,6 +16,10 @@
  * - MSE byte capture is hard-capped per track and per session count, stops
  *   copying the moment a cap hits (pure passthrough afterwards), and frees
  *   buffered bytes as soon as a session is known DRM-tainted.
+ * - Playlist (m3u8/mpd) bodies the page itself loads are kept (bounded count,
+ *   chars, TTL, inflight/rate budget) so the extension can reuse the exact
+ *   bytes the CDN served the page instead of re-fetching them — and, when
+ *   asked, this world performs the fetch itself with the page's own context.
  */
 import { extractMediaFileUrls } from "./lib/apiUrls";
 
@@ -172,54 +176,63 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
   }
 
   /**
-   * Bounded body peek: reads at most MAX_BODY chars within PEEK_TIME_MS,
-   * then cancels the clone. The page's original response is untouched and
-   * long-lived streams can never stall us — we take a prefix and walk away.
+   * Bounded body peek: reads at most `maxChars` chars within `budgetMs`, then
+   * cancels the clone. The page's original response is untouched and long-lived
+   * streams can never stall us — we take a prefix and walk away. `truncated`
+   * says whether the prefix is incomplete (cap hit or budget blown).
    */
-  function peekText(res: Response): Promise<string> {
+  function peekBody(
+    res: Response,
+    maxChars: number,
+    budgetMs: number,
+  ): Promise<{ text: string; truncated: boolean }> {
     return new Promise((resolve) => {
       let out = "";
       let settled = false;
-      const finish = (t: string): void => {
+      let timedOut = false;
+      const finish = (truncated: boolean): void => {
         if (!settled) {
           settled = true;
-          resolve(t);
+          resolve({ text: out, truncated });
         }
       };
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       try {
         const body = res.clone().body;
         if (!body) {
-          finish("");
+          finish(false);
           return;
         }
         reader = body.getReader();
       } catch {
-        finish("");
+        finish(false);
         return;
       }
       const r = reader;
       const timer = setTimeout(() => {
+        timedOut = true;
         try {
           r.cancel();
         } catch {
           /* ignore */
         }
-        finish(out);
-      }, PEEK_TIME_MS);
+        finish(true);
+      }, budgetMs);
       const dec = new TextDecoder();
       (async () => {
+        let capped = false;
         try {
           for (;;) {
             const { done, value } = await r.read();
             if (done) break;
             out += dec.decode(value, { stream: true });
-            if (out.length >= MAX_BODY) {
-              out = out.slice(0, MAX_BODY);
+            if (out.length >= maxChars) {
+              out = out.slice(0, maxChars);
+              capped = true;
               break;
             }
           }
-          out += dec.decode();
+          if (!capped) out += dec.decode();
         } catch {
           /* partial prefix is fine */
         }
@@ -229,10 +242,215 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
         } catch {
           /* ignore */
         }
-        finish(out);
+        finish(capped || timedOut);
       })();
     });
   }
+
+  /** Inspect a prefix of a response body (URL sniffing). */
+  function peekText(res: Response): Promise<string> {
+    return peekBody(res, MAX_BODY, PEEK_TIME_MS).then((r) => r.text);
+  }
+
+  // ---- manifest body capture --------------------------------------------
+  // The player has already downloaded every playlist it needs, with exactly
+  // the cookies/Referer/Origin/fingerprint the CDN accepts. Re-fetching the
+  // same URL from the extension is what fails (403/404 on most token-gated
+  // CDNs), so we keep the bytes the page itself received and hand those to the
+  // extension instead. Bounded: a handful of playlists, a hard char cap, a TTL,
+  // and its own inflight/rate budget so page traffic is never slowed.
+  const MANIFEST_PATH_RE = /\.(m3u8|mpd)(?:$|[?#])/i;
+  /** Playlist served under a disguised/extensionless path. */
+  const PLAYLIST_CT_RE = /(mpegurl|dash\+xml|vnd\.apple\.mpegurl)/i;
+  const MANIFEST_MAX_ENTRIES = 8;
+  const MANIFEST_MAX_CHARS = 2_000_000;
+  const MANIFEST_MAX_AGE_MS = 10 * 60_000;
+  const MANIFEST_PEEK_BUDGET_MS = 4000;
+  // A master plus its variant playlists can load in parallel: allow two.
+  const MANIFEST_MAX_INFLIGHT = 2;
+  const MANIFEST_MAX_PER_WINDOW = 12;
+  const MANIFEST_WINDOW_MS = 10_000;
+  let manifestInflight = 0;
+  let manifestWindowStart = Date.now();
+  let manifestWindowCount = 0;
+
+  interface ManifestEntry {
+    url: string;
+    text: string;
+    at: number;
+    /** Path-alias entry: the query string differed from the request. */
+    alias: boolean;
+  }
+  const manifests = new Map<string, ManifestEntry>();
+  /** path-alias -> the distinct URLs captured for it (ambiguity guard). */
+  const manifestPaths = new Map<string, Set<string>>();
+
+  function manifestAllowed(): boolean {
+    const now = Date.now();
+    if (now - manifestWindowStart > MANIFEST_WINDOW_MS) {
+      manifestWindowStart = now;
+      manifestWindowCount = 0;
+    }
+    if (manifestInflight >= MANIFEST_MAX_INFLIGHT || manifestWindowCount >= MANIFEST_MAX_PER_WINDOW) {
+      return false;
+    }
+    manifestWindowCount++;
+    return true;
+  }
+
+  /** Query-stripped identity: playlist tokens rotate, the path does not. */
+  function manifestAlias(url: string): string {
+    try {
+      const u = new URL(url);
+      return `${u.origin}${u.pathname}`.toLowerCase();
+    } catch {
+      return url;
+    }
+  }
+
+  function pruneManifests(now: number): void {
+    let dropped = false;
+    manifests.forEach((e, k) => {
+      if (now - e.at > MANIFEST_MAX_AGE_MS) {
+        manifests.delete(k);
+        dropped = true;
+      }
+    });
+    if (!dropped) return;
+    // Keep the ambiguity guard in step with the live entries.
+    manifestPaths.forEach((urls, path) => {
+      urls.forEach((u) => {
+        if (!manifests.has(u)) urls.delete(u);
+      });
+      if (!urls.size) manifestPaths.delete(path);
+    });
+  }
+
+  function recordManifest(url: string, text: string): void {
+    if (!text || text.length > MANIFEST_MAX_CHARS) return; // partial playlists are worse than none
+    const now = Date.now();
+    pruneManifests(now);
+    manifests.set(url, { url, text, at: now, alias: false });
+    const alias = manifestAlias(url);
+    if (alias !== url) {
+      manifests.set(alias, { url, text, at: now, alias: true });
+      let urls = manifestPaths.get(alias);
+      if (!urls) {
+        urls = new Set<string>();
+        manifestPaths.set(alias, urls);
+      }
+      urls.add(url);
+    }
+    while (manifests.size > MANIFEST_MAX_ENTRIES * 2) {
+      const oldest = manifests.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      manifests.delete(oldest);
+    }
+  }
+
+  /**
+   * Exact-URL hit first; the path alias covers a rotated token. The alias is
+   * used only when exactly one URL was ever captured for that path — two videos
+   * sharing `/hls/stream.m3u8` must never be handed each other's playlist.
+   */
+  function findManifest(url: string): ManifestEntry | undefined {
+    const now = Date.now();
+    pruneManifests(now);
+    const exact = manifests.get(url);
+    if (exact) return exact;
+    const alias = manifestAlias(url);
+    if (alias === url) return undefined;
+    const urls = manifestPaths.get(alias);
+    if (!urls || urls.size !== 1) return undefined;
+    return manifests.get(alias);
+  }
+
+  /** Read a playlist the page just fetched, into the capture store. */
+  function captureManifestBody(res: Response, url: string): void {
+    manifestInflight++;
+    void peekBody(res, MANIFEST_MAX_CHARS, MANIFEST_PEEK_BUDGET_MS)
+      .then((r) => {
+        if (r.truncated) return;
+        if (r.text) recordManifest(url, r.text);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        manifestInflight--;
+      });
+  }
+
+  // ---- page-context service (isolated world asks, page world answers) ----
+  window.addEventListener("message", (event) => {
+    try {
+      if (event.source !== window) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const d = event.data as any;
+      if (!d || typeof d !== "object" || typeof d.nonce !== "string") return;
+      if (d.__vdg === "manifest-text" && typeof d.url === "string") {
+        const hit = findManifest(d.url);
+        window.postMessage(
+          {
+            __vdg: "manifest-text-result",
+            nonce: d.nonce,
+            url: d.url,
+            found: Boolean(hit),
+            source: hit?.url,
+            alias: hit?.alias === true,
+            text: hit?.text ?? "",
+          },
+          "*",
+        );
+        return;
+      }
+      if (d.__vdg === "page-fetch" && typeof d.url === "string") {
+        const nonce = d.nonce;
+        const url = String(d.url);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 12_000);
+        // window.fetch is the hooked wrapper, so this request also feeds the
+        // capture store — the page's own context, for the extension's benefit.
+        void window
+          .fetch(url, { credentials: "include", signal: ctrl.signal })
+          .then(async (res) => {
+            if (!res.ok) {
+              window.postMessage(
+                { __vdg: "page-fetch-result", nonce, url, ok: false, status: res.status },
+                "*",
+              );
+              return;
+            }
+            const body = await peekBody(res, MANIFEST_MAX_CHARS, 8000);
+            window.postMessage(
+              {
+                __vdg: "page-fetch-result",
+                nonce,
+                url,
+                ok: true,
+                status: res.status,
+                text: body.text,
+                truncated: body.truncated,
+              },
+              "*",
+            );
+          })
+          .catch((err: unknown) => {
+            window.postMessage(
+              {
+                __vdg: "page-fetch-result",
+                nonce,
+                url,
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              },
+              "*",
+            );
+          })
+          .finally(() => clearTimeout(timer));
+      }
+    } catch {
+      /* never break page messaging */
+    }
+  });
 
   function mediaish(url: string, contentType: string | null): boolean {
     const u = url.toLowerCase().split("?")[0];
@@ -283,14 +501,23 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
         const method = ((init as { method?: unknown } | undefined)?.method as string | undefined) ?? "GET";
         if (String(method).toUpperCase() !== "GET") return p;
         const url = urlOf(input);
-        if (!url || mediaish(url, null) || skippable(url)) return p;
-        if (pageHidden()) return p; // background tab: never spend its CPU
-        if (!peekAllowed()) return p;
+        if (!url || skippable(url)) return p;
+        const urlIsPlaylist = MANIFEST_PATH_RE.test(url);
+        if (!urlIsPlaylist && mediaish(url, null)) return p;
         p.then((res) => {
           let started = false;
           try {
             if (!res.ok) return; // error pages never carry manifests
             const ct = res.headers?.get?.("content-type") ?? null;
+            // Playlist the player is loading (by extension or content type):
+            // keep the bytes it received — the extension cannot re-fetch them
+            // with the same cookies/Referer/Origin/fingerprint. Bounded.
+            if (urlIsPlaylist || PLAYLIST_CT_RE.test(ct ?? "")) {
+              if (manifestAllowed()) captureManifestBody(res, url);
+              return;
+            }
+            if (pageHidden()) return; // background tab: never spend its CPU
+            if (!peekAllowed()) return;
             if (mediaish(url, ct) || !apiish(ct)) return;
             const len = Number(res.headers?.get?.("content-length") ?? "0");
             if (len > MAX_BODY * 2) return;
@@ -349,14 +576,25 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
               const rec = this as unknown as Record<string, unknown>;
               if (String(rec.__vdgMethod ?? "GET").toUpperCase() !== "GET") return;
               const url = String(rec.__vdgUrl ?? "");
-              if (!url || mediaish(url, null) || skippable(url)) return;
-              if (pageHidden()) return;
-              if (!peekAllowed()) return;
-              const ct: string | null =
+              if (!url || skippable(url)) return;
+              const urlIsPlaylist = MANIFEST_PATH_RE.test(url);
+              if (!urlIsPlaylist && mediaish(url, null)) return;
+              const responseCt =
                 typeof this.getResponseHeader === "function"
                   ? this.getResponseHeader("content-type")
                   : null;
-              if (mediaish(url, ct) || !apiish(ct)) return;
+              // Playlist the player loaded (by extension or content type): keep
+              // exactly the bytes it received.
+              if (urlIsPlaylist || PLAYLIST_CT_RE.test(responseCt ?? "")) {
+                if (manifestAllowed()) {
+                  const body = typeof this.responseText === "string" ? this.responseText : "";
+                  if (body) recordManifest(url, body);
+                }
+                return;
+              }
+              if (pageHidden()) return;
+              if (!peekAllowed()) return;
+              if (mediaish(url, responseCt) || !apiish(responseCt)) return;
               const text = typeof this.responseText === "string" ? this.responseText : "";
               if (!text || text.length > MAX_BODY * 2) return;
               handleText(text);

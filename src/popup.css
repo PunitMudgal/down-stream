@@ -422,6 +422,25 @@ button.ghost.cancelbtn:hover { color: var(--danger); border-color: var(--danger)
 /* ---------- notes & states ---------- */
 .error, .protected { font-size: 12px; margin-top: 8px; border-radius: 8px; padding: 7px 9px; }
 .error { color: var(--danger); background: var(--danger-soft); }
+/* Failed-manifest row: message wraps, Retry sits at the end. */
+.error { display: flex; align-items: center; gap: 8px; }
+.error .error-text { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.35; }
+.retry-btn {
+  flex: 0 0 auto;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 650;
+  border-radius: 7px;
+  padding: 4px 10px;
+  min-height: 26px;
+  cursor: pointer;
+  transition: background 150ms ease, opacity 150ms ease;
+}
+.retry-btn:hover { background: rgba(220, 38, 38, 0.12); }
+.retry-btn:disabled { opacity: 0.55; cursor: default; }
+.retry-btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
 .protected { color: var(--warning); background: var(--warning-soft); }
 
 .empty {

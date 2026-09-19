@@ -401,7 +401,7 @@ export async function startDownload(
         return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
       });
       try {
-        const freshText = await fetchManifestText(tabId, item.url);
+        const freshText = await fetchManifestText(tabId, item.url, { forceNetwork: true });
         const fresh = parseDashManifest(freshText, item.url);
         const fv = fresh.variants.find((v) => v.id === variant.id) ?? fresh.variants[0];
         if (fv?.segments?.length) {
@@ -644,13 +644,6 @@ function isResumableKind(itemUrl: string): boolean {
 
 // ---- history re-download --------------------------------------------------
 
-/** Plain fetch (no page context) used to refresh a manifest for a re-download. */
-async function fetchTextUnscoped(url: string): Promise<string> {
-  const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error(`Manifest fetch failed (${res.status})`);
-  return res.text();
-}
-
 /** The live tab still showing this page — the richest re-download context. */
 async function findTabForPage(pageUrl?: string): Promise<number | undefined> {
   if (!pageUrl) return undefined;
@@ -726,7 +719,10 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
     type,
   };
   if (type === "hls") {
-    const parsed = parseHlsManifest(await fetchTextUnscoped(entry.itemUrl), entry.itemUrl);
+    const parsed = parseHlsManifest(
+      await fetchManifestText(tabId, entry.itemUrl, { forceNetwork: true }),
+      entry.itemUrl,
+    );
     if (parsed.drmProtected) throw new Error(parsed.drmReason ?? "Protected content — cannot download.");
     const variant = parsed.variants.find((v) => v.id === entry.variantId) ?? parsed.variants[0];
     if (!variant) throw new Error("This manifest no longer lists a downloadable quality.");
@@ -751,7 +747,10 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
     );
   }
   if (type === "dash") {
-    const parsed = parseDashManifest(await fetchTextUnscoped(entry.itemUrl), entry.itemUrl);
+    const parsed = parseDashManifest(
+      await fetchManifestText(tabId, entry.itemUrl, { forceNetwork: true }),
+      entry.itemUrl,
+    );
     if (parsed.drmProtected) throw new Error(parsed.drmReason ?? "Protected content — cannot download.");
     const variant = parsed.variants.find((v) => v.id === entry.variantId) ?? parsed.variants[0];
     if (!variant?.segments?.length) throw new Error("This manifest no longer lists downloadable segments.");
