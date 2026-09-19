@@ -18,6 +18,8 @@ export interface HistoryEntry {
   /** Page the video was found on — used to re-resolve the item on re-download. */
   pageUrl?: string;
   tabId?: number;
+  /** Frame the media lived in (page-context re-download target). */
+  frameId?: number;
   title?: string;
   /** Relative destination path as saved (subfolder + filename). */
   filename: string;
@@ -83,6 +85,7 @@ export function entryFromJob(
     itemUrl: job.itemUrl,
     pageUrl: job.pageUrl,
     tabId: job.tabId,
+    frameId: job.frameId,
     title: job.title,
     filename: job.filename,
     variantId: job.variantId,

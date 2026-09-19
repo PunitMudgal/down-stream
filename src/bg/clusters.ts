@@ -175,6 +175,7 @@ export async function maybePromoteCluster(tabId: number, cluster: Cluster): Prom
     await upsertItem(tabId, {
       url: cluster.urls[0],
       tabId,
+      frameId: cluster.frameId,
       type: "segments",
       filename: filenameForUrl(cluster.urls[0], "segments"),
       autoNamed: true,

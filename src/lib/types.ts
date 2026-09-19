@@ -57,6 +57,13 @@ export interface MediaItem {
   /** Short human line, e.g. "1280×720 • 0:34 • playing". */
   meta?: string;
   error?: string;
+  /**
+   * Frame (0 = top) the media was seen in. Page-context work — captured
+   * playlists, page-world fetches, relayed chunks, blob/MSE pulls — is
+   * addressed to this frame, because that is the frame whose Referer, cookies
+   * and player state the CDN accepted. Absent/-1 = address the whole tab.
+   */
+  frameId?: number;
 }
 
 export type RuntimeMessage =
@@ -205,6 +212,8 @@ export interface NetReplay {
 export interface DownloadJobRequest {
   jobId: string;
   tabId: number;
+  /** Frame that owns the media (page-relay target). Absent = whole tab. */
+  frameId?: number;
   kind: DownloadKind;
   /** Resolved URL to fetch: direct file, HLS variant playlist, or "" for DASH (uses segments). */
   url: string;
@@ -277,6 +286,8 @@ export interface BatchSnapshot {
 export interface DownloadJobState {
   jobId: string;
   tabId: number;
+  /** Frame that owns the media (page-relay target). Absent = whole tab. */
+  frameId?: number;
   itemUrl: string;
   variantId?: string;
   filename: string;

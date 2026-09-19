@@ -21,6 +21,7 @@ import type {
   Variant,
 } from "../lib/types";
 import { lookupNet } from "./headers";
+import { sendToAcceptingFrame } from "./frames";
 import { fetchManifestText, parseStreamingItem } from "./manifests";
 import { codecsOf, enforceCaps, hasAudioCodec, hasVideoCodec, patchItem, updateBadge } from "./media";
 import { resetRate } from "./rate";
@@ -166,12 +167,15 @@ interface JobMeta {
   pageUrl?: string;
   quality?: string;
   type?: MediaType;
+  /** Frame that owns the media — where page-context work is addressed. */
+  frameId?: number;
 }
 
 function newJobState(req: DownloadJobRequest, meta: JobMeta): DownloadJobState {
   return {
     jobId: req.jobId,
     tabId: req.tabId,
+    frameId: meta.frameId ?? req.frameId,
     itemUrl: meta.itemUrl,
     variantId: meta.variantId,
     filename: req.filename,
@@ -231,6 +235,7 @@ export async function startDownload(
     pageUrl: await pageUrlFor(tabId),
     quality: dest.quality,
     type: item.type,
+    frameId: item.frameId,
   };
 
   // MSE capture downloads route through the tab's content script, which
@@ -259,12 +264,18 @@ export async function startDownload(
     await upsertJob(job);
     await ensureOffscreen();
     try {
-      await chrome.tabs.sendMessage(tabId, {
+      // Only the frame holding this Blob can stream it; the others decline.
+      const sent = await sendToAcceptingFrame(tabId, item.frameId, {
         type: "BLOB_DOWNLOAD",
         jobId,
         url: item.url,
         filename: job.filename,
       });
+      if (!sent.accepted) {
+        job.status = "error";
+        job.error = sent.error ?? "Blob expired — replay the video and Rescan.";
+        await upsertJob(job);
+      }
     } catch (err) {
       job.status = "error";
       job.error = `Could not reach the page: ${err instanceof Error ? err.message : String(err)} Reload the tab and retry.`;
@@ -314,7 +325,8 @@ export async function startDownload(
     await upsertJob(job);
     await ensureOffscreen();
     try {
-      await chrome.tabs.sendMessage(tabId, {
+      // Only the frame whose player buffer holds this capture can stream it.
+      const sent = await sendToAcceptingFrame(tabId, item.frameId, {
         type: "MS_DOWNLOAD",
         jobId,
         captureId,
@@ -322,6 +334,13 @@ export async function startDownload(
         pairTrackIdx,
         filename: job.filename,
       });
+      if (!sent.accepted) {
+        job.status = "error";
+        job.error =
+          sent.error ??
+          "Capture expired — the page dropped the player buffer. Replay the video and Rescan.";
+        await upsertJob(job);
+      }
     } catch (err) {
       job.status = "error";
       job.error = `Could not reach the page capture: ${err instanceof Error ? err.message : String(err)} Reload the tab and retry.`;
@@ -401,7 +420,10 @@ export async function startDownload(
         return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
       });
       try {
-        const freshText = await fetchManifestText(tabId, item.url, { forceNetwork: true });
+        const freshText = await fetchManifestText(tabId, item.url, {
+          forceNetwork: true,
+          frameId: item.frameId,
+        });
         const fresh = parseDashManifest(freshText, item.url);
         const fv = fresh.variants.find((v) => v.id === variant.id) ?? fresh.variants[0];
         if (fv?.segments?.length) {
@@ -532,6 +554,7 @@ export async function ensureItemForUrl(
   tabId: number,
   candidates: string[],
   title?: string,
+  frameId?: number,
 ): Promise<MediaItem | undefined> {
   const httpish = candidates.filter((u) => /^https?:\/\//i.test(u));
   for (const url of httpish) {
@@ -544,6 +567,7 @@ export async function ensureItemForUrl(
     const item: MediaItem = {
       url,
       tabId,
+      frameId,
       type,
       filename: filenameForUrl(url, type, stem || undefined),
       title: stem || undefined,
@@ -703,6 +727,7 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
   const item: MediaItem = {
     url: entry.itemUrl,
     tabId: entry.tabId ?? -1,
+    frameId: entry.frameId,
     type,
     filename: entry.filename,
     title: entry.title,
@@ -717,10 +742,14 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
     title: entry.title,
     pageUrl: entry.pageUrl,
     type,
+    frameId: entry.frameId,
   };
   if (type === "hls") {
     const parsed = parseHlsManifest(
-      await fetchManifestText(tabId, entry.itemUrl, { forceNetwork: true }),
+      await fetchManifestText(tabId, entry.itemUrl, {
+        forceNetwork: true,
+        frameId: item.frameId,
+      }),
       entry.itemUrl,
     );
     if (parsed.drmProtected) throw new Error(parsed.drmReason ?? "Protected content — cannot download.");
@@ -748,7 +777,10 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
   }
   if (type === "dash") {
     const parsed = parseDashManifest(
-      await fetchManifestText(tabId, entry.itemUrl, { forceNetwork: true }),
+      await fetchManifestText(tabId, entry.itemUrl, {
+        forceNetwork: true,
+        frameId: item.frameId,
+      }),
       entry.itemUrl,
     );
     if (parsed.drmProtected) throw new Error(parsed.drmReason ?? "Protected content — cannot download.");

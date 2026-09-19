@@ -7,6 +7,7 @@ import { extractHlsSegments } from "../lib/parseHls";
 import { appendHistory, clearHistory, entryFromJob, getHistoryEntry, loadHistory } from "../lib/history";
 import { getSettings, normalizeSettings, saveSettings } from "../lib/settings";
 import type { DownloadJobState, MediaItem, NetReplay } from "../lib/types";
+import { sendToFrame } from "./frames";
 import { lookupNet } from "./headers";
 import { fetchManifestText, parseStreamingItem } from "./manifests";
 import { ensureOffscreen, maybeCloseOffscreen, newJobId, redownloadHistoryEntry, startDownload } from "./jobs";
@@ -69,7 +70,7 @@ async function sampleUrlsFor(tabId: number, item: MediaItem, variantId?: string)
   // HLS: the variant URL is a media playlist — read it and take its first
   // segments (the same resolving path the downloader uses).
   try {
-    const text = await fetchManifestText(tabId, variant.url);
+    const text = await fetchManifestText(tabId, variant.url, { frameId: item.frameId });
     return extractHlsSegments(text, variant.url).slice(0, 3);
   } catch {
     return [];
@@ -155,7 +156,7 @@ async function handleCancelJob(m: AnyMsg): Promise<unknown> {
     // Capture + blob-file jobs also stream from the tab — stop the driver too.
     if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
       try {
-        await chrome.tabs.sendMessage(job.tabId, { type: "MS_CANCEL", jobId: m.jobId });
+        await sendToFrame(job.tabId, job.frameId, { type: "MS_CANCEL", jobId: m.jobId });
       } catch {
         /* driver ends on its own via abort flag or completion */
       }
@@ -257,7 +258,14 @@ async function handleVideoElements(m: AnyMsg, sender: Sender): Promise<unknown> 
     }
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await handleCaptureSessions(fromSender, m.msSessions as any, posterByBlob, titleByBlob, m.pageTitle);
+  await handleCaptureSessions(
+    fromSender,
+    m.msSessions as any,
+    posterByBlob,
+    titleByBlob,
+    m.pageTitle,
+    sender.frameId,
+  );
   return { ok: true };
 }
 
@@ -479,12 +487,13 @@ async function handleRequestPageBytes(m: AnyMsg): Promise<unknown> {
     return { ok: false, error: "Unknown message" };
   }
   await ensureJobsLoaded();
-  const tabId = typeof m.jobId === "string" ? getJob(m.jobId)?.tabId : undefined;
+  const job = typeof m.jobId === "string" ? getJob(m.jobId) : undefined;
+  const tabId = job?.tabId;
   if (tabId == null || tabId < 0) {
     return { ok: false, error: "No live tab to relay through — re-download from the page." };
   }
   try {
-    await chrome.tabs.sendMessage(tabId, {
+    await sendToFrame(tabId, job?.frameId, {
       type: "PAGE_FETCH_BYTES",
       transferId: m.transferId,
       url: m.url,
@@ -512,6 +521,8 @@ async function handlePageBytesCancel(m: AnyMsg): Promise<unknown> {
   pageRelayTabs.delete(m.transferId);
   if (tabId == null) return { ok: true };
   try {
+    // Deliberately tab-wide: only the frame streaming this transferId reacts,
+    // and cancelling must still land if that frame's id has since changed.
     await chrome.tabs.sendMessage(tabId, { type: "PAGE_BYTES_CANCEL", transferId: m.transferId });
   } catch {
     /* tab closed mid-transfer */
@@ -549,6 +560,7 @@ async function handleRescan(m: AnyMsg): Promise<unknown> {
   // Ask the content script to re-collect <video> elements (covers
   // cached pages where webRequest saw nothing new).
   try {
+    // Tab-wide by design: a rescan wants every frame's <video> elements.
     await chrome.tabs.sendMessage(m.tabId, { type: "COLLECT_NOW" });
   } catch {
     // Content script not injected: inject a one-shot collector.

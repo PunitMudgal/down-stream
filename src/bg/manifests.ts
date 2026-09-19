@@ -18,6 +18,7 @@ import {
   type FetchAttempt,
 } from "../lib/manifestCache";
 import type { MediaItem } from "../lib/types";
+import { sendToFrame } from "./frames";
 import { lookupNet } from "./headers";
 import { patchItem } from "./media";
 
@@ -32,6 +33,12 @@ export interface FetchManifestOptions {
    * (download-time re-resolution of signed segment URLs).
    */
   forceNetwork?: boolean;
+  /**
+   * Frame the media lives in. Page-context reads are addressed there — that is
+   * the frame whose Referer/cookies the CDN accepted and whose player holds the
+   * playlist bytes. Absent = ask the whole tab.
+   */
+  frameId?: number;
 }
 
 /** One fetch attempt from the worker context, with the page's auth replayed. */
@@ -68,11 +75,15 @@ async function fetchFromWorker(
  * at all. Returns undefined when absent (or the page is unreachable), which is
  * the normal case before playback starts.
  */
-async function probePageCapture(tabId: number, url: string): Promise<string | undefined> {
+async function probePageCapture(
+  tabId: number,
+  frameId: number | undefined,
+  url: string,
+): Promise<string | undefined> {
   if (tabId < 0) return undefined;
   try {
     const res = await Promise.race([
-      chrome.tabs.sendMessage(tabId, { type: "FETCH_TEXT", url, captureOnly: true }),
+      sendToFrame(tabId, frameId, { type: "FETCH_TEXT", url, captureOnly: true }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 2000)),
     ]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -90,12 +101,13 @@ async function probePageCapture(tabId: number, url: string): Promise<string | un
  *  request context. Returns a short failure reason when it can't. */
 async function fetchFromPage(
   tabId: number,
+  frameId: number | undefined,
   url: string,
 ): Promise<{ text?: string; attempt?: FetchAttempt }> {
   if (tabId < 0) return {};
   try {
     const res = await Promise.race([
-      chrome.tabs.sendMessage(tabId, { type: "FETCH_TEXT", url }),
+      sendToFrame(tabId, frameId, { type: "FETCH_TEXT", url }),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Page fetch timed out")), 20_000),
       ),
@@ -135,7 +147,7 @@ export async function fetchManifestText(
   // URLs and a minutes-old playlist can carry expired tokens (the page step
   // below still falls back to the captured copy if the network refuses).
   if (!opts.forceNetwork) {
-    const captured = await probePageCapture(tabId, url);
+    const captured = await probePageCapture(tabId, opts.frameId, url);
     if (captured !== undefined) {
       manifestCache.set(url, captured);
       return captured;
@@ -159,7 +171,7 @@ export async function fetchManifestText(
   // its own request context — the one the playing video proved the CDN accepts.
   let pageAttempt: FetchAttempt | undefined;
   try {
-    const page = await fetchFromPage(tabId, url);
+    const page = await fetchFromPage(tabId, opts.frameId, url);
     if (page.text !== undefined) {
       manifestCache.set(url, page.text);
       return page.text;
@@ -183,7 +195,10 @@ export async function parseStreamingItem(
   opts: FetchManifestOptions = {},
 ): Promise<void> {
   try {
-    const text = await fetchManifestText(tabId, item.url, opts);
+    const text = await fetchManifestText(tabId, item.url, {
+      ...opts,
+      frameId: opts.frameId ?? item.frameId,
+    });
     if (text.length > MAX_MANIFEST_BYTES) {
       throw new Error("Manifest too large to parse (>5 MB).");
     }

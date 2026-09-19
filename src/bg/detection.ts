@@ -29,6 +29,7 @@ export function onHeadersReceived(
   const item: MediaItem = {
     url, // keep full URL incl. auth/signed params
     tabId,
+    frameId: details.frameId ?? 0,
     type,
     filename: filenameForUrl(url, type),
     autoNamed: true,

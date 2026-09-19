@@ -783,19 +783,35 @@ async function driveMsDownload(
 // document in ≤4MB slices, reusing the MS_TRACK_* accumulation + save flow.
 const BLOB_STEP = 4_000_000;
 
-async function driveBlobDownload(jobId: string, blobUrl: string, filename: string): Promise<void> {
+async function driveBlobDownload(
+  jobId: string,
+  blobUrl: string,
+  filename: string,
+  known?: { size: number; mime: string },
+): Promise<void> {
   const fail = (error: string): void => {
     void bgSend({ type: "DOWNLOAD_ERROR", jobId, error });
   };
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const info = (await askHook({ __vdg: "blob-info", url: blobUrl }, 8000)) as any;
-    if (!info || info.__vdg !== "blob-info-result" || typeof info.size !== "number" || info.size <= 0) {
-      fail(typeof info?.error === "string" ? info.error : "Blob expired — replay the video and Rescan.");
-      return;
+    let total = known?.size ?? 0;
+    let mime = known?.mime ?? "video/mp4";
+    if (total <= 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const info = (await askHook({ __vdg: "blob-info", url: blobUrl }, 8000)) as any;
+      if (
+        !info ||
+        info.__vdg !== "blob-info-result" ||
+        typeof info.size !== "number" ||
+        info.size <= 0
+      ) {
+        fail(
+          typeof info?.error === "string" ? info.error : "Blob expired — replay the video and Rescan.",
+        );
+        return;
+      }
+      total = info.size as number;
+      mime = typeof info.type === "string" && info.type ? info.type : "video/mp4";
     }
-    const total: number = info.size;
-    const mime: string = typeof info.type === "string" && info.type ? info.type : "video/mp4";
     await bgSend({ type: "MS_TRACK_START", jobId, total, mime, filename });
     let cursor = 0;
     let index = 0;
@@ -866,6 +882,46 @@ async function pageWorldFetch(url: string): Promise<{ text: string; truncated: b
     throw new Error(res?.status ? `Page fetch failed (${res.status})` : String(res?.error ?? "Page fetch failed"));
   }
   return { text: String(res.text ?? ""), truncated: res.truncated === true };
+}
+
+// ---- frame ownership probes -----------------------------------------------
+// A download request reaches every frame of a tab unless the worker knows which
+// frame owns the media. These probes let a frame that does NOT own the bytes
+// decline instead of reporting a failure for a buffer it never had.
+
+/** Ownership probe timeout: the hook answers from a map, so this is generous. */
+const OWNERSHIP_PROBE_MS = 300;
+
+/** Does THIS frame's page hook hold that MSE capture session? */
+async function thisFrameOwnsCapture(captureId: string): Promise<boolean> {
+  if (!captureId) return false;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = (await askHook({ __vdg: "ms-sessions" }, OWNERSHIP_PROBE_MS)) as any;
+    if (res?.__vdg !== "ms-sessions-result" || !Array.isArray(res.sessions)) return false;
+    return (res.sessions as MsSessionMeta[]).some((s) => s?.id === captureId);
+  } catch {
+    return false;
+  }
+}
+
+/** Size/type of a Blob THIS frame's hook still holds (undefined when absent). */
+async function thisFrameBlob(
+  blobUrl: string,
+): Promise<{ size: number; mime: string } | undefined> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = (await askHook({ __vdg: "blob-info", url: blobUrl }, OWNERSHIP_PROBE_MS)) as any;
+    if (res?.__vdg !== "blob-info-result" || typeof res.size !== "number" || res.size <= 0) {
+      return undefined;
+    }
+    return {
+      size: res.size as number,
+      mime: typeof res.type === "string" && res.type ? res.type : "video/mp4",
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 // ---- page-relayed segment bytes -------------------------------------------
@@ -1015,13 +1071,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (m?.type === "MS_DOWNLOAD" && typeof m.jobId === "string") {
     const pair = typeof m.pairTrackIdx === "number" ? m.pairTrackIdx : undefined;
-    void driveMsDownload(m.jobId, String(m.captureId ?? ""), Number(m.trackIdx) || 0, String(m.filename ?? "capture.mp4"), pair);
-    try {
-      sendResponse({ ok: true, accepted: true });
-    } catch {
-      /* ignore */
-    }
-    return false;
+    const captureId = String(m.captureId ?? "");
+    const trackIdx = Number(m.trackIdx) || 0;
+    void (async () => {
+      // Only the frame whose hook holds this capture can serve it. Any other
+      // frame declines (no side effects) so the worker walks on to the right
+      // one instead of failing a download the page can still complete.
+      if (!(await thisFrameOwnsCapture(captureId))) {
+        try {
+          sendResponse({
+            ok: false,
+            declined: true,
+            error: "Capture expired — the page dropped the player buffer. Replay the video and Rescan.",
+          });
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      void driveMsDownload(
+        m.jobId,
+        captureId,
+        trackIdx,
+        String(m.filename ?? "capture.mp4"),
+        pair,
+      );
+      try {
+        sendResponse({ ok: true, accepted: true });
+      } catch {
+        /* ignore */
+      }
+    })();
+    return true; // async ownership probe
   }
   if (m?.type === "MS_CANCEL" && typeof m.jobId === "string") {
     msAbort.add(m.jobId);
@@ -1033,13 +1114,31 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
   if (m?.type === "BLOB_DOWNLOAD" && typeof m.jobId === "string" && typeof m.url === "string") {
-    void driveBlobDownload(m.jobId, m.url, String(m.filename ?? "video.mp4"));
-    try {
-      sendResponse({ ok: true, accepted: true });
-    } catch {
-      /* ignore */
-    }
-    return false;
+    const blobUrl = String(m.url);
+    void (async () => {
+      // Same ownership rule as captures: the frame holding the Blob answers,
+      // the rest decline so the worker can find it.
+      const info = await thisFrameBlob(blobUrl);
+      if (!info) {
+        try {
+          sendResponse({
+            ok: false,
+            declined: true,
+            error: "Blob expired — replay the video and Rescan.",
+          });
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      void driveBlobDownload(m.jobId, blobUrl, String(m.filename ?? "video.mp4"), info);
+      try {
+        sendResponse({ ok: true, accepted: true });
+      } catch {
+        /* ignore */
+      }
+    })();
+    return true; // async ownership probe
   }
   if (m?.type === "PAGE_BYTES_CANCEL" && typeof m.transferId === "string") {
     pageBytesCancelled.add(m.transferId);

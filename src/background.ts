@@ -9,6 +9,7 @@ import { classify, looksLikeChunk } from "./lib/classify";
 import type { MediaType } from "./lib/types";
 import { clearClustersForTab } from "./bg/clusters";
 import { onHeadersReceived } from "./bg/detection";
+import { sendToFrame } from "./bg/frames";
 import { clearHeadersForTab, onSendHeaders } from "./bg/headers";
 import { markInterruptedJobs, maybeCloseOffscreen, ensureItemForUrl, startDownload } from "./bg/jobs";
 import { isExcludedUrl, updateBadge, updateBadgeForActiveTab } from "./bg/media";
@@ -111,9 +112,11 @@ safeWire("webNavigation.history", () => {
 const CTX_MENU_ID = "vdg-download-video";
 const CMD_DOWNLOAD_BEST = "download-best-video";
 
-async function triggerPageDownload(tabId: number): Promise<boolean> {
+async function triggerPageDownload(tabId: number, frameId?: number): Promise<boolean> {
   try {
-    const res = (await chrome.tabs.sendMessage(tabId, { type: "CONTEXT_DOWNLOAD" })) as
+    // Right-click carries the frame the element lives in; the keyboard shortcut
+    // has none (the content script then picks the most relevant video itself).
+    const res = (await sendToFrame(tabId, frameId, { type: "CONTEXT_DOWNLOAD" })) as
       | { ok?: boolean; candidates?: string[]; title?: string }
       | undefined;
     if (!res?.ok || !Array.isArray(res.candidates) || res.candidates.length === 0) return false;
@@ -129,7 +132,7 @@ async function triggerPageDownload(tabId: number): Promise<boolean> {
     }
     // 2. Nothing matched: register the element's direct/manifest URL ourselves
     //    (cached media and manifests webRequest never reported).
-    const fresh = await ensureItemForUrl(tabId, res.candidates, res.title);
+    const fresh = await ensureItemForUrl(tabId, res.candidates, res.title, frameId);
     if (fresh) {
       await startDownload(tabId, fresh.url);
       return true;
@@ -152,7 +155,7 @@ async function triggerPageDownload(tabId: number): Promise<boolean> {
 safeWire("contextMenus", () => {
   chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId !== CTX_MENU_ID || tab?.id == null) return;
-    void triggerPageDownload(tab.id);
+    void triggerPageDownload(tab.id, info.frameId);
   });
 });
 

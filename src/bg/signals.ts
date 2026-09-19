@@ -32,6 +32,7 @@ function upsertBlobFile(
   backing: BlobFileInfo,
   v: VideoSignal,
   pageTitle?: string,
+  frameId?: number,
 ): boolean {
   const ext = extForBlobMime(backing.type);
   const elTitle = cleanTitle(v.title);
@@ -46,6 +47,7 @@ function upsertBlobFile(
     items.push({
       url,
       tabId,
+      frameId,
       type: "blobfile",
       filename,
       title: title || undefined,
@@ -118,7 +120,7 @@ export async function handleVideoSignals(
         // Whole-file Blob backing this player? Exact bytes, direct save.
         const backing = blobMap.get(src);
         if (backing) {
-          if (upsertBlobFile(items, tabId, src, backing, v, pageTitle)) changed = true;
+          if (upsertBlobFile(items, tabId, src, backing, v, pageTitle, frameId)) changed = true;
           continue;
         }
         // If the player feeding this blob: URL has visible chunk traffic in
@@ -164,6 +166,7 @@ export async function handleVideoSignals(
           items.push({
             url: src,
             tabId,
+            frameId,
             type: "blob",
             filename: "",
             title: title || undefined,
@@ -196,6 +199,7 @@ export async function handleVideoSignals(
           const item: MediaItem = {
             url: src,
             tabId,
+            frameId,
             type,
             filename: filenameForUrl(src, type, title || undefined),
             title: title || undefined,
@@ -221,6 +225,7 @@ export async function handleVideoSignals(
           items.push({
             url: src,
             tabId,
+            frameId,
             type,
             filename: filenameForUrl(src, type, title || undefined),
             title: title || undefined,
@@ -241,7 +246,7 @@ export async function handleVideoSignals(
       }
     }
   }
-  changed = (await mergeAdapterItems(tabId, items, adapterItems, pageTitle)) || changed;
+  changed = (await mergeAdapterItems(tabId, items, adapterItems, pageTitle, frameId)) || changed;
   if (changed) {
     await persistTab(tabId, enforceCaps(items));
     await updateBadge(tabId);
@@ -261,6 +266,7 @@ async function mergeAdapterItems(
   items: MediaItem[],
   adapterItems: MediaItem[] | undefined,
   pageTitle?: string,
+  frameId?: number,
 ): Promise<boolean> {
   if (!Array.isArray(adapterItems) || adapterItems.length === 0) return false;
   let changed = false;
@@ -275,6 +281,7 @@ async function mergeAdapterItems(
     const item: MediaItem = {
       ...raw,
       tabId,
+      frameId: raw.frameId ?? frameId,
       type,
       filename: raw.filename?.length ? raw.filename : filenameForUrl(url, type, title || undefined),
       title: title || undefined,
@@ -312,6 +319,7 @@ export async function handleCaptureSessions(
   posterByBlob: Map<string, string>,
   titleByBlob: Map<string, string>,
   pageTitle?: string,
+  frameId?: number,
 ): Promise<void> {
   if (!sessions) return;
   const now = Date.now();
@@ -337,6 +345,7 @@ export async function handleCaptureSessions(
           items.push({
             url,
             tabId,
+            frameId,
             type: "capture",
             captureRef: `${s.id}:${t.idx}`,
             captureKind: t.kind,
@@ -367,6 +376,7 @@ export async function handleCaptureSessions(
             detectedAt: now,
             drmProtected: true,
             drmReason: "This page uses DRM playback, so buffered captures are disabled here to stay safe.",
+            frameId,
             meta: `${kindLabel}${sizeLabel} • captured buffer`,
             pageTitle,
           });
@@ -382,6 +392,7 @@ export async function handleCaptureSessions(
         items.push({
           url,
           tabId,
+          frameId,
           type: "capture",
           captureRef: `${s.id}:${t.idx}`,
             captureKind: t.kind,
