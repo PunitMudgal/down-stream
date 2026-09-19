@@ -1,0 +1,51 @@
+/* Shared surface tokens for popup + options.
+ * Cool graphite, one rust accent. No navy, no blue glow, no remote fonts. */
+:root {
+  color-scheme: light dark;
+  --bg: #f0f1f2;
+  --fg: #17181a;
+  --muted: #5c5e63;
+  --card: #fafbfb;
+  --card-2: #e8eaed;
+  --border: #cfd2d6;
+  --accent: #8f3a16;
+  --accent-fill: #8f3a16;
+  --accent-fill-hover: #732e11;
+  --on-accent: #fff7f2;
+  --accent-soft: rgb(143 58 22 / 0.09);
+  --danger: #9d1c1c;
+  --danger-soft: rgb(157 28 28 / 0.08);
+  --success: #215c40;
+  --success-soft: rgb(33 92 64 / 0.1);
+  --warning: #7a5310;
+  --warning-soft: rgb(122 83 16 / 0.1);
+  --ring: rgb(143 58 22 / 0.45);
+  --thumb-bg: #17181a;
+  --shadow: none;
+  --radius: 5px;
+  --font: ui-sans-serif, "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111214;
+    --fg: #eceef0;
+    --muted: #9aa0a6;
+    --card: #181a1c;
+    --card-2: #151618;
+    --border: #2c3034;
+    --accent: #e08a58;
+    --accent-fill: #8f3a16;
+    --accent-fill-hover: #a8461c;
+    --on-accent: #fff7f2;
+    --accent-soft: rgb(196 92 38 / 0.16);
+    --danger: #e07070;
+    --danger-soft: rgb(224 112 112 / 0.12);
+    --success: #7dba96;
+    --success-soft: rgb(125 186 150 / 0.12);
+    --warning: #d4a04a;
+    --warning-soft: rgb(212 160 74 / 0.12);
+    --ring: rgb(224 138 88 / 0.5);
+    --thumb-bg: #0b0c0d;
+  }
+}

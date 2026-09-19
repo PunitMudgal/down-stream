@@ -59,7 +59,7 @@ export async function updateBadge(tabId: number): Promise<void> {
       text: count > 0 ? String(count) : "",
       tabId,
     });
-    await chrome.action.setBadgeBackgroundColor({ color: "#1a73e8", tabId });
+    await chrome.action.setBadgeBackgroundColor({ color: "#8f3a16", tabId });
   } catch {
     /* badge is best-effort */
   }

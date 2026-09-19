@@ -96,7 +96,7 @@ async function retryParseManifest(
       return;
     }
     label.textContent =
-      res?.error ?? "Still unreadable — play the video for a few seconds, then Retry again.";
+      res?.error ?? "Still unreadable. Play the video for a few seconds, then Retry again.";
   } catch (err) {
     label.textContent = `Retry failed: ${err instanceof Error ? err.message : String(err)}`;
   } finally {
@@ -241,7 +241,7 @@ async function markRecommendedQuality(item: MediaItem, sel: HTMLSelectElement): 
     if (!res?.ok || !res.recommendedId) return;
     const opt = Array.from(sel.options).find((o) => o.value === res.recommendedId);
     if (!opt || /Recommended/.test(opt.textContent ?? "")) return;
-    opt.textContent = `${opt.textContent} — Recommended`;
+    opt.textContent = `${opt.textContent} (recommended)`;
     if (typeof res.bps === "number" && res.bps > 0) {
       sel.title = `Based on a measured ${formatSpeed(res.bps)} connection`;
     }
@@ -254,7 +254,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     p,
     new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out — the background worker may be restarting. Reopen the popup.`)), ms),
+      setTimeout(() => reject(new Error(`${label} timed out. The background worker may be restarting. Reopen the popup.`)), ms),
     ),
   ]);
 }
@@ -276,7 +276,7 @@ function unsupportedHostReason(url: string): string | null {
   try {
     const h = new URL(url).hostname.toLowerCase();
     if (/(^|\.)youtube\.com$/.test(h) || /(^|\.)youtu\.be$/.test(h) || /(^|\.)youtube-nocookie\.com$/.test(h)) {
-      return "YouTube isn't supported by this extension (its delivery is encrypted/obfuscated). It works on other video sites — open one and try again.";
+      return "YouTube isn't supported by this extension (its delivery is encrypted). It works on other video sites. Open one and try again.";
     }
   } catch {
     /* ignore */
@@ -406,7 +406,7 @@ function domSessionsToItems(
           title: title || undefined,
           titleFromPage: title ? !elTitle : undefined,
           detectedAt: now, drmProtected: true,
-          drmReason: "Protected content — this player uses an encrypted media path (DRM). Cannot download.",
+          drmReason: "Protected content. This player uses an encrypted media path (DRM). Cannot download.",
           meta: `${kindLabel}${sizeLabel} • captured buffer`,
         });
         continue;
@@ -476,7 +476,7 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number, pageTitle?: st
           drmProtected: false,
           poster: v.poster,
           meta,
-          error: "Blob/MSE stream (in-player buffer) — the file is captured from the network when it loads. Play the video, then Rescan.",
+          error: "Blob/MSE stream (in-player buffer). The file is captured from the network when it loads. Play the video, then Rescan.",
         });
       } else if (type === "hls" || type === "dash") {
         items.push({
@@ -492,7 +492,7 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number, pageTitle?: st
           variants: [],
           poster: v.poster,
           meta,
-          error: "Found on the page — waiting for the background worker to parse qualities. If the worker is down, reload the extension.",
+          error: "Found on the page. Waiting for the background worker to parse qualities. If the worker is down, reload the extension.",
         });
       } else {
         items.push({
@@ -554,7 +554,7 @@ function combinedLine(related: DownloadJobState[], direct: boolean): { label: st
     const bytes = active.reduce((n, j) => n + (j.bytesDone ?? 0), 0);
     const mb = bytes > 0 ? ` • ${formatBytes(bytes)}` : "";
     const tail = "(safe to close popup)";
-    if (!anyRunning) return { label: `Paused (${segs} segments) — resume to continue.`, state: "paused" };
+    if (!anyRunning) return { label: `Paused (${segs} segments). Resume to continue.`, state: "paused" };
     return { label: `Fetching 2 parts… ${segs} segments${mb} ${tail}`, state: "running" };
   }
   // One part still active while its sibling finished: keep showing progress,
@@ -562,7 +562,7 @@ function combinedLine(related: DownloadJobState[], direct: boolean): { label: st
   if (active.length === 1) return jobLine(active[0], direct);
   if (related.length > 1 && related.every((j) => j.status === "done")) {
     const note = related.find((j) => j.note)?.note;
-    return { label: `Done — check your downloads folder.${note ? ` ${note}` : ""}`, state: "done" };
+    return { label: `Done. Check your downloads folder.${note ? ` ${note}` : ""}`, state: "done" };
   }
   const job = related[0];
   if (!job) return { label: "", state: "idle" };
@@ -597,7 +597,7 @@ function runningText(job: DownloadJobState): string {
   const tail = "(safe to close popup)";
   if (job.status === "paused") {
     const segs = job.total > 1 ? ` ${job.done}/${job.total} segments` : "";
-    return `Paused${segs} — resume to continue.`;
+    return `Paused${segs}. Resume to continue.`;
   }
   if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
     if (job.stage === "assembling") return `Assembling capture… ${tail}`;
@@ -815,9 +815,9 @@ async function loadMedia(): Promise<void> {
   setStatus(
     workerAlive
       ? downloadable > 0
-        ? `${downloadable} downloadable video${downloadable > 1 ? "s" : ""} detected.`
-        : "Found player streams, but no direct file yet — play the video, then Rescan."
-      : "Worker unreachable — showing what the page itself exposes. Direct files can still download; qualities need the worker.",
+        ? ""
+        : "Player streams found. Play the video, then Rescan."
+      : "Worker unreachable. Direct files can still download; quality lists need a reload.",
   );
   for (const item of items) listEl.appendChild(renderCard(item));
   totalCards = items.length;
@@ -871,7 +871,7 @@ function updateCount(visible?: number): void {
 /** Banner (not a dead end): page scan worked, worker didn't. */
 function showWorkerWarning(): void {
   const banner = document.createElement("div");
-  banner.className = "card";
+  banner.className = "card notice";
   const meta = document.createElement("div");
   meta.className = "meta";
   const note = document.createElement("div");
@@ -1068,7 +1068,7 @@ async function startBatch(): Promise<void> {
     lastQueueActive = batchSnapshot?.active ?? false;
     renderQueue();
     setStatus(
-      `Queued ${items.length} download${items.length > 1 ? "s" : ""} — running ${batchSnapshot?.concurrency ?? 2} at a time. You can close this popup.`,
+      `Queued ${items.length} download${items.length > 1 ? "s" : ""}. Running ${batchSnapshot?.concurrency ?? 2} at a time. You can close this popup.`,
     );
     window.setTimeout(() => void refreshJobs(), 700);
   } catch (err) {
@@ -1175,7 +1175,7 @@ function renderCard(item: MediaItem): HTMLElement {
   if (item.drmProtected) {
     const p = document.createElement("div");
     p.className = "protected";
-    p.textContent = item.drmReason ?? "Protected content — cannot download.";
+    p.textContent = item.drmReason ?? "Protected content. Cannot download.";
     meta.appendChild(p);
   } else if (isDirect(item)) {
     const btn = document.createElement("button");
@@ -1225,7 +1225,7 @@ function renderCard(item: MediaItem): HTMLElement {
     const n = item.segments?.length ?? 0;
     if (n === 0) {
       meta.appendChild(
-        errorRow(item.error ?? "Grouped player chunks expired — play the video, then Rescan."),
+        errorRow(item.error ?? "Grouped player chunks expired. Play the video, then Rescan."),
       );
     } else {
       const btn = document.createElement("button");
@@ -1243,7 +1243,7 @@ function renderCard(item: MediaItem): HTMLElement {
     btn.onclick = () => void handleStartDownload(item, undefined, btn);
     meta.appendChild(btn);
   } else if (item.type === "blob") {
-    meta.appendChild(errorRow(item.error ?? "Blob stream — not directly downloadable."));
+    meta.appendChild(errorRow(item.error ?? "Blob stream. Not directly downloadable."));
   } else if (item.error) {
     // Any other type that failed to resolve — surface it rather than hide it.
     meta.appendChild(errorRow(item.error));
@@ -1297,7 +1297,7 @@ function jobLine(job: DownloadJobState, direct: boolean): { label: string; state
   if (job.status === "paused") return { label: runningText(job), state: "paused" };
   if (job.status === "running") return { label: runningText(job), state: "running" };
   if (job.status === "done") {
-    return { label: `Done — check your downloads folder.${job.note ? ` ${job.note}` : ""}`, state: "done" };
+    return { label: `Done. Check your downloads folder.${job.note ? ` ${job.note}` : ""}`, state: "done" };
   }
   if (/cancelled/i.test(job.error ?? "")) return { label: "Cancelled.", state: "cancelled" };
   if (job.expired) return { label: `Link expired mid-download: ${job.error ?? ""} Hit Refresh & Retry for fresh URLs.`, state: "error" };
@@ -1439,7 +1439,7 @@ async function pauseJob(jobId: string): Promise<void> {
       8000,
       "Pausing",
     );
-    setStatus("Paused — resume anytime. Fetched parts are kept.");
+    setStatus("Paused. Resume anytime. Fetched parts are kept.");
   } catch (err) {
     setStatus(`Pause failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1509,7 +1509,7 @@ async function copyLink(url: string, btn: HTMLButtonElement): Promise<void> {
       ta.remove();
       done("Copied!");
     } catch {
-      setStatus("Copy failed — right-click the URL text to copy manually.");
+      setStatus("Copy failed. Right-click the URL text to copy manually.");
       done("Copy link");
     }
   }
@@ -1556,13 +1556,13 @@ async function handleStartDownload(
       if (item.type === "hls" || item.type === "dash" || item.type === "segments" || item.type === "capture") {
         setStatus(
           res.merged
-            ? "Merging video + audio into one file with sound — you can close this popup."
+            ? "Merging video + audio into one file with sound. You can close this popup."
             : res.paired
-              ? "Downloading video + audio as 2 files (this stream can't be merged in-app) — you can close this popup."
-              : `Download running in background for ${basenameOf(job.filename)} — you can close this popup.`,
+              ? "Downloading video + audio as 2 files (this stream can't be merged in-app). You can close this popup."
+              : `Download running in the background for ${basenameOf(job.filename)}. You can close this popup.`,
         );
       } else {
-        setStatus(`Download running in background for ${basenameOf(job.filename)} — you can close this popup.`);
+        setStatus(`Download running in the background for ${basenameOf(job.filename)}. You can close this popup.`);
       }
       refreshCard(item.url);
       return;
@@ -1597,7 +1597,7 @@ async function downloadDirectFallback(item: MediaItem, btn: HTMLButtonElement): 
     const prog = card?.querySelector(".progress") as HTMLElement | null;
     if (prog) {
       prog.hidden = false;
-      prog.textContent = "Done — check your downloads folder.";
+      prog.textContent = "Done. Check your downloads folder.";
     }
   } catch (err) {
     setStatus(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
