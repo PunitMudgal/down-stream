@@ -21,7 +21,7 @@
  *   bytes the CDN served the page instead of re-fetching them — and, when
  *   asked, this world performs the fetch itself with the page's own context.
  */
-import { extractMediaFileUrls } from "./lib/apiUrls";
+import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
 
 (function () {
   const w = window as unknown as Record<string, unknown>;
@@ -94,14 +94,9 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
     return text.replace(/\\\//g, "/");
   }
 
-  /** Cheap gate before the regex engine: no manifest extension, no match. */
+  /** Cheap gate before the regex engine: playlists, inline MPD, or file lists. */
   function hasManifestHint(text: string): boolean {
-    return (
-      text.indexOf(".m3u8") !== -1 ||
-      text.indexOf(".M3U8") !== -1 ||
-      text.indexOf(".mpd") !== -1 ||
-      text.indexOf(".MPD") !== -1
-    );
+    return hasMediaBodyHint(text);
   }
 
   function extractImages(text: string): string[] {
@@ -153,25 +148,23 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
 
   function handleText(text: string): void {
     if (!text || !hasManifestHint(text)) return;
-    const cleanText = clean(text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text);
+    const cleanText = clean(text.length > 800_000 ? text.slice(0, 800_000) : text);
     const urls = extractUrls(cleanText);
     emit(urls, cleanText);
-    // Companion progressive file (same API response often carries BOTH the
-    // HLS manifest and the direct mp4 — Pinterest-style). Same channel: the
-    // background classifies file URLs as direct rows (chunk-guarded there).
-    if (urls.length) {
-      try {
-        const files = extractMediaFileUrls(cleanText).filter((u) => remember("f:" + u));
-        if (files.length) {
-          try {
-            window.postMessage({ __vdg: "manifest-urls", urls: files }, "*");
-          } catch {
-            /* ignore */
-          }
+    // Progressive files in the same body (Pinterest HLS+mp4, Instagram
+    // video_versions, inline DASH BaseURL). Independent of playlist hits —
+    // Instagram GraphQL often has the mp4 and no .m3u8/.mpd URL at all.
+    try {
+      const files = extractMediaFileUrls(cleanText).filter((u) => remember("f:" + u));
+      if (files.length) {
+        try {
+          window.postMessage({ __vdg: "manifest-urls", urls: files }, "*");
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* never break page traffic */
       }
+    } catch {
+      /* never break page traffic */
     }
   }
 
@@ -245,11 +238,6 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
         finish(capped || timedOut);
       })();
     });
-  }
-
-  /** Inspect a prefix of a response body (URL sniffing). */
-  function peekText(res: Response): Promise<string> {
-    return peekBody(res, MAX_BODY, PEEK_TIME_MS).then((r) => r.text);
   }
 
   // ---- manifest body capture --------------------------------------------
@@ -667,11 +655,15 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
             if (!peekAllowed()) return;
             if (mediaish(url, ct) || !apiish(ct)) return;
             const len = Number(res.headers?.get?.("content-length") ?? "0");
-            if (len > MAX_BODY * 2) return;
+            const jsonish = (ct ?? "").toLowerCase().includes("json");
+            // Instagram GraphQL bodies are often >400KB; the peek itself is
+            // still bounded. Only skip absurd payloads.
+            if (!jsonish && len > MAX_BODY * 2) return;
+            if (jsonish && len > 5_000_000) return;
             started = true;
             peekInflight++;
-            void peekText(res)
-              .then(handleText)
+            void peekBody(res, jsonish ? 800_000 : MAX_BODY, jsonish ? 2500 : PEEK_TIME_MS)
+              .then((r) => handleText(r.text))
               .catch(() => undefined)
               .finally(() => {
                 peekInflight--;
@@ -719,7 +711,7 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
               if (this.status < 200 || this.status >= 300) return;
               // Binary/blob consumers never carry manifest text.
               const rt = (this as XMLHttpRequest).responseType;
-              if (rt !== "" && rt !== "text") return;
+              if (rt !== "" && rt !== "text" && rt !== "json") return;
               const rec = this as unknown as Record<string, unknown>;
               if (String(rec.__vdgMethod ?? "GET").toUpperCase() !== "GET") return;
               const url = String(rec.__vdgUrl ?? "");
@@ -742,8 +734,19 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
               if (pageHidden()) return;
               if (!peekAllowed()) return;
               if (mediaish(url, responseCt) || !apiish(responseCt)) return;
-              const text = typeof this.responseText === "string" ? this.responseText : "";
-              if (!text || text.length > MAX_BODY * 2) return;
+              let text = "";
+              if (rt === "json") {
+                try {
+                  const resp = this.response;
+                  text = typeof resp === "string" ? resp : JSON.stringify(resp);
+                } catch {
+                  return;
+                }
+              } else {
+                text = typeof this.responseText === "string" ? this.responseText : "";
+              }
+              if (!text) return;
+              if (text.length > 800_000) text = text.slice(0, 800_000);
               handleText(text);
             } catch {
               /* never break page traffic */
@@ -780,8 +783,11 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
 
   function isMediaSourceObj(obj: unknown): boolean {
     try {
-      const MS = (window as unknown as { MediaSource?: object }).MediaSource;
-      if (MS && obj instanceof (MS as object as new () => object)) return true;
+      const w = window as unknown as { MediaSource?: object; ManagedMediaSource?: object };
+      if (w.MediaSource && obj instanceof (w.MediaSource as object as new () => object)) return true;
+      if (w.ManagedMediaSource && obj instanceof (w.ManagedMediaSource as object as new () => object)) {
+        return true;
+      }
     } catch {
       /* ignore */
     }
@@ -1066,7 +1072,7 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
       (URL as unknown as Record<string, unknown>).createObjectURL = function (obj: unknown): string {
         const url = (origCUO as (o: unknown) => string)(obj);
         try {
-          if (MS.MediaSource && obj instanceof MS.MediaSource) {
+          if (isMediaSourceObj(obj)) {
             const id = ensureMs(obj as object);
             blobToMs.set(url, id);
             while (blobToMs.size > 100) {
@@ -1090,53 +1096,75 @@ import { extractMediaFileUrls } from "./lib/apiUrls";
       /* ignore */
     }
 
-    // -- addSourceBuffer: bind track + wrap appendBuffer --
-    try {
-      if (MS.MediaSource?.prototype?.addSourceBuffer) {
-        const origAdd = MS.MediaSource.prototype.addSourceBuffer;
-        MS.MediaSource.prototype.addSourceBuffer = function (
-          this: MediaSource,
-          mime: string,
-        ): SourceBuffer {
-          const sb = origAdd.call(this, mime);
-          try {
-            const msId = ensureMs(this as object);
-            const session = sessions.get(msId);
-            const trackIdx = session ? session.tracks.length : 0;
-            const track: MsTrack = { mime: String(mime ?? ""), kind: trackKind(String(mime ?? "")), parts: [], bytes: 0, overflow: false };
-            session?.tracks.push(track);
-            sbInfo.set(sb as object, { msId, trackIdx });
-            const origAppend = sb.appendBuffer.bind(sb);
-            (sb as unknown as Record<string, unknown>).appendBuffer = function (data: unknown): void {
-              try {
-                const info = sbInfo.get(sb as object);
-                const sess = info ? sessions.get(info.msId) : undefined;
-                const trk = sess?.tracks[info?.trackIdx ?? -1];
-                // Fast path: capped/DRM sessions cost one map lookup, zero copy.
-                if (trk && !trk.overflow && sess && !sess.eme && !pageEme) {
-                  const len = byteLengthOf(data);
-                  if (len > 0) {
-                    sess.lastAppend = Date.now();
-                    if (trk.bytes + len > TRACK_CAP) {
-                      trk.overflow = true;
-                    } else {
-                      const bytes = toBytes(data);
-                      if (bytes && bytes.byteLength > 0) {
-                        trk.parts.push(bytes);
-                        trk.bytes += bytes.byteLength;
-                      }
-                    }
-                  }
-                }
-              } catch {
-                /* capture must never break playback */
+    // -- addSourceBuffer: bind track. appendBuffer is wrapped on the
+    // prototype below so players that call SourceBuffer.prototype.appendBuffer
+    // (Instagram/Facebook, dash.js) still get captured.
+    function captureAppend(sb: object, data: unknown): void {
+      try {
+        const info = sbInfo.get(sb);
+        const sess = info ? sessions.get(info.msId) : undefined;
+        const trk = sess?.tracks[info?.trackIdx ?? -1];
+        if (trk && !trk.overflow && sess && !sess.eme && !pageEme) {
+          const len = byteLengthOf(data);
+          if (len > 0) {
+            sess.lastAppend = Date.now();
+            if (trk.bytes + len > TRACK_CAP) {
+              trk.overflow = true;
+            } else {
+              const bytes = toBytes(data);
+              if (bytes && bytes.byteLength > 0) {
+                trk.parts.push(bytes);
+                trk.bytes += bytes.byteLength;
               }
-              (origAppend as (d: unknown) => void)(data);
-            };
-          } catch {
-            /* ignore */
+            }
           }
-          return sb;
+        }
+      } catch {
+        /* capture must never break playback */
+      }
+    }
+
+    function wrapAddSourceBuffer(proto: { addSourceBuffer?: (mime: string) => SourceBuffer } | undefined): void {
+      if (!proto?.addSourceBuffer) return;
+      const origAdd = proto.addSourceBuffer;
+      proto.addSourceBuffer = function (this: MediaSource, mime: string): SourceBuffer {
+        const sb = origAdd.call(this, mime);
+        try {
+          const msId = ensureMs(this as object);
+          const session = sessions.get(msId);
+          const trackIdx = session ? session.tracks.length : 0;
+          const track: MsTrack = {
+            mime: String(mime ?? ""),
+            kind: trackKind(String(mime ?? "")),
+            parts: [],
+            bytes: 0,
+            overflow: false,
+          };
+          session?.tracks.push(track);
+          sbInfo.set(sb as object, { msId, trackIdx });
+        } catch {
+          /* ignore */
+        }
+        return sb;
+      };
+    }
+
+    try {
+      wrapAddSourceBuffer(MS.MediaSource?.prototype);
+      const MMS = (window as unknown as { ManagedMediaSource?: { prototype?: { addSourceBuffer?: (mime: string) => SourceBuffer } } })
+        .ManagedMediaSource;
+      wrapAddSourceBuffer(MMS?.prototype);
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      const SB = (window as unknown as { SourceBuffer?: { prototype?: { appendBuffer?: (data: BufferSource) => void } } }).SourceBuffer;
+      if (SB?.prototype?.appendBuffer) {
+        const origAppend = SB.prototype.appendBuffer;
+        SB.prototype.appendBuffer = function (this: SourceBuffer, data: BufferSource): void {
+          captureAppend(this as object, data);
+          origAppend.call(this, data);
         };
       }
     } catch {

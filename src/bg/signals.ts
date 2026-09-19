@@ -43,7 +43,23 @@ function upsertBlobFile(
     : `video-${ts}.${ext}`;
   const meta = `${mbLabel(backing.size)} • direct file`;
   const existing = items.find((x) => x.url === url);
-  if (!existing) {
+  if (!existing || existing.type === "blob") {
+    // A blob: player often appears before the hook has listed the backing
+    // Blob (play starts, then bytes land). Upgrade the error placeholder in
+    // place so the row becomes a real download instead of staying stuck.
+    if (existing) {
+      existing.type = "blobfile";
+      existing.error = undefined;
+      existing.filename = filename;
+      existing.autoNamed = !title;
+      existing.meta = meta;
+      existing.drmProtected = false;
+      existing.frameId = existing.frameId ?? frameId;
+      existing.pageTitle = existing.pageTitle ?? pageTitle;
+      if (v.poster && !existing.poster) existing.poster = v.poster;
+      applyTitle(existing, v.title, true) || applyTitle(existing, pageTitle, false);
+      return true;
+    }
     items.push({
       url,
       tabId,
@@ -436,6 +452,22 @@ export async function handleCaptureSessions(
     }
   }
   if (pruned) changed = true;
+
+  // A blob: error row is only useful while nothing downloadable exists for
+  // that player. Once this session has captured bytes, drop the placeholder.
+  const capturedBlobs = new Set<string>();
+  for (const s of sessions) {
+    if (!s?.blobUrl || s.eme || s.pageEme) continue;
+    if ((s.tracks ?? []).some((t) => t.bytes > 0)) capturedBlobs.add(s.blobUrl);
+  }
+  if (capturedBlobs.size) {
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].type === "blob" && capturedBlobs.has(items[i].url)) {
+        items.splice(i, 1);
+        changed = true;
+      }
+    }
+  }
 
   if (changed) {
     await persistTab(tabId, enforceCaps(items));

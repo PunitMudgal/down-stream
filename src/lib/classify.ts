@@ -55,6 +55,19 @@ export function looksLikeChunk(url: string): boolean {
   return false;
 }
 
+/** Instagram/Facebook progressive video files served without a file extension. */
+export function looksLikeHostedVideoFile(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    if (!path.includes("/o1/v/")) return false;
+    return /(^|\.)(cdninstagram\.com|fbcdn\.net)$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
 export function classify(url: string, contentType: string): MediaType | null {
   const ct = contentType.toLowerCase().split(";")[0].trim();
   const lower = url.toLowerCase().split("?")[0].split("#")[0];
@@ -67,6 +80,9 @@ export function classify(url: string, contentType: string): MediaType | null {
   // Raw stream fragments are never standalone videos — the cluster engine
   // owns them (they'd otherwise flood the popup, e.g. X's video/mp4 .m4s).
   if (looksLikeChunk(url)) return null;
+  // Instagram/Facebook progressive files often have no extension and no
+  // Content-Type at classify time (API JSON). The `/o1/v/` path is the file.
+  if (looksLikeHostedVideoFile(url)) return "mp4";
   if (ct === "video/mp4") return "mp4";
   if (ct === "video/webm") return "webm";
   if (ct === "video/ogg") return "ogg";

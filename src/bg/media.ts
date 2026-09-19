@@ -1,6 +1,7 @@
 // Media-item helpers: exclusions, badges, titles, caps, upserts.
 // Moved verbatim from background.ts — zero behavior change.
 import { cleanTitle, sanitizeStem } from "../lib/download";
+import { forDisplay } from "../lib/target";
 import type { MediaItem, VideoSignal } from "../lib/types";
 import { getTabItems, persistTab } from "./store";
 
@@ -46,11 +47,7 @@ export function hasAudioCodec(c: string): boolean {
  * count the popup does (manifests dominate; fragments/placeholders hidden).
  */
 export function countForBadge(items: MediaItem[]): number {
-  const hasManifest = items.some(
-    (x) => (x.type === "hls" || x.type === "dash") && (x.variants?.length ?? 0) > 0 && !x.drmProtected,
-  );
-  const visible = hasManifest ? items.filter((x) => x.type !== "blob" && x.type !== "segments") : items;
-  return visible.filter((x) => x.type !== "blob").length;
+  return forDisplay(items).filter((x) => x.type !== "blob").length;
 }
 
 /** Badge counts real videos, not blob placeholders or raw fragments. */

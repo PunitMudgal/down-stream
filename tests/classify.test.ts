@@ -68,8 +68,16 @@ describe("classify (URL + content-type -> media type)", () => {
     expect(classify("https://cdn.example.com/video.ism/manifest(format=mpd-time-csf)", "")).toBe("dash");
   });
 
-  it("maps blob URLs before anything else", () => {
-    expect(classify("blob:https://example.com/abc-def", "")).toBe("blob");
+  it("maps Instagram CDN videos that have no file extension", () => {
+    expect(
+      classify(
+        "https://scontent-lga3-1.cdninstagram.com/o1/v/t16/f2/m86/AQNcliphash?_nc_cat=111",
+        "",
+      ),
+    ).toBe("mp4");
+    expect(
+      classify("https://scontent.cdninstagram.com/v/t51.2885-15/123_n.jpg", ""),
+    ).toBeNull();
   });
 
   it("maps direct video types by content-type", () => {

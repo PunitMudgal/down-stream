@@ -99,6 +99,32 @@ const TYPE_RANK: Record<string, number> = {
  * the most recently detected. Returns undefined when nothing is downloadable
  * (so the caller reports "nothing found" rather than starting a doomed job).
  */
+type DisplayItem = {
+  type: string;
+  variants?: unknown[];
+  drmProtected?: boolean;
+};
+
+/**
+ * Popup / badge display filter. Blob placeholders are an explanation, not a
+ * file: hide them as soon as anything downloadable exists. Parsed HLS/DASH
+ * rows also replace raw chunk groups.
+ */
+export function forDisplay<T extends DisplayItem>(items: T[]): T[] {
+  const hasParsedManifest = items.some(
+    (x) =>
+      (x.type === "hls" || x.type === "dash") &&
+      (x.variants?.length ?? 0) > 0 &&
+      !x.drmProtected,
+  );
+  const hasDownloadable = items.some((x) => x.type !== "blob" && !x.drmProtected);
+  return items.filter((x) => {
+    if (x.type === "blob" && hasDownloadable) return false;
+    if (hasParsedManifest && x.type === "segments") return false;
+    return true;
+  });
+}
+
 export function pickBestTabItem<T extends TargetItem>(items: T[]): T | undefined {
   const rank = (t: T): number => TYPE_RANK[t.type] ?? Number.MAX_SAFE_INTEGER;
   const usable = items.filter((i) => TYPE_RANK[i.type] !== undefined);

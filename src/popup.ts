@@ -2,6 +2,7 @@ import { classify as classifyBare } from "./lib/classify";
 import { cleanTitle, filenameForUrl, sanitizeStem } from "./lib/download";
 import { basenameOf } from "./lib/filename";
 import { formatBytes, formatDuration, formatEta, formatProgressPair, formatSpeed } from "./lib/format";
+import { forDisplay } from "./lib/target";
 import type {
   BatchSnapshot,
   DownloadJobState,
@@ -716,10 +717,25 @@ async function loadMedia(): Promise<void> {
   const pagePromise = scanPageDirect(tabId);
 
   const [workerSettled, pageSettled] = await Promise.allSettled([workerPromise, pagePromise]);
-  const workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
+  let workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
   const pageScan = pageSettled.status === "fulfilled"
     ? pageSettled.value
     : { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [] };
+  // COLLECT_FOR_POPUP pushes VIDEO_ELEMENTS (blobs/captures) before it
+  // answers — re-read so a blob: player that just became downloadable
+  // shows a button instead of the placeholder error.
+  if (workerAlive) {
+    try {
+      const mediaRes = await withTimeout(
+        chrome.runtime.sendMessage({ type: "GET_MEDIA", tabId }),
+        4000,
+        "Refreshing detections",
+      );
+      if (Array.isArray(mediaRes?.items)) workerItems = mediaRes.items as MediaItem[];
+    } catch {
+      /* keep the first worker snapshot */
+    }
+  }
   const titleByBlob = new Map<string, string>();
   for (const v of pageScan.videos) {
     if (v.currentSrc.startsWith("blob:") && v.title) {
@@ -732,15 +748,18 @@ async function loadMedia(): Promise<void> {
     ...domSessionsToItems(pageScan.msSessions, tabId, titleByBlob, pageScan.pageTitle),
   ];
 
-  // Merge: worker detections win on exact URL; page-only signals fill gaps.
-  // Adapter items are authoritative rows from a specialized extractor (they
-  // already passed the worker's merge/classify/parse normalization), so they
-  // join the merge last and cannot be overwritten by generic rows.
+  // Merge: worker detections win on exact URL unless the worker row is still
+  // a blob placeholder and the page has a real row for the same URL.
+  // Adapter items are authoritative rows from a specialized extractor.
   // Extra blob placeholders collapse to one row (all mean "player buffer").
   const byUrl = new Map<string, MediaItem>();
   for (const it of workerItems) byUrl.set(it.url, it);
   for (const it of pageItems) {
-    if (byUrl.has(it.url)) continue;
+    const prev = byUrl.get(it.url);
+    if (prev) {
+      if (prev.type === "blob" && it.type !== "blob") byUrl.set(it.url, it);
+      continue;
+    }
     if (it.type === "blob" && [...byUrl.values()].some((x) => x.type === "blob")) continue;
     byUrl.set(it.url, it);
   }
@@ -753,25 +772,11 @@ async function loadMedia(): Promise<void> {
       tabId,
       pageTitle: it.pageTitle ?? pageScan.pageTitle,
     };
-    // Pre-parsed adapter manifests (variants already populated, typically
-    // after a worker normalization pass) must not be clobbered by page rows.
     byUrl.set(it.url, row);
   }
   const merged = [...byUrl.values()];
 
-  // Production display filter: parsed manifests strictly dominate raw
-  // chunk groups and player-buffer placeholders. When at least one HLS/DASH
-  // item with qualities exists, blob + segments rows are pure noise — hide
-  // them (storage keeps them for manifest-less sites).
-  const hasManifest = merged.some(
-    (x) => (x.type === "hls" || x.type === "dash") && (x.variants?.length ?? 0) > 0 && !x.drmProtected,
-  );
-  const items = merged
-    .filter((x) => {
-      if (!hasManifest) return true;
-      return x.type !== "blob" && x.type !== "segments";
-    })
-    .sort((a, b) => b.detectedAt - a.detectedAt);
+  const items = forDisplay(merged).sort((a, b) => b.detectedAt - a.detectedAt);
 
   if (!workerAlive && pageItems.length > 0) {
     showWorkerWarning();

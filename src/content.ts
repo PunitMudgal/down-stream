@@ -456,6 +456,52 @@ function collect(): VideoSignal[] {
   }
 }
 
+/**
+ * Page-level video URLs (Open Graph / Twitter) that SPA players never put on
+ * the <video> element. Attached as candidates on blob: players so a reel that
+ * only exposes a blob: src still has a downloadable https file when the page
+ * advertised one.
+ */
+function pageMediaUrls(): string[] {
+  const out: string[] = [];
+  try {
+    const sels = [
+      'meta[property="og:video"]',
+      'meta[property="og:video:secure_url"]',
+      'meta[property="og:video:url"]',
+      'meta[name="twitter:player:stream"]',
+    ];
+    for (const sel of sels) {
+      const u = absolutize(document.querySelector(sel)?.getAttribute("content") ?? null);
+      if (u && !u.startsWith("blob:") && !out.includes(u)) out.push(u);
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+function attachPageMediaUrls(videos: VideoSignal[]): void {
+  const extras = pageMediaUrls();
+  if (extras.length === 0) return;
+  let attached = false;
+  for (const v of videos) {
+    const blobish =
+      (v.currentSrc && v.currentSrc.startsWith("blob:")) ||
+      (v.candidates ?? []).some((c) => typeof c === "string" && c.startsWith("blob:"));
+    if (!blobish) continue;
+    const cands = v.candidates ?? [];
+    for (const u of extras) {
+      if (!cands.includes(u)) cands.push(u);
+    }
+    v.candidates = cands;
+    attached = true;
+  }
+  if (!attached && videos.length === 0) {
+    for (const u of extras) videos.push({ currentSrc: u, candidates: [u] });
+  }
+}
+
 /** Stable content script fingerprint for adapter extraction results. */
 let lastAdapterKey = "";
 
@@ -519,14 +565,21 @@ async function report(force: boolean): Promise<void> {
   if (!force && pageHidden()) return;
   try {
     const videos = collect();
+    attachPageMediaUrls(videos);
     const adapterItems = collectAdapterItems(videos);
     const hasAdapterItems = adapterItems.length > 0;
     const now = Date.now();
     let sessions: MsSessionMeta[] = [];
     let blobs: BlobFileInfo[] = [];
-    // Session/blob metadata only on demand or at a slow cadence: every
-    // report used to round-trip the MAIN hook, waking both worlds constantly.
-    if (force || now - lastSessQuery > 15000) {
+    // Session/blob metadata on demand, on a slow cadence, OR whenever a
+    // blob: player is on screen — those players have no other downloadable
+    // URL until the hook reports the backing Blob / MSE capture.
+    const blobPlayer = videos.some(
+      (v) =>
+        (v.currentSrc && v.currentSrc.startsWith("blob:")) ||
+        (v.candidates ?? []).some((c) => typeof c === "string" && c.startsWith("blob:")),
+    );
+    if (force || blobPlayer || now - lastSessQuery > 15000) {
       lastSessQuery = now;
       [sessions, blobs] = await Promise.all([queryMsSessions(), queryBlobs()]);
       if (dead) return;
@@ -1051,12 +1104,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           /* ignore */
         }
         lastSessQuery = Date.now();
-        const [videos, msSessions, blobs] = await Promise.all([
-          Promise.resolve(collect()),
-          queryMsSessions(),
-          queryBlobs(),
-        ]);
+        const videos = collect();
+        attachPageMediaUrls(videos);
+        const [msSessions, blobs] = await Promise.all([queryMsSessions(), queryBlobs()]);
         const adapterItems = collectAdapterItems(videos);
+        // Keep the worker in lockstep with the popup scan so a blob: player
+        // that just got a backing Blob/capture upgrades before Download.
+        await bgSend({
+          type: "VIDEO_ELEMENTS",
+          tabId: -1,
+          videos,
+          pageTitle: document.title,
+          msSessions,
+          blobs,
+          adapterItems: adapterItems.length ? adapterItems : undefined,
+        });
         sendResponse({ ok: true, videos, pageTitle: document.title, msSessions, blobs, adapterItems });
       } catch (err) {
         noteDead(err);

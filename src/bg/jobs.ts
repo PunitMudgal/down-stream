@@ -224,7 +224,8 @@ export async function startDownload(
   const item = items.find((x) => x.url === itemUrl);
   if (!item) throw new Error("Video no longer listed for this tab. Rescan and try again.");
   if (item.drmProtected) throw new Error(item.drmReason ?? "Protected content — cannot download.");
-  if (item.type === "blob") throw new Error("Blob/MSE stream — not directly downloadable.");
+  // Blob placeholders used to throw here. The hook may now hold the page Blob
+  // (or will decline with a clear error) — try the same pull as blobfile.
 
   const existing = resumeJobId ? jobMemory.get(resumeJobId) : undefined;
   const chosenVariant =
@@ -242,10 +243,11 @@ export async function startDownload(
   // pulls bytes from the page hook and streams them to the offscreen
   // document (existing DOWNLOAD_BLOB finalization). A video track pairs
   // with its session's audio track into ONE merged file.
-  if (item.type === "blobfile") {
+  if (item.type === "blobfile" || item.type === "blob") {
     // Page-held Blob: the content script slices the exact bytes out of the
     // page and streams them to the offscreen document (never re-fetched —
-    // one-time URLs keep working).
+    // one-time URLs keep working). type "blob" is the un-upgraded placeholder
+    // for the same URL — the hook declines if it never captured those bytes.
     const jobId = newJobId();
     const job: DownloadJobState = {
       jobId,

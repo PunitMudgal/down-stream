@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Download Grabber (local)",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Detect playable video on the current tab and download it locally. No backend, no third-party calls. YouTube is not supported.",
   "icons": {
     "16": "downstream.png",
@@ -40,7 +40,9 @@
       ],
       "js": ["src/content.ts"],
       "run_at": "document_idle",
-      "all_frames": true
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
     },
     {
       "matches": ["<all_urls>"],
@@ -55,6 +57,8 @@
       "js": ["src/hook.ts"],
       "run_at": "document_start",
       "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
       "world": "MAIN"
     }
   ],

@@ -33,7 +33,7 @@ Detect playable video on any tab and download it locally — no backend, no thir
 
 1. `npm install`
 2. `npm run build`
-3. Open `chrome://extensions` (or `brave://extensions`) → enable **Developer mode** → **Load unpacked** → select `dist/` (after build). Confirm version **1.0.0**.
+3. Open `chrome://extensions` (or `brave://extensions`) → enable **Developer mode** → **Load unpacked** → select `dist/` (after build). Confirm version **1.0.1**.
 4. **Reload the web page's tab** after installing/updating (content scripts only inject into fresh loads).
 5. Test: MDN `flower.mp4` (direct), `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8` (HLS master), `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd` (DASH), any X/Twitter feed video.
 6. Click the extension icon → pick quality → Download. You can close the popup.
@@ -55,6 +55,7 @@ Keyboard shortcuts (`Alt+Shift+D` download best video, `Alt+Shift+V` open popup)
 
 ## Version history
 
+- **1.0.1** — Blob/MSE players (Instagram reels and similar) now surface a real download: GraphQL progressive files are extracted, in-player buffers are captured, and the old “play then Rescan” placeholder upgrades instead of sticking.
 - **1.0.0** — UX polish: batch selection with a concurrency-capped queue, rolling speed + ETA, filename templates and a download subfolder (options page), completion notifications with "Show in folder", and a re-downloadable download history. Large assembled files now save through `chrome.downloads` (from the offscreen blob URL) so the subfolder and templated name apply and the file is tracked.
 - **0.9.0** — resumable downloads (OPFS-persisted segments: restart-safe resume, orphan pruning, cancel cleanup) and detection coverage (context menu + keyboard shortcuts with a shared target resolver, site-adapter registry, `#EXT-X-MEDIA` audio-rendition pairing, connection-aware quality recommendation).
 - **0.8.0** — capture-path 1.5 GB cap fixed via auto-split parts, split-A/V muxing hardening, offscreen capture purging, restart-recovery handshake.
