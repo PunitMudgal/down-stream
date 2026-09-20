@@ -23,6 +23,16 @@ export interface FetchSegmentsOptions {
    * `isGateFailure`. Supplied by the offscreen document.
    */
   relay?: SegmentRelayFn;
+  /**
+   * Re-resolve the segment list when a signed URL expires mid-download.
+   * Must return the same number of URLs (playlist order). Holes already
+   * fetched are kept; only missing indices are retried with the new tokens.
+   */
+  refreshUrls?: () => Promise<string[] | null>;
+  /** Parallel fetch pool (default 8). Lower on short-lived signed CDNs. */
+  concurrency?: number;
+  /** Cap on playlist refreshes during one fetch (default 8). */
+  maxRefreshes?: number;
 }
 
 /** Fetch one URL with the page's own request context (see FetchSegmentsOptions). */
@@ -971,6 +981,27 @@ export async function fetchSegments(
     }
   };
   let firstErr: unknown = null;
+  let refreshes = 0;
+  const maxRefreshes = Math.max(0, opts?.maxRefreshes ?? 8);
+  let refreshInflight: Promise<boolean> | null = null;
+  const tryRefresh = async (): Promise<boolean> => {
+    if (!opts?.refreshUrls || refreshes >= maxRefreshes) return false;
+    if (refreshInflight) return refreshInflight;
+    refreshInflight = (async () => {
+      try {
+        const fresh = await opts.refreshUrls!();
+        if (!fresh || fresh.length !== total) return false;
+        for (let k = 0; k < total; k++) urls[k] = fresh[k];
+        refreshes++;
+        return true;
+      } catch {
+        return false;
+      }
+    })().finally(() => {
+      refreshInflight = null;
+    });
+    return refreshInflight;
+  };
   const worker = async (): Promise<void> => {
     while (true) {
       throwIfAborted(signal);
@@ -985,7 +1016,17 @@ export async function fetchSegments(
       // Skip holes filled by a racing worker after resume mapping.
       if (parts[i]) continue;
       try {
-        const buf = await fetchBuffer(urls[i], signal, scope, opts?.relay);
+        let buf: ArrayBuffer | undefined;
+        for (;;) {
+          try {
+            buf = await fetchBuffer(urls[i], signal, scope, opts?.relay);
+            break;
+          } catch (err) {
+            if (signal?.aborted) throw err;
+            if (!isExpiredFailure(err) || !(await tryRefresh())) throw err;
+          }
+        }
+        if (!buf) throw new Error(`Segment fetch failed: ${urls[i]}`);
         parts[i] = buf;
         bytes += buf.byteLength;
         if (bytes > MAX_BYTES) {
@@ -1011,7 +1052,7 @@ export async function fetchSegments(
       }
     }
   };
-  const pool = Math.min(FETCH_CONCURRENCY, total);
+  const pool = Math.min(Math.max(1, opts?.concurrency ?? FETCH_CONCURRENCY), total);
   await Promise.all(Array.from({ length: pool }, () => worker()));
   throwIfAborted(signal);
   if (firstErr) {

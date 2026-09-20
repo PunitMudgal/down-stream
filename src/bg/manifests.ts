@@ -39,17 +39,30 @@ export interface FetchManifestOptions {
    * playlist bytes. Absent = ask the whole tab.
    */
   frameId?: number;
+  /**
+   * Prefer a live page-world fetch over the worker. Token-gated CDNs accept
+   * the page's Referer/Origin; the extension origin often gets 403/404.
+   */
+  preferPage?: boolean;
+  /**
+   * Skip the player's captured copy. Captured playlists keep the segment
+   * tokens from when the player first loaded them — often already expired
+   * by Download click.
+   */
+  skipCapture?: boolean;
 }
 
 /** One fetch attempt from the worker context, with the page's auth replayed. */
 async function fetchFromWorker(
   tabId: number,
   url: string,
+  opts: { noStore?: boolean } = {},
 ): Promise<{ text?: string; attempt?: FetchAttempt }> {
   const net = lookupNet(tabId, url);
   try {
     const res = await fetch(url, {
       credentials: "include",
+      cache: opts.noStore ? "no-store" : undefined,
       headers: net?.headers,
       referrer: net?.referrer,
       referrerPolicy: net?.referrer ? "unsafe-url" : undefined,
@@ -103,11 +116,16 @@ async function fetchFromPage(
   tabId: number,
   frameId: number | undefined,
   url: string,
+  opts: { skipCapture?: boolean } = {},
 ): Promise<{ text?: string; attempt?: FetchAttempt }> {
   if (tabId < 0) return {};
   try {
     const res = await Promise.race([
-      sendToFrame(tabId, frameId, { type: "FETCH_TEXT", url }),
+      sendToFrame(tabId, frameId, {
+        type: "FETCH_TEXT",
+        url,
+        skipCapture: opts.skipCapture === true,
+      }),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Page fetch timed out")), 20_000),
       ),
@@ -139,19 +157,50 @@ export async function fetchManifestText(
   url: string,
   opts: FetchManifestOptions = {},
 ): Promise<string> {
+  const wantFresh = Boolean(opts.forceNetwork || opts.preferPage);
+  const skipCapture = Boolean(opts.skipCapture || wantFresh);
   const cached = manifestCache.get(url);
-  if (cached !== undefined && !opts.forceNetwork) return cached;
+  if (cached !== undefined && !wantFresh) return cached;
 
   // Fastest first: the page's own copy of the playlist costs no network.
   // Skipped when freshness matters — a download re-resolves signed segment
-  // URLs and a minutes-old playlist can carry expired tokens (the page step
-  // below still falls back to the captured copy if the network refuses).
-  if (!opts.forceNetwork) {
+  // URLs and a minutes-old playlist can carry expired tokens.
+  if (!skipCapture) {
     const captured = await probePageCapture(tabId, opts.frameId, url);
     if (captured !== undefined) {
       manifestCache.set(url, captured);
       return captured;
     }
+  }
+
+  const take = (text: string | undefined): string | undefined => {
+    if (text === undefined) return undefined;
+    manifestCache.set(url, text);
+    return text;
+  };
+
+  if (wantFresh) {
+    // Download-time: never serve a cached/captured playlist. Prefer a live
+    // page-world fetch (the context token-gated CDNs actually accept), then
+    // the worker with cache:no-store. A stale cache hit here is the 404
+    // mid-download failure mode.
+    let workerAttempt: FetchAttempt | undefined;
+    let pageAttempt: FetchAttempt | undefined;
+    try {
+      const page = await fetchFromPage(tabId, opts.frameId, url, { skipCapture: true });
+      if (page.text !== undefined) return take(page.text) as string;
+      pageAttempt = page.attempt;
+    } catch (err) {
+      throw err;
+    }
+    try {
+      const worker = await fetchFromWorker(tabId, url, { noStore: true });
+      if (worker.text !== undefined) return take(worker.text) as string;
+      workerAttempt = worker.attempt;
+    } catch (err) {
+      throw err;
+    }
+    throw new Error(manifestFailureMessage(workerAttempt, pageAttempt));
   }
 
   let workerAttempt: FetchAttempt | undefined;

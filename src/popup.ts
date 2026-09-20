@@ -1,3 +1,4 @@
+import { BLOB_PLACEHOLDER_HINT } from "./lib/blobResolve";
 import { classify as classifyBare } from "./lib/classify";
 import { cleanTitle, filenameForUrl, sanitizeStem } from "./lib/download";
 import { basenameOf } from "./lib/filename";
@@ -411,18 +412,6 @@ function domSessionsToItems(
         });
         continue;
       }
-      if (s.pageEme) {
-        items.push({
-          url, tabId, type: "capture", captureRef: `${s.id}:${t.idx}`,
-            captureKind: t.kind, filename: "",
-          title: title || undefined,
-          titleFromPage: title ? !elTitle : undefined,
-          detectedAt: now, drmProtected: true,
-          drmReason: "This page uses DRM playback, so buffered captures are disabled here to stay safe.",
-          meta: `${kindLabel}${sizeLabel} • captured buffer`,
-        });
-        continue;
-      }
       if (t.bytes <= 0) continue;
       const ts = new Date(now).toISOString().replace(/[:.]/g, "-").slice(0, 19);
       items.push({
@@ -476,7 +465,7 @@ function domSignalsToItems(signals: VideoSignal[], tabId: number, pageTitle?: st
           drmProtected: false,
           poster: v.poster,
           meta,
-          error: "Blob/MSE stream (in-player buffer). The file is captured from the network when it loads. Play the video, then Rescan.",
+          error: BLOB_PLACEHOLDER_HINT,
         });
       } else if (type === "hls" || type === "dash") {
         items.push({
@@ -811,12 +800,14 @@ async function loadMedia(): Promise<void> {
     updateCount();
     return;
   }
-  const downloadable = items.filter((x) => x.type !== "blob").length;
+  // Every non-DRM row is actionable now (a blob row resolves its source at
+  // click time), so the nudge is only for a page with nothing downloadable.
+  const usable = items.filter((x) => !x.drmProtected).length;
   setStatus(
     workerAlive
-      ? downloadable > 0
+      ? usable > 0
         ? ""
-        : "Player streams found. Play the video, then Rescan."
+        : "Every video on this page is DRM-protected — these can't be downloaded."
       : "Worker unreachable. Direct files can still download; quality lists need a reload.",
   );
   for (const item of items) listEl.appendChild(renderCard(item));
@@ -937,9 +928,9 @@ function showFatal(message: string): void {
 
 // ---- batch selection ------------------------------------------------------
 
-/** Items that make sense in a batch: real downloads, never DRM or blob rows. */
+/** Items that make sense in a batch: real downloads, never DRM rows. */
 function isSelectable(item: MediaItem): boolean {
-  if (item.drmProtected || item.type === "blob") return false;
+  if (item.drmProtected) return false;
   if (item.type === "hls" || item.type === "dash") return (item.variants?.length ?? 0) > 0;
   if (item.type === "segments") return (item.segments?.length ?? 0) > 0;
   return true;
@@ -1243,7 +1234,18 @@ function renderCard(item: MediaItem): HTMLElement {
     btn.onclick = () => void handleStartDownload(item, undefined, btn);
     meta.appendChild(btn);
   } else if (item.type === "blob") {
-    meta.appendChild(errorRow(item.error ?? "Blob stream. Not directly downloadable."));
+    // A blob: player IS downloadable: at click time the page is asked for the
+    // video's bytes — the file behind the object URL when it is Blob-backed,
+    // or the segments its player already appended when it is a MediaSource
+    // buffer. The hint stays visible because "play it first" is the honest
+    // state of this row (previously this row had nothing to click at all).
+    const btn = document.createElement("button");
+    btn.className = "dl";
+    btn.textContent = "Download";
+    btn.title = "Read this video out of the page — file bytes or the buffer its player filled";
+    btn.onclick = () => void handleStartDownload(item, undefined, btn);
+    meta.appendChild(btn);
+    meta.appendChild(errorRow(item.error ?? BLOB_PLACEHOLDER_HINT));
   } else if (item.error) {
     // Any other type that failed to resolve — surface it rather than hide it.
     meta.appendChild(errorRow(item.error));
@@ -1525,6 +1527,8 @@ async function handleStartDownload(
     return;
   }
   btn.disabled = true;
+  const expired = jobsForItem(item.url).some((j) => j.expired);
+  if (expired) setStatus("Refreshing stream URLs and restarting download…");
   // Preferred path: background worker (tracks jobs, offscreen for HLS/DASH).
   if (workerAlive && currentTabId != null) {
     try {
@@ -1534,8 +1538,10 @@ async function handleStartDownload(
           tabId: currentTabId,
           itemUrl: item.url,
           variantId,
+          refresh: expired,
+          resumeJobId: jobsForItem(item.url).find((j) => j.expired)?.jobId,
         }),
-        15000,
+        45000,
         "Starting download",
       );
       if (!res?.ok) {

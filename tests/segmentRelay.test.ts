@@ -135,4 +135,42 @@ describe("fetchSegments with a page relay", () => {
     expect(relayCalls).toBe(0);
     expect(out).toHaveLength(2);
   });
+
+  it("replaces expired signed URLs via refreshUrls and finishes the job", async () => {
+    handler = (url) =>
+      url.includes("token=old") ? res(404, new ArrayBuffer(0)) : res(200, buf(4, 0x47));
+    const out = await fetchSegments(
+      ["https://cdn.example.com/x/1.ts?token=old", "https://cdn.example.com/x/2.ts?token=old"],
+      undefined,
+      undefined,
+      undefined,
+      {
+        refreshUrls: async () => [
+          "https://cdn.example.com/x/1.ts?token=new",
+          "https://cdn.example.com/x/2.ts?token=new",
+        ],
+      },
+    );
+    expect(out).toHaveLength(2);
+    expect(calls.some((u) => u.includes("token=new"))).toBe(true);
+  });
+
+  it("caps in-flight fetches at opts.concurrency", async () => {
+    let inflight = 0;
+    let max = 0;
+    vi.stubGlobal("fetch", (url: string) => {
+      calls.push(String(url));
+      inflight++;
+      max = Math.max(max, inflight);
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          inflight--;
+          resolve(res(200, buf(4, 0x47)));
+        }, 20);
+      });
+    });
+    const urls = [A, B, "https://cdn.example.com/x/3.ts", "https://cdn.example.com/x/4.ts"];
+    await fetchSegments(urls, undefined, undefined, undefined, { concurrency: 2 });
+    expect(max).toBeLessThanOrEqual(2);
+  });
 });

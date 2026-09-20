@@ -93,6 +93,10 @@ export type RuntimeMessage =
       tabId: number;
       itemUrl: string;
       variantId?: string;
+      /** Re-scan and pick a rotated-token URL (Refresh & Retry). */
+      refresh?: boolean;
+      /** Reuse this job id so OPFS-persisted segments resume. */
+      resumeJobId?: string;
     }
   | { type: "GET_JOBS"; tabId: number }
   /** Worker -> content script: resolve the video under the cursor / the page's best video. */
@@ -114,7 +118,7 @@ export type RuntimeMessage =
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
   | { type: "OFFSCREEN_PAUSE"; jobId: string }
   | { type: "OFFSCREEN_RESUME"; jobId: string }
-  | { type: "FETCH_TEXT"; tabId: number; url: string; captureOnly?: boolean }
+  | { type: "FETCH_TEXT"; tabId: number; url: string; captureOnly?: boolean; skipCapture?: boolean }
   // Page relay: bytes for a segment this extension is not allowed to fetch
   // (worker -> content script starts it; the slices come back as
   // PAGE_BYTES_CHUNK broadcasts that the offscreen document assembles).
@@ -225,6 +229,13 @@ export interface DownloadJobRequest {
   mime?: string;
   /** Per-origin replay contexts (auth scoped to capture origin). */
   netScope?: { byOrigin: Record<string, NetReplay> };
+  /** HLS master or DASH MPD — re-resolved when signed segment URLs expire. */
+  masterUrl?: string;
+  variantId?: string;
+  /** Which track this job is (split A/V jobs share a master). */
+  track?: "main" | "audio";
+  /** Parallel segment fetches; lower on short-lived signed CDNs. */
+  concurrency?: number;
 }
 
 export type DownloadJobStatus =
@@ -254,10 +265,20 @@ export interface MsSessionMeta {
   bytes: number;
   /** True when nothing was dropped (per-track memory cap never hit). */
   complete: boolean;
-  /** EME (Widevine/FairPlay/PlayReady-style DRM path) touched this session. */
+  /**
+   * EME (Widevine/FairPlay/PlayReady-style DRM path) really touched this
+   * session — keys were attached to its element, or it emitted `encrypted`.
+   * Such a session is refused and its bytes released.
+   */
   eme: boolean;
-  /** Page requested EME keys at all — unattributed sessions stay refused. */
+  /**
+   * Informational: some player on this page used a real DRM path. Never used
+   * to refuse other players' captures (a DRM ad must not silence a clear
+   * video), but it explains an empty capture to the user.
+   */
   pageEme: boolean;
+  /** Informational: the page probed EME capability (`requestMediaKeySystemAccess`). */
+  emeProbed?: boolean;
 }
 
 export type BatchStatus = "queued" | "running" | "done" | "failed";

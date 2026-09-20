@@ -1,6 +1,7 @@
 // Content-script enrichment: <video> signals + MSE capture sessions.
 // Moved verbatim from background.ts — zero behavior change.
 import { classify } from "../lib/classify";
+import { BLOB_PLACEHOLDER_HINT } from "../lib/blobResolve";
 import { cleanTitle, filenameForUrl, pickManifestForBlob, sanitizeStem } from "../lib/download";
 import type { BlobFileInfo, MediaItem, MsSessionMeta, VideoSignal } from "../lib/types";
 import { matchCluster } from "./clusters";
@@ -192,7 +193,7 @@ export async function handleVideoSignals(
             poster: v.poster,
             pageTitle,
             meta,
-            error: "Blob/MSE stream (in-player buffer) — the downloadable file is captured from the network when it loads. Try playing, then Rescan.",
+            error: BLOB_PLACEHOLDER_HINT,
           });
           changed = true;
         } else {
@@ -324,10 +325,11 @@ const captureSeen = new Map<string, number>();
 /**
  * MSE capture sessions -> downloadable `capture` items (one per track).
  * Refusal rules (never bypassed):
- * - session.eme (setMediaKeys/encrypted on its element) -> DRM row, refused.
- * - session clean BUT page requested EME keys -> refused as unverified: on a
- *   mixed page we cannot prove this buffer isn't DRM-adjacent.
- * - clean session, clean page, bytes>0 -> downloadable capture item.
+ * - session.eme (keys attached / `encrypted` on its element) -> DRM row, refused.
+ * - clean session, bytes>0 -> downloadable capture item.
+ * A DRM player elsewhere on the page (or an EME capability probe, which every
+ * Meta player does) no longer refuses unrelated sessions: that page-wide rule
+ * used to leave clear players with no capture at all.
  */
 export async function handleCaptureSessions(
   tabId: number,
@@ -371,28 +373,6 @@ export async function handleCaptureSessions(
             detectedAt: now,
             drmProtected: true,
             drmReason: "Protected content — this player uses an encrypted media path (DRM). Cannot download.",
-            meta: `${kindLabel}${sizeLabel} • captured buffer`,
-            pageTitle,
-          });
-          changed = true;
-        }
-        continue;
-      }
-      if (s.pageEme) {
-        if (!existing) {
-          items.push({
-            url,
-            tabId,
-            type: "capture",
-            captureRef: `${s.id}:${t.idx}`,
-            captureKind: t.kind,
-            filename: "",
-            title: title || undefined,
-            titleFromPage: title ? !elTitle : undefined,
-            detectedAt: now,
-            drmProtected: true,
-            drmReason: "This page uses DRM playback, so buffered captures are disabled here to stay safe.",
-            frameId,
             meta: `${kindLabel}${sizeLabel} • captured buffer`,
             pageTitle,
           });
@@ -457,7 +437,7 @@ export async function handleCaptureSessions(
   // that player. Once this session has captured bytes, drop the placeholder.
   const capturedBlobs = new Set<string>();
   for (const s of sessions) {
-    if (!s?.blobUrl || s.eme || s.pageEme) continue;
+    if (!s?.blobUrl || s.eme) continue;
     if ((s.tracks ?? []).some((t) => t.bytes > 0)) capturedBlobs.add(s.blobUrl);
   }
   if (capturedBlobs.size) {

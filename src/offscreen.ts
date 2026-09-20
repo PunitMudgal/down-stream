@@ -18,6 +18,7 @@ import {
   type SegmentedPart,
 } from "./lib/download";
 import { extractHlsSegments } from "./lib/parseHls";
+import { resolveDashForDownload, resolveHlsForDownload, segmentConcurrencyFor } from "./lib/freshStream";
 import { basenameOf, withExtPreservingDir } from "./lib/filename";
 import { muxFmp4 } from "./lib/mp4mux";
 import {
@@ -343,6 +344,7 @@ async function textWithNet(url: string, scope: NetScope | undefined, signal: Abo
   }
   const res = await fetch(url, {
     credentials: "include",
+    cache: "no-store",
     signal,
     headers: net?.headers,
     referrer: net?.referrer,
@@ -421,6 +423,8 @@ interface TrackSaveOpts {
   isPaused: () => boolean;
   /** Re-resolve the segment list when signed URLs expire (HLS); absent = fail like before. */
   refreshUrls?: () => Promise<string[] | null>;
+  /** Parallel segment fetches (lower on short-lived signed CDNs). */
+  concurrency?: number;
   /** Playlist-ordered progress across the whole track. */
   onSegs: (done: number, total: number, bytesDone: number) => void;
   /** When true, even a lone part saves without reporting DONE (caller reports once for several tracks). */
@@ -488,6 +492,15 @@ async function saveTrackInParts(opts: TrackSaveOpts): Promise<TrackSaveResult> {
         isPaused: opts.isPaused,
         relay: pageRelayFor(opts.jobId),
         existingParts: existing,
+        concurrency: opts.concurrency,
+        refreshUrls: opts.refreshUrls
+          ? async () => {
+              const all = await opts.refreshUrls!();
+              if (!all || all.length !== total) return null;
+              for (let i = 0; i < all.length; i++) opts.urls[i] = all[i];
+              return all.slice(ropts.start, ropts.end);
+            }
+          : undefined,
         onSegmentDone: opts.onSegmentDone
           ? (i, buf) => {
               try {
@@ -593,6 +606,37 @@ async function saveTrackInParts(opts: TrackSaveOpts): Promise<TrackSaveResult> {
   return { parts, multi, bytes: savedBytes, firstFile, lastFile };
 }
 
+function playlistFetcher(
+  job: DownloadJobRequest,
+  scope: NetScope | undefined,
+  signal: AbortSignal,
+): (url: string) => Promise<string> {
+  return (url) => textWithNetRelayed(job, url, scope, signal);
+}
+
+/** Re-resolve this job's segment list from the live master/MPD. */
+function makeRefreshUrls(
+  job: DownloadJobRequest,
+  scope: NetScope | undefined,
+  signal: AbortSignal,
+): (() => Promise<string[] | null>) | undefined {
+  const fetchText = playlistFetcher(job, scope, signal);
+  if (job.kind === "hls") {
+    const root = job.masterUrl ?? job.url;
+    return async () => {
+      const plan = await resolveHlsForDownload(root, job.variantId, fetchText);
+      return job.track === "audio" ? (plan.pairSegments ?? null) : plan.segments;
+    };
+  }
+  if (job.kind === "dash" && job.masterUrl) {
+    return async () => {
+      const plan = await resolveDashForDownload(job.masterUrl as string, job.variantId, fetchText);
+      return job.track === "audio" ? (plan.pairSegments ?? null) : plan.segments;
+    };
+  }
+  return undefined;
+}
+
 /**
  * Resolve one track's segment URLs (HLS variant playlist or stored DASH list).
  */
@@ -601,6 +645,7 @@ async function resolveMainUrls(
   scope: NetScope | undefined,
   signal: AbortSignal,
 ): Promise<string[]> {
+  if (job.segments?.length) return [...job.segments];
   if (job.kind === "hls") {
     const text = await textWithNetRelayed(job, job.url, scope, signal);
     const mainUrls = extractHlsSegments(text, job.url);
@@ -627,15 +672,8 @@ async function downloadSingleTrack(
   onProgress: ByteProgress,
 ): Promise<void> {
   const isPaused = (): boolean => pausedJobs.has(job.jobId);
-  // HLS expiry refresher: re-resolve the variant playlist for fresh URLs.
-  const refreshUrls =
-    job.kind === "hls"
-      ? async (): Promise<string[] | null> => {
-          const retryText = await textWithNetRelayed(job, job.url, scope, signal);
-          const fresh = extractHlsSegments(retryText, job.url);
-          return fresh.length ? fresh : null;
-        }
-      : undefined;
+  const refreshUrls = makeRefreshUrls(job, scope, signal);
+  const concurrency = job.concurrency ?? segmentConcurrencyFor(urls);
   // Resumability: hydrate segments persisted before a restart; write each new
   // segment to OPFS as it lands. Only re-fetchable kinds persist (direct /
   // capture streams are not).
@@ -663,6 +701,7 @@ async function downloadSingleTrack(
       signal,
       isPaused,
       refreshUrls,
+      concurrency,
       onSegmentDone,
       resumedParts,
       onSegs: (done, total, bytesDone) => onProgress(done, total, bytesDone),
@@ -716,10 +755,23 @@ async function assembleMuxedBlob(
     bytesDone = vBytes + aBytes;
     onProgress(done, total, bytesDone);
   };
+  const concurrency = job.concurrency ?? segmentConcurrencyFor(mainUrls);
+  const refreshMain = makeRefreshUrls({ ...job, track: "main" }, scope, signal);
+  const refreshAudio = makeRefreshUrls({ ...job, track: "audio" }, scope, signal);
   // Video first, then audio — order irrelevant, progress combined.
   const [vParts, aParts] = await Promise.all([
-    fetchSegments(mainUrls, progV, signal, scope, { isPaused, relay: pageRelayFor(job.jobId) }),
-    fetchSegments(pairUrls, progA, signal, scope, { isPaused, relay: pageRelayFor(job.jobId) }),
+    fetchSegments(mainUrls, progV, signal, scope, {
+      isPaused,
+      relay: pageRelayFor(job.jobId),
+      concurrency,
+      refreshUrls: refreshMain,
+    }),
+    fetchSegments(pairUrls, progA, signal, scope, {
+      isPaused,
+      relay: pageRelayFor(job.jobId),
+      concurrency,
+      refreshUrls: refreshAudio,
+    }),
   ]);
   stage(job.jobId, "assembling");
   let merged: Uint8Array;
@@ -761,17 +813,9 @@ async function downloadMuxed(
   const stem = job.filename.replace(/\.[a-z0-9]+$/i, "") || job.filename;
   const total = mainUrls.length + pairUrls.length;
   const isPaused = (): boolean => pausedJobs.has(job.jobId);
-  // Signed HLS URLs expire mid-download; re-resolving the playlists keeps
-  // long (large) fallback downloads alive, same as the single-track path.
-  const refreshPlaylist =
-    job.kind === "hls"
-      ? (playlistUrl: string) =>
-        async (): Promise<string[] | null> => {
-          const retryText = await textWithNetRelayed(job, playlistUrl, scope, signal);
-          const fresh = extractHlsSegments(retryText, playlistUrl);
-          return fresh.length ? fresh : null;
-        }
-      : undefined;
+  const refreshMain = makeRefreshUrls({ ...job, track: "main" }, scope, signal);
+  const refreshAudio = makeRefreshUrls({ ...job, track: "audio" }, scope, signal);
+  const concurrency = job.concurrency ?? segmentConcurrencyFor(mainUrls);
   let vSegs = 0;
   let vBytes = 0;
   const video = await saveTrackInParts({
@@ -783,7 +827,8 @@ async function downloadMuxed(
     scope,
     signal,
     isPaused,
-    refreshUrls: refreshPlaylist?.(job.url),
+    refreshUrls: refreshMain,
+    concurrency,
     deferDone: true,
     onSegs: (d, _t, b) => {
       vSegs = d;
@@ -800,7 +845,8 @@ async function downloadMuxed(
     scope,
     signal,
     isPaused,
-    refreshUrls: job.pairUrl && refreshPlaylist ? refreshPlaylist(job.pairUrl) : undefined,
+    refreshUrls: refreshAudio,
+    concurrency,
     deferDone: true,
     onSegs: (d, _t, b) => onProgress(vSegs + d, total, vBytes + b),
   });
@@ -1178,15 +1224,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await downloadMuxed(job, pairUrls, scope, signal, onProgress);
         return;
       }
-      // Single track: HLS resolves its variant playlist here (with the
-      // encrypted-stream refusal); DASH/grouped use stored segment lists.
-      // Over-cap lists save as sequential part files instead of failing.
+      // Single track: HLS uses segments resolved at click time when present
+      // (fresh tokens); otherwise reads the variant playlist here. DASH and
+      // grouped jobs always carry a stored list. Over-cap lists save as
+      // sequential part files instead of failing.
       if (job.kind === "hls") {
-        const text = await textWithNetRelayed(job, job.url, scope, signal);
-        if (/#EXT-X-KEY\s*:\s*[^\r\n]*METHOD\s*=\s*(?!NONE\b)/i.test(text)) {
-          throw new Error("Protected content — cannot download (encrypted HLS).");
+        let urls = job.segments?.length ? [...job.segments] : [];
+        if (!urls.length) {
+          const text = await textWithNetRelayed(job, job.url, scope, signal);
+          if (/#EXT-X-KEY\s*:\s*[^\r\n]*METHOD\s*=\s*(?!NONE\b)/i.test(text)) {
+            throw new Error("Protected content — cannot download (encrypted HLS).");
+          }
+          urls = extractHlsSegments(text, job.url);
         }
-        const urls = extractHlsSegments(text, job.url);
         if (!urls.length) throw new Error("No segments found in the HLS variant playlist.");
         await downloadSingleTrack(job, urls, "video/mp2t", ".ts", scope, signal, onProgress);
         return;

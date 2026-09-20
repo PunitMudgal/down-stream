@@ -1,6 +1,6 @@
 {
   "name": "video-download-extension",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Detect playable video media on the current tab and download it locally. Fully local, no backend.",
   "type": "module",

@@ -1,4 +1,5 @@
 import { extractWithAdapters, matchAdapters, type AdapterPage } from "./lib/adapters";
+import { blobDeadMessage, parseBlobRoute, type BlobRoute } from "./lib/blobResolve";
 import { pickShortcutVideo, type ShortcutVideoSnapshot } from "./lib/pickVideo";
 import type { BlobFileInfo, MediaItem, MsSessionMeta, VideoSignal } from "./lib/types";
 
@@ -834,37 +835,37 @@ async function driveMsDownload(
 // ---- Blob-file download driver ----
 // Streams a page-held Blob (whole-file blob: playback) to the offscreen
 // document in ≤4MB slices, reusing the MS_TRACK_* accumulation + save flow.
+// A blob: URL that turns out to be a live MediaSource buffer instead hands
+// over to the capture driver — the user clicked "the video", and both routes
+// produce the same file.
 const BLOB_STEP = 4_000_000;
 
 async function driveBlobDownload(
   jobId: string,
   blobUrl: string,
   filename: string,
-  known?: { size: number; mime: string },
+  route: BlobRoute,
 ): Promise<void> {
   const fail = (error: string): void => {
     void bgSend({ type: "DOWNLOAD_ERROR", jobId, error });
   };
+  if (route.kind === "dead") {
+    fail(blobDeadMessage(route.reason));
+    return;
+  }
+  if (route.kind === "mse") {
+    await driveMsDownload(
+      jobId,
+      route.sessionId,
+      route.videoTrackIdx,
+      filename,
+      route.audioTrackIdx,
+    );
+    return;
+  }
+  const total = route.size;
+  const mime = route.mime || "video/mp4";
   try {
-    let total = known?.size ?? 0;
-    let mime = known?.mime ?? "video/mp4";
-    if (total <= 0) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const info = (await askHook({ __vdg: "blob-info", url: blobUrl }, 8000)) as any;
-      if (
-        !info ||
-        info.__vdg !== "blob-info-result" ||
-        typeof info.size !== "number" ||
-        info.size <= 0
-      ) {
-        fail(
-          typeof info?.error === "string" ? info.error : "Blob expired — replay the video and Rescan.",
-        );
-        return;
-      }
-      total = info.size as number;
-      mime = typeof info.type === "string" && info.type ? info.type : "video/mp4";
-    }
     await bgSend({ type: "MS_TRACK_START", jobId, total, mime, filename });
     let cursor = 0;
     let index = 0;
@@ -945,6 +946,9 @@ async function pageWorldFetch(url: string): Promise<{ text: string; truncated: b
 /** Ownership probe timeout: the hook answers from a map, so this is generous. */
 const OWNERSHIP_PROBE_MS = 300;
 
+/** The page reads its own blob: URL inside this budget (8s hook-side cap). */
+const BLOB_RESOLVE_BUDGET_MS = 9000;
+
 /** Does THIS frame's page hook hold that MSE capture session? */
 async function thisFrameOwnsCapture(captureId: string): Promise<boolean> {
   if (!captureId) return false;
@@ -958,22 +962,37 @@ async function thisFrameOwnsCapture(captureId: string): Promise<boolean> {
   }
 }
 
-/** Size/type of a Blob THIS frame's hook still holds (undefined when absent). */
-async function thisFrameBlob(
-  blobUrl: string,
-): Promise<{ size: number; mime: string } | undefined> {
+/** Route for a `blob:` URL THIS frame can serve (cheap: no page fetch). */
+async function thisFrameBlobRoute(blobUrl: string): Promise<BlobRoute | undefined> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const res = (await askHook({ __vdg: "blob-info", url: blobUrl }, OWNERSHIP_PROBE_MS)) as any;
-    if (res?.__vdg !== "blob-info-result" || typeof res.size !== "number" || res.size <= 0) {
-      return undefined;
-    }
-    return {
-      size: res.size as number,
-      mime: typeof res.type === "string" && res.type ? res.type : "video/mp4",
-    };
+    const res = (await askHook(
+      { __vdg: "blob-resolve", url: blobUrl, allowFetch: false },
+      OWNERSHIP_PROBE_MS,
+    )) as any;
+    const route = parseBlobRoute(res);
+    return route && route.kind !== "dead" ? route : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Ask the page itself for the bytes behind a `blob:` URL. Any Blob-backed
+ * object URL answers here even when the hook's createObjectURL registry
+ * missed it (created before injection, evicted, or built inside a page
+ * worker); a MediaSource object URL cannot be fetched and is reported dead.
+ */
+async function resolveBlobDeep(blobUrl: string): Promise<BlobRoute> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = (await askHook(
+      { __vdg: "blob-resolve", url: blobUrl, allowFetch: true },
+      BLOB_RESOLVE_BUDGET_MS,
+    )) as any;
+    return parseBlobRoute(res) ?? { kind: "dead", reason: "not-fetchable" };
+  } catch {
+    return { kind: "dead", reason: "not-fetchable" };
   }
 }
 
@@ -1178,22 +1197,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (m?.type === "BLOB_DOWNLOAD" && typeof m.jobId === "string" && typeof m.url === "string") {
     const blobUrl = String(m.url);
     void (async () => {
-      // Same ownership rule as captures: the frame holding the Blob answers,
-      // the rest decline so the worker can find it.
-      const info = await thisFrameBlob(blobUrl);
-      if (!info) {
+      // Fast path: this frame already holds the bytes (Blob registry or one of
+      // its own capture sessions), so it answers without any page traffic.
+      let route = await thisFrameBlobRoute(blobUrl);
+      // Otherwise read the object URL in the page itself. Every frame of a
+      // same-origin tab can serve a Blob-backed URL, so the first one that
+      // succeeds accepts and streams; frames that cannot (a MediaSource
+      // buffer, a revoked URL) decline with the reason we report.
+      if (!route) route = await resolveBlobDeep(blobUrl);
+      if (route.kind === "dead") {
         try {
-          sendResponse({
-            ok: false,
-            declined: true,
-            error: "Blob expired — replay the video and Rescan.",
-          });
+          sendResponse({ ok: false, declined: true, error: blobDeadMessage(route.reason) });
         } catch {
           /* ignore */
         }
         return;
       }
-      void driveBlobDownload(m.jobId, blobUrl, String(m.filename ?? "video.mp4"), info);
+      void driveBlobDownload(m.jobId, blobUrl, String(m.filename ?? "video.mp4"), route);
       try {
         sendResponse({ ok: true, accepted: true });
       } catch {
@@ -1235,11 +1255,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         else reply({ ok: true, text, source });
       };
       try {
-        // 1. The player already loaded this playlist — reuse those exact bytes.
-        const captured = await pageCapturedManifest(url);
-        if (captured !== undefined) {
-          ok(captured, "page-capture");
-          return;
+        // 1. The player already loaded this playlist — reuse those exact bytes
+        //    unless the caller asked for a live read (captured copies keep
+        //    expired segment tokens from when the player first fetched them).
+        if (m.skipCapture !== true) {
+          const captured = await pageCapturedManifest(url);
+          if (captured !== undefined) {
+            ok(captured, "page-capture");
+            return;
+          }
         }
         if (m.captureOnly === true) {
           // Cheap probe: the worker asks this first because it costs no
@@ -1261,7 +1285,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           // 3. Isolated-world fetch (extension-origin request, host permission):
           //    weaker context, but occasionally the only thing that works.
           try {
-            const res = await fetch(url, { credentials: "include" });
+            const res = await fetch(url, { credentials: "include", cache: "no-store" });
             if (!res.ok) throw new Error(`Page fetch failed (${res.status})`);
             ok(await res.text(), "page-isolated");
             return;

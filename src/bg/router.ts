@@ -227,7 +227,14 @@ async function handleStartDownload(m: AnyMsg): Promise<unknown> {
     return { ok: false, error: "Unknown message" };
   }
   try {
-    const { job, paired, merged } = await startDownload(m.tabId, m.itemUrl, m.variantId);
+    const resumeJobId = typeof m.resumeJobId === "string" ? m.resumeJobId : undefined;
+    const { job, paired, merged } = await startDownload(
+      m.tabId,
+      m.itemUrl,
+      m.variantId,
+      resumeJobId,
+      { refresh: m.refresh === true, cardUrl: m.itemUrl },
+    );
     return { ok: true, job, paired, merged };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };

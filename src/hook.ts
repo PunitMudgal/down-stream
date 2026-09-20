@@ -47,6 +47,9 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
   let peekInflight = 0;
   let peekWindowStart = Date.now();
   let peekWindowCount = 0;
+  // The untouched fetch, kept for our own reads (blob: URLs must not be run
+  // through the instrumented wrapper below — it would peek at page blobs).
+  let nativeFetch: typeof fetch | undefined;
 
   function peekAllowed(): boolean {
     const now = Date.now();
@@ -448,7 +451,11 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
           try {
             pruneSegs(Date.now());
             segStore.set(token, { buf: new ArrayBuffer(0), at: Date.now(), ctrl, ready: false });
-            const res = await window.fetch(url, { credentials: "include", signal: ctrl.signal });
+            const res = await window.fetch(url, {
+              credentials: "include",
+              cache: "no-store",
+              signal: ctrl.signal,
+            });
             if (!res.ok) {
               closeSeg(token);
               window.postMessage(
@@ -545,7 +552,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
         // window.fetch is the hooked wrapper, so this request also feeds the
         // capture store — the page's own context, for the extension's benefit.
         void window
-          .fetch(url, { credentials: "include", signal: ctrl.signal })
+          .fetch(url, { credentials: "include", cache: "no-store", signal: ctrl.signal })
           .then(async (res) => {
             if (!res.ok) {
               window.postMessage(
@@ -625,6 +632,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
   // ---- fetch() ----
   try {
     const origFetch = window.fetch.bind(window);
+    nativeFetch = origFetch;
     const hooked = function (input: unknown, init?: unknown): Promise<Response> {
       let p: Promise<Response>;
       try {
@@ -794,13 +802,10 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
     return false;
   }
 
-  function recordBlobUrl(url: string, obj: unknown): void {
+  /** Bounded retention of a page Blob keyed by its object URL. */
+  function storeBlob(url: string, blob: Blob): void {
     try {
-      if (isMediaSourceObj(obj)) return;
-      const b = obj as Partial<Blob>;
-      if (!b || typeof b.size !== "number" || typeof b.slice !== "function") return;
-      if (b.size < BLOB_MIN_SIZE) return;
-      if (blobStore.size >= BLOB_MAX_ENTRIES) {
+      if (blobStore.size >= BLOB_MAX_ENTRIES && !blobStore.has(url)) {
         // Evict the oldest entry.
         let oldestKey: string | undefined;
         let oldestAt = Infinity;
@@ -813,11 +818,23 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
         if (oldestKey !== undefined) blobStore.delete(oldestKey);
       }
       blobStore.set(url, {
-        blob: obj as Blob,
-        size: b.size,
-        type: typeof b.type === "string" ? b.type : "",
+        blob,
+        size: blob.size,
+        type: typeof blob.type === "string" ? blob.type : "",
         at: Date.now(),
       });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function recordBlobUrl(url: string, obj: unknown): void {
+    try {
+      if (isMediaSourceObj(obj)) return;
+      const b = obj as Partial<Blob>;
+      if (!b || typeof b.size !== "number" || typeof b.slice !== "function") return;
+      if (b.size < BLOB_MIN_SIZE) return;
+      storeBlob(url, obj as Blob);
     } catch {
       /* ignore */
     }
@@ -851,14 +868,21 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
         if (!d || typeof d !== "object" || typeof d.nonce !== "string") return;
         if (d.__vdg === "blob-list") {
           window.postMessage({ __vdg: "blob-list-result", nonce: d.nonce, blobs: blobList() }, "*");
-        } else if (d.__vdg === "blob-info" && typeof d.url === "string") {
+        } else if (d.__vdg === "blob-resolve" && typeof d.url === "string") {
+          // Registry hit answers here (the MSE-half resolver below owns the
+          // session/live-fetch cases), so a held Blob resolves even if the
+          // capture half of this hook failed to initialize.
           pruneBlobs(Date.now());
-          const e = blobStore.get(d.url);
-          if (!e) {
-            window.postMessage({ __vdg: "blob-info-result", nonce: d.nonce, error: "Blob expired — replay the video and Rescan." }, "*");
-          } else {
+          const held = blobStore.get(d.url);
+          if (held) {
             window.postMessage(
-              { __vdg: "blob-info-result", nonce: d.nonce, size: e.size, type: e.type },
+              {
+                __vdg: "blob-resolve-result",
+                nonce: d.nonce,
+                kind: "blob",
+                size: held.size,
+                type: held.type,
+              },
               "*",
             );
           }
@@ -928,6 +952,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
     const TRACK_CAP = 64_000_000; // per-track memory cap (was 250MB)
     const MAX_SESSIONS = 4; // oldest session evicted beyond this
     const XFER = 4_000_000; // bytes per postMessage chunk
+    const BLOB_RESOLVE_MS = 8000; // budget for reading a blob: URL in-page
 
     interface MsTrack {
       mime: string;
@@ -950,6 +975,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
     };
     let msSeq = 0;
     let pageEme = false;
+    let emeProbed = false;
     const sessions = new Map<string, MsSession>();
     const msByObj = new WeakMap<object, string>();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1104,7 +1130,9 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
         const info = sbInfo.get(sb);
         const sess = info ? sessions.get(info.msId) : undefined;
         const trk = sess?.tracks[info?.trackIdx ?? -1];
-        if (trk && !trk.overflow && sess && !sess.eme && !pageEme) {
+        // Only this session's own DRM taint blocks capture; a DRM player
+        // elsewhere on the page must not silence a clear one.
+        if (trk && !trk.overflow && sess && !sess.eme) {
           const len = byteLengthOf(data);
           if (len > 0) {
             sess.lastAppend = Date.now();
@@ -1171,30 +1199,21 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
       /* ignore */
     }
 
-    // -- EME detection: attribute to sessions, plus page-level flag --
-    // Newly-tainted sessions release buffered bytes immediately.
+    // -- EME detection --------------------------------------------------
+    // DRM is tainted per SESSION, never page-wide. Meta (Instagram/Facebook)
+    // and many other players call requestMediaKeySystemAccess just to probe
+    // capability and then play clear content; treating that probe as "this
+    // page is DRM" used to free every buffer and refuse every row, which is
+    // exactly why clear reels showed nothing but a dead placeholder. Only a
+    // real encrypted-media signal — keys attached to an element, or an
+    // `encrypted` event on it — refuses (and releases) that player's session.
     function markEme(el: unknown): void {
       try {
-        pageEme = true;
+        pageEme = true; // informational: some player on this page really uses DRM
         const s = sessionForElement(el);
         if (s && !s.eme) {
           s.eme = true;
           freeSession(s);
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-    function markPageEme(): void {
-      try {
-        if (!pageEme) {
-          pageEme = true;
-          sessions.forEach((s) => {
-            if (!s.eme) {
-              s.eme = true;
-              freeSession(s);
-            }
-          });
         }
       } catch {
         /* ignore */
@@ -1205,7 +1224,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
       if (typeof nav.requestMediaKeySystemAccess === "function") {
         const origRMKSA = (navigator.requestMediaKeySystemAccess as Function).bind(navigator);
         (nav as Record<string, unknown>).requestMediaKeySystemAccess = function (...args: unknown[]): Promise<unknown> {
-          markPageEme();
+          emeProbed = true; // a capability probe, not DRM playback
           return (origRMKSA as (...a: unknown[]) => Promise<unknown>)(...args);
         };
       }
@@ -1259,9 +1278,125 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
           complete: s.tracks.length > 0 && s.tracks.every((t) => !t.overflow),
           eme: s.eme,
           pageEme,
+          emeProbed,
         });
       });
       return out;
+    }
+
+    // -- blob: URL -> bytes -------------------------------------------------
+    // A `<video src="blob:...">` is either a whole file wrapped in a Blob or a
+    // live MediaSource buffer. Resolve which, so a Download click on a blob
+    // row either streams the page's own bytes or pulls the captured appends.
+    function sessionForBlobUrl(url: string): MsSession | undefined {
+      const mapped = blobToMs.get(url);
+      if (mapped) {
+        const s = sessions.get(mapped);
+        if (s) return s;
+      }
+      let hit: MsSession | undefined;
+      sessions.forEach((s) => {
+        if (!hit && s.blobUrl === url) hit = s;
+      });
+      if (hit) return hit;
+      // Object URL created before this hook ran (map empty): find the element
+      // playing it and read the session off the element instead. Only ever
+      // reached on a Download click, so the element scan is not steady-state.
+      try {
+        const els = document.querySelectorAll("video,audio");
+        for (const el of Array.from(els)) {
+          const src = (el as HTMLMediaElement).currentSrc || el.getAttribute("src") || "";
+          if (src !== url) continue;
+          const s = sessionForElement(el);
+          if (s) {
+            s.blobUrl = s.blobUrl ?? url;
+            return s;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      return undefined;
+    }
+
+    function trackInfo(s: MsSession): unknown[] {
+      return s.tracks.map((t, idx) => ({ idx, kind: t.kind, bytes: t.bytes }));
+    }
+
+    /**
+     * Is a `<video>` playing this URL straight from a MediaSource object? Such
+     * a URL is a live stream, not a file: reading it can consume the player's
+     * own buffer, so it must be refused rather than fetched.
+     */
+    function isMediaSourceUrl(url: string): boolean {
+      try {
+        for (const el of Array.from(document.querySelectorAll("video,audio"))) {
+          const src = (el as HTMLMediaElement).currentSrc || el.getAttribute("src") || "";
+          if (src !== url) continue;
+          const so = (el as { srcObject?: unknown }).srcObject;
+          if (so && typeof so === "object" && isMediaSourceObj(so)) return true;
+        }
+      } catch {
+        /* ignore */
+      }
+      return false;
+    }
+
+    /**
+     * `allowFetch:false` answers from what the page already handed us (cheap
+     * enough for a frame-ownership probe). `allowFetch:true` additionally
+     * reads the object URL itself — any Blob-backed URL yields its bytes, even
+     * one created before this hook was injected or evicted from the registry;
+     * a MediaSource URL cannot be fetched, and is reported as such.
+     */
+    async function resolveBlob(url: string, allowFetch: boolean): Promise<Record<string, unknown>> {
+      pruneBlobs(Date.now());
+      const cached = blobStore.get(url);
+      if (cached) {
+        return { __vdg: "blob-resolve-result", kind: "blob", size: cached.size, type: cached.type };
+      }
+      const sess = sessionForBlobUrl(url);
+      if (sess) {
+        return {
+          __vdg: "blob-resolve-result",
+          kind: "mse",
+          sessionId: sess.id,
+          eme: sess.eme,
+          tracks: trackInfo(sess),
+        };
+      }
+      if (!allowFetch) return { __vdg: "blob-resolve-result", error: "not-held" };
+      // Live stream, no captured bytes to fall back on: say so instead of
+      // reading a buffer the player is still writing.
+      if (isMediaSourceUrl(url)) return { __vdg: "blob-resolve-result", error: "not-fetchable" };
+      const fetchImpl = nativeFetch ?? window.fetch.bind(window);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => {
+        try {
+          ctrl.abort();
+        } catch {
+          /* ignore */
+        }
+      }, BLOB_RESOLVE_MS);
+      try {
+        const res = await fetchImpl(url, { signal: ctrl.signal });
+        if (!res.ok) return { __vdg: "blob-resolve-result", error: `not-fetchable:${res.status}` };
+        const blob = await res.blob();
+        if (blob.size <= 0) return { __vdg: "blob-resolve-result", error: "empty" };
+        storeBlob(url, blob);
+        return {
+          __vdg: "blob-resolve-result",
+          kind: "blob",
+          size: blob.size,
+          type: typeof blob.type === "string" ? blob.type : "",
+        };
+      } catch {
+        // Chrome rejects a MediaSource object URL outright; a revoked blob
+        // fails the same way. Either way there is nothing to read here.
+        return { __vdg: "blob-resolve-result", error: "not-fetchable" };
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     function serveSlice(id: string, trackIdx: number, cursor: number): unknown {
@@ -1300,6 +1435,14 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
         if (!d || typeof d !== "object") return;
         if (d.__vdg === "ms-sessions" && d.nonce) {
           window.postMessage({ __vdg: "ms-sessions-result", nonce: d.nonce, sessions: sessionMeta() }, "*");
+        } else if (d.__vdg === "blob-resolve" && d.nonce && typeof d.url === "string") {
+          void resolveBlob(d.url, d.allowFetch === true).then((res) => {
+            try {
+              window.postMessage({ ...res, nonce: d.nonce }, "*");
+            } catch {
+              /* ignore */
+            }
+          });
         } else if (d.__vdg === "ms-get" && d.nonce && typeof d.id === "string") {
           const res = serveSlice(d.id, Number(d.track) || 0, Number(d.cursor) || 0) as Record<string, unknown>;
           (res as Record<string, unknown>).nonce = d.nonce;

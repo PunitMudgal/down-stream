@@ -15,6 +15,7 @@ import {
   normalizeUrl,
   pickBestTabItem,
   pickCandidateItem,
+  pickNewestByPath,
   type TargetItem,
 } from "../src/lib/target";
 
@@ -271,6 +272,28 @@ describe("pickCandidateItem", () => {
     expect(pickCandidateItem(items, ["https://nope.example.com/a.mp4"])).toBeUndefined();
     expect(pickCandidateItem(items, [])).toBeUndefined();
     expect(pickCandidateItem([], ["https://x/y.mp4"])).toBeUndefined();
+  });
+});
+
+describe("pickNewestByPath", () => {
+  it("returns the most recently detected item that shares origin+path", () => {
+    const items: TargetItem[] = [
+      { url: "https://ev.phncdn.com/hls/a/master.m3u8?token=old", type: "hls", detectedAt: 10 },
+      { url: "https://ev.phncdn.com/hls/a/master.m3u8?token=new", type: "hls", detectedAt: 50 },
+      { url: "https://ev.phncdn.com/hls/b/master.m3u8?token=other", type: "hls", detectedAt: 99 },
+    ];
+    expect(
+      pickNewestByPath(items, "https://ev.phncdn.com/hls/a/master.m3u8?token=stale")?.url,
+    ).toBe("https://ev.phncdn.com/hls/a/master.m3u8?token=new");
+  });
+
+  it("returns undefined when no path matches", () => {
+    expect(
+      pickNewestByPath(
+        [{ url: "https://cdn.example.com/x.m3u8", type: "hls", detectedAt: 1 }],
+        "https://cdn.example.com/y.m3u8",
+      ),
+    ).toBeUndefined();
   });
 });
 

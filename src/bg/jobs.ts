@@ -4,13 +4,16 @@
 // The offscreen document (runtime API only) assembles segment bytes;
 // the worker performs the actual chrome.downloads.download(), which
 // offscreen documents cannot call.
-import { parseDashManifest } from "../lib/parseDash";
-import { parseHlsManifest } from "../lib/parseHls";
 import { classify } from "../lib/classify";
 import { cleanTitle, defaultExtForType, filenameForUrl, sortSegmentsNatural } from "../lib/download";
 import { basenameOf, joinDownloadPath, qualityLabel, renderFilename, withExtPreservingDir } from "../lib/filename";
+import {
+  resolveDashForDownload,
+  resolveHlsForDownload,
+  segmentConcurrencyFor,
+} from "../lib/freshStream";
 import type { HistoryEntry } from "../lib/history";
-import { normalizeUrl } from "../lib/target";
+import { normalizeUrl, pickNewestByPath } from "../lib/target";
 import { getSettings } from "../lib/settings";
 import type {
   DownloadJobRequest,
@@ -23,7 +26,7 @@ import type {
 import { lookupNet } from "./headers";
 import { sendToAcceptingFrame } from "./frames";
 import { fetchManifestText, parseStreamingItem } from "./manifests";
-import { codecsOf, enforceCaps, hasAudioCodec, hasVideoCodec, patchItem, updateBadge } from "./media";
+import { enforceCaps, patchItem, updateBadge } from "./media";
 import { resetRate } from "./rate";
 import { hasPendingSave } from "./saves";
 import { ensureJobsLoaded, getTabItems, jobMemory, persistJobs, persistTab, upsertJob } from "./store";
@@ -85,44 +88,6 @@ export async function maybeCloseOffscreen(): Promise<void> {
   } catch {
     /* best-effort */
   }
-}
-
-/**
- * Peek at an HLS variant playlist to decide mux-vs-split: fMP4 (EXT-X-MAP
- * or .m4s/.mp4 segments) muxes into one file; TS stays two files.
- * Fail-closed to false (two files) on any fetch/parse problem.
- */
-export async function probeHlsFmp4(tabId: number, variantUrl: string): Promise<boolean> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15_000);
-  try {
-    const net = lookupNet(tabId, variantUrl);
-    const res = await fetch(variantUrl, {
-      credentials: "include",
-      signal: ctrl.signal,
-      headers: net?.headers,
-      referrer: net?.referrer,
-      referrerPolicy: net?.referrer ? "unsafe-url" : undefined,
-    });
-    if (!res.ok) return false;
-    const text = await res.text();
-    if (/#EXT-X-MAP\s*:/i.test(text)) return true;
-    const m = /^[^#\r\n]*\.(m4s|mp4|m4v|cmfv|cmfa)(\?[^#\r\n]*)?$/im.exec(text);
-    if (m) return true;
-    if (/^[^#\r\n]*\.ts(\?[^#\r\n]*)?$/im.test(text)) return false;
-    return false;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Segment lists starting with init-style fMP4 chunks. */
-export function looksFmp4Segments(segments: string[]): boolean {
-  const first = segments.find((s) => /\.(m4s|mp4|m4v|cmfv|cmfa)(\?|#|$)/i.test(s.split("?")[0]));
-  if (first) return true;
-  return !segments.some((s) => /\.ts(\?|#|$)/i.test(s.split("?")[0]));
 }
 
 // ---- naming + job construction -------------------------------------------
@@ -219,9 +184,21 @@ export async function startDownload(
   variantId?: string,
   /** Reuse an interrupted job's id so its OPFS-persisted segments resume. */
   resumeJobId?: string,
+  opts?: { refresh?: boolean; cardUrl?: string },
 ): Promise<{ job: DownloadJobState; paired: boolean; merged: boolean; jobIds: string[] }> {
+  const cardUrl = opts?.cardUrl ?? itemUrl;
+  if (opts?.refresh) {
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "COLLECT_NOW" });
+    } catch {
+      /* content script may be gone — still try the listed URL */
+    }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+
   const items = await getTabItems(tabId);
-  const item = items.find((x) => x.url === itemUrl);
+  const item =
+    pickNewestByPath(items, itemUrl) ?? items.find((x) => x.url === itemUrl);
   if (!item) throw new Error("Video no longer listed for this tab. Rescan and try again.");
   if (item.drmProtected) throw new Error(item.drmReason ?? "Protected content — cannot download.");
   // Blob placeholders used to throw here. The hook may now hold the page Blob
@@ -252,7 +229,7 @@ export async function startDownload(
     const job: DownloadJobState = {
       jobId,
       tabId,
-      itemUrl,
+      itemUrl: cardUrl,
       filename: dest.filename,
       status: "running",
       done: 0,
@@ -297,7 +274,7 @@ export async function startDownload(
         (x) =>
           x.type === "capture" &&
           !x.drmProtected &&
-          x.url !== itemUrl &&
+          x.url !== cardUrl &&
           x.url.startsWith(sessionPrefix) &&
           x.captureKind === "audio",
       );
@@ -313,7 +290,7 @@ export async function startDownload(
     const job: DownloadJobState = {
       jobId,
       tabId,
-      itemUrl,
+      itemUrl: cardUrl,
       filename,
       status: "running",
       done: 0,
@@ -373,101 +350,119 @@ export async function startDownload(
   // anything else falls back to two files (today's pairReq path).
   let pairReq: DownloadJobRequest | null = null;
   if (item.type === "hls" || item.type === "dash") {
-    const variant = chosenVariant;
-    if (!variant) throw new Error(item.error ?? "Manifest not parsed yet — reopen the popup in a moment and retry.");
+    const liveFetch = (url: string) =>
+      fetchManifestText(tabId, url, {
+        forceNetwork: true,
+        preferPage: true,
+        skipCapture: true,
+        frameId: item.frameId,
+      });
     if (item.type === "hls") {
-      consider(variant.url);
-      req = { jobId, tabId, kind: "hls", url: variant.url, filename: dest.filename, mime: "video/mp2t" };
-      const cc = codecsOf(variant);
-      if (hasVideoCodec(cc) && !hasAudioCodec(cc)) {
-        // Audio for a video-only variant comes from either (a) a sibling
-        // audio-only variant in the list, or (b) an #EXT-X-MEDIA audio
-        // rendition playlist attached at parse time (variant.audioUrl).
-        const audioVariant = item.variants?.find((v) => {
-          const c = codecsOf(v);
-          return hasAudioCodec(c) && !hasVideoCodec(c);
-        });
-        const audioUrl = audioVariant?.url ?? variant.audioUrl;
-        if (audioUrl) {
-          consider(audioUrl);
-          const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
-          // Mux only when BOTH tracks are fMP4 (TS audio can't merge into mp4).
-          const [vFmp4, aFmp4] = await Promise.all([
-            probeHlsFmp4(tabId, variant.url),
-            probeHlsFmp4(tabId, audioUrl),
-          ]);
-          if (vFmp4 && aFmp4) {
-            req.pairUrl = audioUrl;
-            req.filename = `${stem}.mp4`;
-          } else {
-            // Non-fMP4 pair (e.g. TS): two files, as before.
-            req.filename = `${stem}-video.ts`;
-            pairReq = {
-              jobId: newJobId(),
-              tabId,
-              kind: "hls",
-              url: audioUrl,
-              filename: `${stem}-audio.m4a`,
-              mime: "video/mp4",
-            };
-          }
+      const plan = await resolveHlsForDownload(
+        item.url,
+        variantId ?? chosenVariant?.id,
+        liveFetch,
+      );
+      await patchItem(tabId, item.url, {
+        variants: plan.variants,
+        error: undefined,
+        drmProtected: false,
+      });
+      if (item.url !== cardUrl) {
+        await patchItem(tabId, cardUrl, { variants: plan.variants, error: undefined });
+      }
+      const destResolved = await computeDestination(item, plan.variant, existing?.filename);
+      metaFields.quality = destResolved.quality;
+      consider(plan.variant.url);
+      for (const s of plan.segments) consider(s);
+      if (plan.pairUrl) consider(plan.pairUrl);
+      if (plan.pairSegments) for (const s of plan.pairSegments) consider(s);
+      req = {
+        jobId,
+        tabId,
+        kind: "hls",
+        url: plan.variant.url,
+        segments: plan.segments,
+        masterUrl: item.url,
+        variantId: plan.variant.id,
+        filename: destResolved.filename,
+        mime: "video/mp2t",
+        concurrency: segmentConcurrencyFor([plan.variant.url, ...plan.segments]),
+        frameId: item.frameId,
+      };
+      if (plan.pairUrl && plan.pairSegments?.length) {
+        const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
+        if (plan.muxable) {
+          req.pairUrl = plan.pairUrl;
+          req.pairSegments = plan.pairSegments;
+          req.filename = `${stem}.mp4`;
+        } else {
+          req.filename = `${stem}-video.ts`;
+          pairReq = {
+            jobId: newJobId(),
+            tabId,
+            kind: "hls",
+            url: plan.pairUrl,
+            segments: plan.pairSegments,
+            masterUrl: item.url,
+            variantId: plan.variant.id,
+            track: "audio",
+            filename: `${stem}-audio.m4a`,
+            mime: "video/mp4",
+            concurrency: segmentConcurrencyFor(plan.pairSegments),
+            frameId: item.frameId,
+          };
         }
       }
     } else {
-      // DASH: re-resolve the manifest at download time so signed segment
-      // URLs are fresh (stored variants may have expired since detection).
-      let dashVariant = variant;
-      let dashAudio = item.variants?.find((v) => {
-        const c = codecsOf(v);
-        return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
-      });
-      try {
-        const freshText = await fetchManifestText(tabId, item.url, {
-          forceNetwork: true,
-          frameId: item.frameId,
-        });
-        const fresh = parseDashManifest(freshText, item.url);
-        const fv = fresh.variants.find((v) => v.id === variant.id) ?? fresh.variants[0];
-        if (fv?.segments?.length) {
-          dashVariant = { ...variant, segments: fv.segments };
-          const fa = fresh.variants.find((v) => {
-            const c = codecsOf(v);
-            return hasAudioCodec(c) && !hasVideoCodec(c) && (v.segments?.length ?? 0) > 0;
-          });
-          if (fa?.segments?.length) {
-            dashAudio = { ...dashAudio, ...fa } as typeof dashAudio;
-          }
-          // Persist fresh segments so an immediate retry doesn't reuse stale URLs.
-          await patchItem(tabId, item.url, { variants: fresh.variants });
-        }
-      } catch {
-        /* offline/expired manifest — fall back to stored segments */
+      const plan = await resolveDashForDownload(
+        item.url,
+        variantId ?? chosenVariant?.id,
+        liveFetch,
+      );
+      await patchItem(tabId, item.url, { variants: plan.variants, error: undefined, drmProtected: false });
+      if (item.url !== cardUrl) {
+        await patchItem(tabId, cardUrl, { variants: plan.variants, error: undefined });
       }
-      if (!dashVariant.segments?.length) throw new Error("No segments listed for this DASH variant.");
+      const destResolved = await computeDestination(item, plan.variant, existing?.filename);
+      metaFields.quality = destResolved.quality;
       consider(item.url);
-      for (const s of dashVariant.segments) consider(s);
-      req = { jobId, tabId, kind: "dash", url: item.url, segments: dashVariant.segments, filename: dest.filename, mime: "video/mp4" };
-      const cc = codecsOf(dashVariant);
-      if (hasVideoCodec(cc) && !hasAudioCodec(cc)) {
-        const audio = dashAudio;
-        if (audio?.segments?.length) {
-          for (const s of audio.segments) consider(s);
-          const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
-          if (looksFmp4Segments(dashVariant.segments ?? []) && looksFmp4Segments(audio.segments)) {
-            req.pairSegments = [...audio.segments];
-            req.filename = `${stem}.mp4`;
-          } else {
-            req.filename = `${stem}-video.mp4`;
-            pairReq = {
-              jobId: newJobId(),
-              tabId,
-              kind: "dash",
-              url: item.url,
-              segments: [...audio.segments],
-              filename: `${stem}-audio.m4a`,
-              mime: "video/mp4",
-            };
-          }
+      for (const s of plan.segments) consider(s);
+      if (plan.pairSegments) for (const s of plan.pairSegments) consider(s);
+      req = {
+        jobId,
+        tabId,
+        kind: "dash",
+        url: item.url,
+        segments: plan.segments,
+        masterUrl: item.url,
+        variantId: plan.variant.id,
+        filename: destResolved.filename,
+        mime: "video/mp4",
+        concurrency: segmentConcurrencyFor(plan.segments),
+        frameId: item.frameId,
+      };
+      if (plan.pairSegments?.length) {
+        const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
+        if (plan.muxable) {
+          req.pairSegments = plan.pairSegments;
+          req.filename = `${stem}.mp4`;
+        } else {
+          req.filename = `${stem}-video.mp4`;
+          pairReq = {
+            jobId: newJobId(),
+            tabId,
+            kind: "dash",
+            url: item.url,
+            segments: [...plan.pairSegments],
+            masterUrl: item.url,
+            variantId: plan.variant.id,
+            track: "audio",
+            filename: `${stem}-audio.m4a`,
+            mime: "video/mp4",
+            concurrency: segmentConcurrencyFor(plan.pairSegments),
+            frameId: item.frameId,
+          };
         }
       }
     }
@@ -523,8 +518,8 @@ export async function startDownload(
       }
     : newJobState(req, {
         ...metaFields,
-        itemUrl,
-        variantId: variantId ?? (req.kind === "direct" ? undefined : item.variants?.[0]?.id),
+        itemUrl: cardUrl,
+        variantId: req.variantId ?? variantId ?? (req.kind === "direct" ? undefined : item.variants?.[0]?.id),
       });
   await upsertJob(job);
 
@@ -536,7 +531,7 @@ export async function startDownload(
   let paired = false;
   const merged = !pairReq && (!!req.pairUrl || !!req.pairSegments);
   if (pairReq) {
-    const pairJob = newJobState(pairReq, { ...metaFields, itemUrl, variantId: undefined });
+    const pairJob = newJobState(pairReq, { ...metaFields, itemUrl: cardUrl, variantId: undefined });
     await upsertJob(pairJob);
     await dispatchOffscreen(pairReq, pairJob);
     paired = true;
@@ -747,58 +742,77 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
     frameId: entry.frameId,
   };
   if (type === "hls") {
-    const parsed = parseHlsManifest(
-      await fetchManifestText(tabId, entry.itemUrl, {
-        forceNetwork: true,
-        frameId: item.frameId,
-      }),
+    const plan = await resolveHlsForDownload(
       entry.itemUrl,
+      entry.variantId,
+      (url) =>
+        fetchManifestText(tabId, url, {
+          forceNetwork: true,
+          preferPage: true,
+          skipCapture: true,
+          frameId: item.frameId,
+        }),
     );
-    if (parsed.drmProtected) throw new Error(parsed.drmReason ?? "Protected content — cannot download.");
-    const variant = parsed.variants.find((v) => v.id === entry.variantId) ?? parsed.variants[0];
-    if (!variant) throw new Error("This manifest no longer lists a downloadable quality.");
     let filename = dest.filename;
     let pairUrl: string | undefined;
-    if (variant.audioUrl) {
-      const [vFmp4, aFmp4] = await Promise.all([
-        probeHlsFmp4(tabId, variant.url),
-        probeHlsFmp4(tabId, variant.audioUrl),
-      ]);
-      if (!vFmp4 || !aFmp4) {
+    let pairSegments: string[] | undefined;
+    if (plan.pairUrl && plan.pairSegments?.length) {
+      if (!plan.muxable) {
         throw new Error(
           "This video keeps its audio in a separate track that can't be merged outside its page — open the page and download there.",
         );
       }
-      pairUrl = variant.audioUrl;
+      pairUrl = plan.pairUrl;
+      pairSegments = plan.pairSegments;
       filename = withExtPreservingDir(dest.filename, ".mp4");
     }
     return createJob(
-      { jobId, tabId, kind: "hls", url: variant.url, pairUrl, filename, mime: "video/mp2t" },
-      { ...meta, variantId: variant.id, quality: qualityLabel(variant) },
+      {
+        jobId,
+        tabId,
+        kind: "hls",
+        url: plan.variant.url,
+        segments: plan.segments,
+        pairUrl,
+        pairSegments,
+        masterUrl: entry.itemUrl,
+        variantId: plan.variant.id,
+        filename,
+        mime: "video/mp2t",
+        concurrency: segmentConcurrencyFor([plan.variant.url, ...plan.segments]),
+        frameId: item.frameId,
+      },
+      { ...meta, variantId: plan.variant.id, quality: qualityLabel(plan.variant) },
     );
   }
   if (type === "dash") {
-    const parsed = parseDashManifest(
-      await fetchManifestText(tabId, entry.itemUrl, {
-        forceNetwork: true,
-        frameId: item.frameId,
-      }),
+    const plan = await resolveDashForDownload(
       entry.itemUrl,
+      entry.variantId,
+      (url) =>
+        fetchManifestText(tabId, url, {
+          forceNetwork: true,
+          preferPage: true,
+          skipCapture: true,
+          frameId: item.frameId,
+        }),
     );
-    if (parsed.drmProtected) throw new Error(parsed.drmReason ?? "Protected content — cannot download.");
-    const variant = parsed.variants.find((v) => v.id === entry.variantId) ?? parsed.variants[0];
-    if (!variant?.segments?.length) throw new Error("This manifest no longer lists downloadable segments.");
     return createJob(
       {
         jobId,
         tabId,
         kind: "dash",
         url: entry.itemUrl,
-        segments: [...variant.segments],
+        segments: [...plan.segments],
+        pairSegments: plan.muxable ? plan.pairSegments : undefined,
+        masterUrl: entry.itemUrl,
+        variantId: plan.variant.id,
         filename: dest.filename,
         mime: "video/mp4",
+        concurrency: segmentConcurrencyFor(plan.segments),
+        frameId: item.frameId,
       },
-      { ...meta, variantId: variant.id, quality: qualityLabel(variant) },
+      { ...meta, variantId: plan.variant.id, quality: qualityLabel(plan.variant) },
     );
   }
   if (HISTORY_DIRECT_TYPES.has(type)) {

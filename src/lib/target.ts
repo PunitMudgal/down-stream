@@ -67,6 +67,23 @@ export function pickCandidateItem<T extends TargetItem>(
 }
 
 /**
+ * Newest item that is the same resource as `staleUrl` after signed query
+ * tokens rotate. Exact strings differ; origin + path stay stable.
+ */
+export function pickNewestByPath<T extends { url: string; detectedAt: number }>(
+  items: T[],
+  staleUrl: string,
+): T | undefined {
+  const key = normalizeUrl(staleUrl);
+  let best: T | undefined;
+  for (const item of items) {
+    if (normalizeUrl(item.url) !== key) continue;
+    if (!best || item.detectedAt > best.detectedAt) best = item;
+  }
+  return best;
+}
+
+/**
  * True when the element plays through MediaSource (only a `blob:` URL is
  * exposed) — the one case where we can't name the video's file and the tab's
  * item list is the only source of truth.

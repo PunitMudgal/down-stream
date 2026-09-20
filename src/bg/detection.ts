@@ -1,5 +1,6 @@
 // Network detection: webRequest -> media items + cluster feed.
 // Moved verbatim from background.ts — zero behavior change.
+import { BLOB_PLACEHOLDER_HINT } from "../lib/blobResolve";
 import { classify } from "../lib/classify";
 import { filenameForUrl } from "../lib/download";
 import type { MediaItem } from "../lib/types";
@@ -36,7 +37,7 @@ export function onHeadersReceived(
     detectedAt: Date.now(),
     drmProtected: false,
     variants: type === "hls" || type === "dash" ? [] : undefined,
-    error: type === "blob" ? "Blob/MSE stream — not directly downloadable." : undefined,
+    error: type === "blob" ? BLOB_PLACEHOLDER_HINT : undefined,
   };
 
   void (async () => {
