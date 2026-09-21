@@ -156,6 +156,7 @@ function newJobState(req: DownloadJobRequest, meta: JobMeta): DownloadJobState {
     pageUrl: meta.pageUrl,
     quality: meta.quality,
     mediaType: meta.type,
+    recording: req.live === true,
   };
 }
 
@@ -367,6 +368,7 @@ export async function startDownload(
         variants: plan.variants,
         error: undefined,
         drmProtected: false,
+        isLive: plan.isLive,
       });
       if (item.url !== cardUrl) {
         await patchItem(tabId, cardUrl, { variants: plan.variants, error: undefined });
@@ -389,10 +391,16 @@ export async function startDownload(
         mime: "video/mp2t",
         concurrency: segmentConcurrencyFor([plan.variant.url, ...plan.segments]),
         frameId: item.frameId,
+        live: plan.isLive === true,
       };
       if (plan.pairUrl && plan.pairSegments?.length) {
         const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
-        if (plan.muxable) {
+        if (plan.isLive) {
+          // Live: the recorder polls the audio playlist alongside the video.
+          // A separate VOD pair job makes no sense — there is no fixed
+          // window to fetch; segments keep arriving.
+          req.pairUrl = plan.pairUrl;
+        } else if (plan.muxable) {
           req.pairUrl = plan.pairUrl;
           req.pairSegments = plan.pairSegments;
           req.filename = `${stem}.mp4`;
@@ -420,7 +428,7 @@ export async function startDownload(
         variantId ?? chosenVariant?.id,
         liveFetch,
       );
-      await patchItem(tabId, item.url, { variants: plan.variants, error: undefined, drmProtected: false });
+      await patchItem(tabId, item.url, { variants: plan.variants, error: undefined, drmProtected: false, isLive: plan.isLive });
       if (item.url !== cardUrl) {
         await patchItem(tabId, cardUrl, { variants: plan.variants, error: undefined });
       }
@@ -441,6 +449,7 @@ export async function startDownload(
         mime: "video/mp4",
         concurrency: segmentConcurrencyFor(plan.segments),
         frameId: item.frameId,
+        live: plan.isLive === true,
       };
       if (plan.pairSegments?.length) {
         const stem = req.filename.replace(/\.[a-z0-9]+$/i, "");
@@ -757,14 +766,20 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
     let pairUrl: string | undefined;
     let pairSegments: string[] | undefined;
     if (plan.pairUrl && plan.pairSegments?.length) {
-      if (!plan.muxable) {
-        throw new Error(
-          "This video keeps its audio in a separate track that can't be merged outside its page — open the page and download there.",
-        );
+      if (plan.isLive) {
+        // Live re-download records again: the recorder polls the audio
+        // playlist itself — no muxability requirement, no fixed window.
+        pairUrl = plan.pairUrl;
+      } else {
+        if (!plan.muxable) {
+          throw new Error(
+            "This video keeps its audio in a separate track that can't be merged outside its page — open the page and download there.",
+          );
+        }
+        pairUrl = plan.pairUrl;
+        pairSegments = plan.pairSegments;
+        filename = withExtPreservingDir(dest.filename, ".mp4");
       }
-      pairUrl = plan.pairUrl;
-      pairSegments = plan.pairSegments;
-      filename = withExtPreservingDir(dest.filename, ".mp4");
     }
     return createJob(
       {
@@ -781,6 +796,7 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
         mime: "video/mp2t",
         concurrency: segmentConcurrencyFor([plan.variant.url, ...plan.segments]),
         frameId: item.frameId,
+        live: plan.isLive === true,
       },
       { ...meta, variantId: plan.variant.id, quality: qualityLabel(plan.variant) },
     );
@@ -811,6 +827,7 @@ async function startHistoryJob(entry: HistoryEntry): Promise<DownloadJobState> {
         mime: "video/mp4",
         concurrency: segmentConcurrencyFor(plan.segments),
         frameId: item.frameId,
+        live: plan.isLive === true,
       },
       { ...meta, variantId: plan.variant.id, quality: qualityLabel(plan.variant) },
     );

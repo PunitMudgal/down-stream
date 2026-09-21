@@ -5,6 +5,23 @@ export interface DashParseResult {
   variants: Variant[];
   drmProtected: boolean;
   drmReason?: string;
+  /** MPD type="dynamic": a live broadcast whose segment list keeps growing. */
+  isLive?: boolean;
+  /** Seconds between MPD reloads (minimumUpdatePeriod; defaults apply). */
+  minUpdatePeriodSec?: number;
+}
+
+/** ISO-8601-ish duration ("PT2S", "PT1M30S") to seconds, or undefined. */
+function parseIsoDurationSec(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i.exec(raw.trim());
+  if (!m) return undefined;
+  const days = Number(m[1] ?? 0);
+  const hours = Number(m[2] ?? 0);
+  const mins = Number(m[3] ?? 0);
+  const secs = Number(m[4] ?? 0);
+  const total = days * 86400 + hours * 3600 + mins * 60 + secs;
+  return total > 0 ? total : undefined;
 }
 
 /**
@@ -75,6 +92,16 @@ export function parseDashManifest(
         return u;
       }
     });
+    const initUrl =
+      typeof initUri === "string"
+        ? (() => {
+            try {
+              return new URL(initUri, manifestUrl).toString();
+            } catch {
+              return initUri;
+            }
+          })()
+        : undefined;
     return {
       id: `dash-${i}`,
       url: manifestUrl,
@@ -84,12 +111,22 @@ export function parseDashManifest(
       bandwidth: attrs?.bandwidth ?? attrs?.BANDWIDTH,
       codecs: attrs?.codecs ?? attrs?.CODECS,
       segments,
+      initUrl,
     };
   });
+
+  // Live DASH: MPD type="dynamic". The segment list slides with the
+  // broadcast; minimumUpdatePeriod says how often to reload it.
+  const isLive = /\btype\s*=\s*["']dynamic["']/i.test(xmlText);
+  const minUpdatePeriodSec =
+    parseIsoDurationSec(/minimumUpdatePeriod\s*=\s*["']([^"']+)["']/i.exec(xmlText)?.[1]) ??
+    (isLive ? 2 : undefined);
 
   return {
     variants,
     drmProtected: drmProtected || drmInTree,
+    isLive,
+    minUpdatePeriodSec,
     drmReason:
       drmReason ??
       (drmInTree

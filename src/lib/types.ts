@@ -29,6 +29,8 @@ export interface Variant {
   segments?: string[];
   /** Separate HLS audio-rendition playlist (from #EXT-X-MEDIA:TYPE=AUDIO) to mux in. */
   audioUrl?: string;
+  /** DASH initialization segment URL, when the MPD declares one. */
+  initUrl?: string;
 }
 
 export interface MediaItem {
@@ -64,6 +66,8 @@ export interface MediaItem {
    * and player state the CDN accepted. Absent/-1 = address the whole tab.
    */
   frameId?: number;
+  /** Open-ended HLS/DASH broadcast — recordable, not a bounded download. */
+  isLive?: boolean;
 }
 
 export type RuntimeMessage =
@@ -118,6 +122,9 @@ export type RuntimeMessage =
   | { type: "OFFSCREEN_CANCEL"; jobId: string }
   | { type: "OFFSCREEN_PAUSE"; jobId: string }
   | { type: "OFFSCREEN_RESUME"; jobId: string }
+  /** Popup -> worker -> offscreen: end a live recording, save what exists. */
+  | { type: "STOP_RECORDING"; jobId: string }
+  | { type: "OFFSCREEN_STOP"; jobId: string }
   | { type: "FETCH_TEXT"; tabId: number; url: string; captureOnly?: boolean; skipCapture?: boolean }
   // Page relay: bytes for a segment this extension is not allowed to fetch
   // (worker -> content script starts it; the slices come back as
@@ -236,6 +243,11 @@ export interface DownloadJobRequest {
   track?: "main" | "audio";
   /** Parallel segment fetches; lower on short-lived signed CDNs. */
   concurrency?: number;
+  /**
+   * Live broadcast: record the growing playlist instead of downloading a
+   * fixed snapshot. `segments` is ignored; the recorder polls and appends.
+   */
+  live?: boolean;
 }
 
 export type DownloadJobStatus =
@@ -333,6 +345,8 @@ export interface DownloadJobState {
   mediaType?: MediaType;
   stage?: DownloadJobStage;
   downloadId?: number;
+  /** Live recording in progress (HLS/DASH live capture; Stop ends it). */
+  recording?: boolean;
   error?: string;
   /** Extra completion detail, e.g. which part files a large download was split into. */
   note?: string;

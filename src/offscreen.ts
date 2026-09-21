@@ -17,8 +17,17 @@ import {
   type SegmentRelayFn,
   type SegmentedPart,
 } from "./lib/download";
-import { extractHlsSegments } from "./lib/parseHls";
+import { extractHlsSegments, parseHlsMediaPlaylist } from "./lib/parseHls";
+import { parseDashManifest } from "./lib/parseDash";
 import { resolveDashForDownload, resolveHlsForDownload, segmentConcurrencyFor } from "./lib/freshStream";
+import { recordLive, type LivePollSnapshot, type LiveRecorderOptions, type LiveTrackDef } from "./lib/liveRecorder";
+import {
+  liveClear,
+  liveCount,
+  liveLoadInit,
+  liveLoadMeta,
+  liveLoadRange,
+} from "./lib/liveRecord";
 import { basenameOf, withExtPreservingDir } from "./lib/filename";
 import { muxFmp4 } from "./lib/mp4mux";
 import {
@@ -33,6 +42,8 @@ import type { DownloadJobRequest, DownloadJobStage } from "./lib/types";
 const controllers = new Map<string, AbortController>();
 /** Jobs currently paused — fetch workers wait instead of taking new segments. */
 const pausedJobs = new Set<string>();
+/** Live recordings the user asked to stop (finish with what exists). */
+const stoppingLive = new Set<string>();
 /** Jobs this offscreen document instance is actively running (startup recovery).
  *  A Set because batch mode can run more than one download at once. */
 const activeJobIds = new Set<string>();
@@ -926,6 +937,186 @@ async function spoolCaptureParts(jobId: string, flushAll = false): Promise<{ fil
   return { files, note };
 }
 
+// ---- live HLS/DASH recording ----------------------------------------------
+
+/**
+ * Record a live broadcast: poll the growing playlist, append every new
+ * segment, and roll bytes into `.partN` files as they accumulate. Ends when
+ * the playlist closes (broadcast over) or the user presses Stop — either way
+ * the captured bytes are saved, never thrown away.
+ */
+async function recordLiveJob(
+  job: DownloadJobRequest,
+  scope: NetScope | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  // Per-job: concurrent recordings must never see each other's filenames.
+  const savedFiles: string[] = [];
+  const fetchText = (url: string): Promise<string> => textWithNetRelayed(job, url, scope, signal);
+  const stem = job.filename.replace(/\.[a-z0-9]+$/i, "") || job.filename;
+  const relay = pageRelayFor(job.jobId);
+
+  // Recover bytes an interrupted session persisted but never spooled, so a
+  // restart continues the recording instead of starting empty.
+  let recovered: Pick<
+    LiveRecorderOptions,
+    "recoveredInit" | "recoveredPending" | "recoveredCount" | "recoveredHasInit"
+  > = {};
+  try {
+    const meta = await liveLoadMeta(job.jobId);
+    if (meta) {
+      const n = await liveCount(job.jobId, 0);
+      const segs =
+        n > 0 ? ((await liveLoadRange(job.jobId, 0, 0, n)).filter(Boolean) as ArrayBuffer[]) : [];
+      const init = meta.hasInit ? await liveLoadInit(job.jobId) : undefined;
+      recovered = {
+        recoveredInit: init,
+        recoveredPending: segs.length ? segs : undefined,
+        recoveredCount: segs.length,
+        recoveredHasInit: false, // init is separate; spooling prepends it
+      };
+      if (segs.length) {
+        report({
+          type: "JOB_NOTE",
+          jobId: job.jobId,
+          note: `Recovered ${segs.length} recorded segments from before the interruption.`,
+        });
+      }
+    }
+  } catch {
+    recovered = {};
+  }
+
+  const savePart = async (parts: ArrayBuffer[], partNo: number, last: boolean): Promise<string> => {
+    const blob = new Blob(parts, { type: job.kind === "dash" ? "video/mp4" : "video/mp2t" });
+    const ext = await sniffExtension(blob, job.kind === "dash" ? ".mp4" : ".ts");
+    const filename = partNo === 1 ? withExtension(stem, ext) : partFilename(stem, partNo, ext);
+    stage(job.jobId, "saving");
+    await saveBlob(job.jobId, blob, filename);
+    savedFiles.push(filename);
+    if (last) stage(job.jobId, "fetching");
+    return filename;
+  };
+
+  let def: LiveTrackDef;
+  if (job.kind === "dash") {
+    def = dashLiveDef(job, fetchText);
+  } else {
+    def = hlsLiveDef(job, fetchText);
+  }
+
+  report({ type: "JOB_NOTE", jobId: job.jobId, note: "Recording live stream — press Stop to finish." });
+  const result = await recordLive(def, {
+    jobId: job.jobId,
+    signal,
+    scope,
+    isPaused: () => pausedJobs.has(job.jobId),
+    isStopping: () => stoppingLive.has(job.jobId),
+    relay,
+    concurrency: job.concurrency,
+    onProgress: (segs, bytes) =>
+      report({ type: "DOWNLOAD_PROGRESS", jobId: job.jobId, done: segs, total: 0, bytesDone: bytes }),
+    savePart,
+    ...recovered,
+  });
+
+  // Recording finalized — its OPFS segments are dead weight.
+  void liveClear(job.jobId);
+
+  const files = [...savedFiles];
+  if (!files.length) {
+    throw new Error(
+      result.segments === 0
+        ? "Nothing was recorded — the live stream published no segments while recording."
+        : "Recording produced no playable output.",
+    );
+  }
+  const which =
+    files.length === 1 ? files[0] : `${files.length} part files (${files[0]} … ${files[files.length - 1]})`;
+  const note = stoppingLive.has(job.jobId)
+    ? `Recording stopped — saved ${result.segments} segments as ${which}. Play in order.`
+    : result.endedNaturally
+      ? `Live broadcast ended — recorded ${result.segments} segments to ${which}.`
+      : `Recorded ${result.segments} segments to ${which}.`;
+  report({ type: "DOWNLOAD_DONE", jobId: job.jobId, filename: files[0], note });
+}
+
+/** DASH live: re-parse the MPD per poll; the window slides with the broadcast. */
+function dashLiveDef(
+  job: DownloadJobRequest,
+  fetchText: (url: string) => Promise<string>,
+): LiveTrackDef {
+  const hasV = (c?: string): boolean => /(avc|hev|hvc|vp0?9|av0?1)/i.test(c ?? "");
+  const hasA = (c?: string): boolean => /(mp4a|opus|ec-3|ac-3|ac-4)/i.test(c ?? "");
+  const mpd = (job.masterUrl ?? job.url) as string;
+  const pollTrack = async (wantAudio: boolean): Promise<LivePollSnapshot> => {
+    const text = await fetchText(mpd);
+    const parsed = parseDashManifest(text, job.url);
+    if (parsed.drmProtected) {
+      throw new Error(parsed.drmReason ?? "Protected content — cannot download.");
+    }
+    const v = wantAudio
+      ? parsed.variants.find((x) => hasA(x.codecs) && !hasV(x.codecs) && (x.segments?.length ?? 0) > 0)
+      : (parsed.variants.find((x) => x.id === job.variantId) ?? parsed.variants[0]);
+    const segs = v?.segments ?? [];
+    // The declared init segment (when any) is captured separately so it can
+    // head every part file; the media segments are the recordable stream.
+    const initUrl = v?.initUrl;
+    return {
+      entries: segs
+        .filter((url) => url !== initUrl)
+        .map((url, i) => ({ seq: i, url })),
+      ended: parsed.isLive !== true,
+      pollSec: parsed.minUpdatePeriodSec,
+      initUrl,
+      byUrl: true,
+    };
+  };
+  const def: LiveTrackDef = { poll: () => pollTrack(false), pollSec: 2 };
+  if (job.pairSegments?.length || job.pairUrl) {
+    def.pair = { poll: () => pollTrack(true), pollSec: 2 };
+  }
+  return def;
+}
+
+/** HLS live: re-resolve through the master so rotated variants keep working. */
+function hlsLiveDef(
+  job: DownloadJobRequest,
+  fetchText: (url: string) => Promise<string>,
+): LiveTrackDef {
+  const poll = async (): Promise<LivePollSnapshot> => {
+    const plan = await resolveHlsForDownload(
+      (job.masterUrl ?? job.url) as string,
+      job.variantId,
+      fetchText,
+    );
+    const info = parseHlsMediaPlaylist(await fetchText(plan.variant.url), plan.variant.url);
+    return {
+      entries: info.entries,
+      ended: info.endList,
+      pollSec: info.targetDurationSec,
+      initUrl: info.initUrl,
+    };
+  };
+  const def: LiveTrackDef = { poll, pollSec: 6 };
+  if (job.pairUrl) {
+    const pairUrl = job.pairUrl;
+    def.pair = {
+      pollSec: 6,
+      poll: async (): Promise<LivePollSnapshot> => {
+        const info = parseHlsMediaPlaylist(await fetchText(pairUrl), pairUrl);
+        return {
+          entries: info.entries,
+          ended: info.endList,
+          pollSec: info.targetDurationSec,
+          initUrl: info.initUrl,
+        };
+      },
+    };
+  }
+  return def;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const m = msg as any;
@@ -978,6 +1169,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     captures.delete(m.jobId);
     pausedJobs.delete(m.jobId);
     cancelledCaptures.add(m.jobId);
+    stoppingLive.delete(m.jobId);
+    void liveClear(m.jobId); // a discarded recording keeps no bytes
     clearRelayStats(m.jobId);
     try {
       sendResponse({ ok: true });
@@ -997,6 +1190,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (m?.type === "OFFSCREEN_RESUME" && typeof m.jobId === "string") {
     pausedJobs.delete(m.jobId);
+    try {
+      sendResponse({ ok: true });
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  // Stop a live recording: the poll loop notices and finalizes what exists.
+  if (m?.type === "OFFSCREEN_STOP" && typeof m.jobId === "string") {
+    stoppingLive.add(m.jobId);
     try {
       sendResponse({ ok: true });
     } catch {
@@ -1202,6 +1405,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       stage(job.jobId, "fetching");
       const scope = job.netScope;
 
+      // Live HLS/DASH: record the growing playlist instead of downloading a
+      // snapshot. Runs until the broadcast ends or the user stops it.
+      if (job.live === true && (job.kind === "hls" || job.kind === "dash")) {
+        await recordLiveJob(job, scope, signal);
+        return;
+      }
+
       // Direct files go through the page's own auth context (cookies +
       // captured same-origin headers + referrer). Script endpoints like
       // `remote_control.php` gate on exactly this — a bare browser download
@@ -1257,6 +1467,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     } finally {
       controllers.delete(job.jobId);
       pausedJobs.delete(job.jobId);
+      stoppingLive.delete(job.jobId);
       activeJobIds.delete(job.jobId);
       clearRelayStats(job.jobId);
     }

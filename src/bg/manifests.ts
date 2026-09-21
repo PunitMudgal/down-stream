@@ -257,6 +257,9 @@ export async function parseStreamingItem(
         variants: parsed.variants,
         drmProtected: parsed.drmProtected,
         drmReason: parsed.drmReason,
+        // Master playlists don't declare liveness (their variants do);
+        // undefined preserves any earlier flag instead of clearing it.
+        isLive: parsed.isLive,
         error: undefined,
       });
     } else if (item.type === "dash") {
@@ -265,6 +268,7 @@ export async function parseStreamingItem(
         variants: parsed.variants,
         drmProtected: parsed.drmProtected,
         drmReason: parsed.drmReason,
+        isLive: parsed.isLive,
         error: undefined,
       });
     }

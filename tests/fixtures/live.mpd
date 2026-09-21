@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" minimumUpdatePeriod="PT2S" availabilityStartTime="2026-09-20T10:00:00Z" timeShiftBufferDepth="PT30S" profiles="urn:mpeg:dash:profile:isoff-live:2011">
+  <Period id="0" start="PT0S">
+    <AdaptationSet id="0" contentType="video" mimeType="video/mp4" codecs="avc1.4d401f">
+      <Representation id="v1" bandwidth="800000" width="640" height="360">
+        <SegmentTemplate timescale="90000" media="chunk-v$Number$.m4s" initialization="init-v.mp4" startNumber="100" duration="360000" />
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" codecs="mp4a.40.2">
+      <Representation id="a1" bandwidth="96000">
+        <SegmentTemplate timescale="48000" media="chunk-a$Number$.m4s" initialization="init-a.mp4" startNumber="100" duration="192000" />
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>

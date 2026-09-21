@@ -19,6 +19,7 @@ import { routeMessage } from "./bg/router";
 import { forgetTabMedia, getTabItems, jobMemory, lastUrlByTab, persistTab } from "./bg/store";
 import { pickBestTabItem, pickCandidateItem, looksLikeBlobPlayer } from "./lib/target";
 import { pruneOrphans } from "./lib/persist";
+import { livePruneOrphans } from "./lib/liveRecord";
 
 // Re-exported for the legacy import path; new code should import
 // from lib/classify directly (popup.ts does).
@@ -244,7 +245,11 @@ try {
 // and become resumable; the rest are marked so the popup offers Retry.
 void markInterruptedJobs().then(() => {
   // Drop OPFS segment caches for jobs that no longer exist (bounded storage).
-  pruneOrphans(new Set([...jobMemory.keys()])).catch(() => {
+  const keep = new Set([...jobMemory.keys()]);
+  pruneOrphans(keep).catch(() => {
+    /* best-effort */
+  });
+  livePruneOrphans(keep).catch(() => {
     /* best-effort */
   });
 });

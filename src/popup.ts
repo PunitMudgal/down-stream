@@ -588,6 +588,15 @@ function runningText(job: DownloadJobState): string {
     const segs = job.total > 1 ? ` ${job.done}/${job.total} segments` : "";
     return `Paused${segs}. Resume to continue.`;
   }
+  if (job.recording) {
+    // Live capture: `done` is segments recorded so far, `total` stays 0 —
+    // the broadcast decides the length. No ETA; show elapsed instead.
+    if (job.stage === "saving") return `Saving recording… ${tail}`;
+    const segs = job.done > 0 ? `${job.done} segments` : "waiting for first segment…";
+    const mb = job.bytesDone && job.bytesDone > 0 ? ` • ${formatBytes(job.bytesDone)}` : "";
+    const elapsed = formatEta(Math.max(0, (Date.now() - (job.startedAt ?? job.updatedAt)) / 1000));
+    return `● Recording… ${segs}${mb}${elapsed ? ` • ${elapsed}` : ""} ${tail}`;
+  }
   if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) {
     if (job.stage === "assembling") return `Assembling capture… ${tail}`;
     if (job.stage === "saving") return `Saving download… ${tail}`;
@@ -1184,8 +1193,11 @@ function renderCard(item: MediaItem): HTMLElement {
       const ordered = sortVariants(item.variants);
       const btn = document.createElement("button");
       btn.className = "dl";
+      const live = item.isLive === true;
       if (ordered.length === 1) {
-        btn.textContent = `Download (${variantLabel(ordered[0], 0)})`;
+        btn.textContent = live
+          ? `● Rec (${variantLabel(ordered[0], 0)})`
+          : `Download (${variantLabel(ordered[0], 0)})`;
         btn.onclick = () => void handleStartDownload(item, ordered[0].id, btn);
         meta.appendChild(btn);
       } else {
@@ -1207,9 +1219,15 @@ function renderCard(item: MediaItem): HTMLElement {
         // appears when the probe returns).
         void markRecommendedQuality(item, sel);
 
-        btn.textContent = "Download";
+        btn.textContent = live ? "● Rec" : "Download";
         btn.onclick = () => void handleStartDownload(item, sel.value, btn);
         meta.appendChild(btn);
+      }
+      if (live) {
+        const hint = document.createElement("div");
+        hint.className = "hint";
+        hint.textContent = "Live stream — records until you press Stop or the broadcast ends.";
+        meta.appendChild(hint);
       }
     }
   } else if (item.type === "segments") {
@@ -1309,6 +1327,7 @@ function jobLine(job: DownloadJobState, direct: boolean): { label: string; state
 /** Segmented jobs (HLS/DASH/groups) support pause; direct streams + capture/blob do not. */
 function isPausableJob(job: DownloadJobState): boolean {
   if (job.unit === "bytes") return false;
+  if (job.recording) return false; // recordings have Stop, not Pause
   if (job.itemUrl.startsWith("capture:") || job.itemUrl.startsWith("blob:")) return false;
   return true;
 }
@@ -1366,6 +1385,27 @@ function paintJobButtons(card: HTMLElement, job: DownloadJobState | undefined, d
     };
   } else if (pause) {
     pause.hidden = true;
+  }
+  // Live recordings get a Stop control: ends the capture and saves whatever
+  // was recorded (distinct from Cancel, which discards nothing but aborts).
+  const recording = activeRelated.filter((j) => j.recording && j.status === "running");
+  let stop = card.querySelector("button.stopbtn") as HTMLButtonElement | null;
+  if (recording.length > 0) {
+    if (!stop) {
+      stop = document.createElement("button");
+      stop.className = "ghost stopbtn";
+      stop.textContent = "■ Stop & save";
+      (card.querySelector(".util-row") ?? card.querySelector(".meta"))?.appendChild(stop);
+    }
+    stop.hidden = false;
+    const ids = recording.map((j) => j.jobId);
+    stop.onclick = (): void => {
+      void (async () => {
+        for (const id of ids) await stopRecording(id);
+      })();
+    };
+  } else if (stop) {
+    stop.hidden = true;
   }
 }
 
@@ -1479,6 +1519,20 @@ async function cancelJob(jobId: string): Promise<void> {
   }
 }
 
+/** End a live recording — the worker finalizes and saves what was captured. */
+async function stopRecording(jobId: string): Promise<void> {
+  try {
+    await withTimeout(
+      chrome.runtime.sendMessage({ type: "STOP_RECORDING", jobId }),
+      8000,
+      "Stopping",
+    );
+    setStatus("Stopping recording — saving what's been captured…");
+  } catch (err) {
+    setStatus(`Stop failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function copyLink(url: string, btn: HTMLButtonElement): Promise<void> {
   // The button holds an icon + label span — update only the label so the
   // icon survives the "Copied!" swap.
@@ -1559,7 +1613,11 @@ async function handleStartDownload(
       }
       const job = res.job as DownloadJobState;
       jobs = [job, ...jobs.filter((j) => j.jobId !== job.jobId)];
-      if (item.type === "hls" || item.type === "dash" || item.type === "segments" || item.type === "capture") {
+      if (job.recording) {
+        setStatus(
+          `Recording ${basenameOf(job.filename)} until you press Stop (on the card) or the broadcast ends. You can close this popup.`,
+        );
+      } else if (item.type === "hls" || item.type === "dash" || item.type === "segments" || item.type === "capture") {
         setStatus(
           res.merged
             ? "Merging video + audio into one file with sound. You can close this popup."

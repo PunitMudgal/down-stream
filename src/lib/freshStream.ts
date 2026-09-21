@@ -73,6 +73,10 @@ export interface HlsDownloadPlan {
   pairUrl?: string;
   pairSegments?: string[];
   muxable: boolean;
+  /** Chosen media playlist is open-ended (live/event) — record, don't fetch. */
+  isLive?: boolean;
+  /** Playlist's #EXT-X-TARGETDURATION (poll interval when live). */
+  targetDurationSec?: number;
 }
 
 export interface DashDownloadPlan {
@@ -81,6 +85,10 @@ export interface DashDownloadPlan {
   segments: string[];
   pairSegments?: string[];
   muxable: boolean;
+  /** MPD type="dynamic" — record, don't fetch. */
+  isLive?: boolean;
+  /** MPD minimumUpdatePeriod (poll interval when live). */
+  minUpdatePeriodSec?: number;
 }
 
 /**
@@ -98,12 +106,15 @@ export async function resolveHlsForDownload(
 
   if (!parsed.isMaster) {
     const segments = extractHlsSegments(masterText, masterUrl);
-    if (segments.length === 0) throw new Error("No segments found in the HLS variant playlist.");
+    if (segments.length === 0 && !parsed.isLive)
+      throw new Error("No segments found in the HLS variant playlist.");
     return {
       variants: parsed.variants,
       variant: parsed.variants[0],
       segments,
       muxable: false,
+      isLive: parsed.isLive,
+      targetDurationSec: parsed.targetDurationSec,
     };
   }
 
@@ -112,8 +123,11 @@ export async function resolveHlsForDownload(
 
   const mediaText = await fetchText(variant.url);
   assertNotEncryptedHls(mediaText);
+  // The chosen variant may itself be a live media playlist.
+  const mediaParsed = parseHlsManifest(mediaText, variant.url);
   const segments = extractHlsSegments(mediaText, variant.url);
-  if (segments.length === 0) throw new Error("No segments found in the HLS variant playlist.");
+  if (segments.length === 0 && !mediaParsed.isLive)
+    throw new Error("No segments found in the HLS variant playlist.");
 
   let pairUrl: string | undefined;
   let pairSegments: string[] | undefined;
@@ -138,7 +152,16 @@ export async function resolveHlsForDownload(
       playlistLooksFmp4(mediaText, segments) &&
       playlistLooksFmp4(pairText ?? "", pairSegments),
   );
-  return { variants: parsed.variants, variant, segments, pairUrl, pairSegments, muxable };
+  return {
+    variants: parsed.variants,
+    variant,
+    segments,
+    pairUrl,
+    pairSegments,
+    muxable,
+    isLive: mediaParsed.isLive,
+    targetDurationSec: mediaParsed.targetDurationSec,
+  };
 }
 
 /**
@@ -177,5 +200,7 @@ export async function resolveDashForDownload(
     segments: [...variant.segments],
     pairSegments,
     muxable,
+    isLive: parsed.isLive,
+    minUpdatePeriodSec: parsed.minUpdatePeriodSec,
   };
 }

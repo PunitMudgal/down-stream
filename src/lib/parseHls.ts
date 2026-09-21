@@ -6,6 +6,10 @@ export interface HlsParseResult {
   drmProtected: boolean;
   drmReason?: string;
   isMaster: boolean;
+  /** Media playlist is open-ended (live/event): no #EXT-X-ENDLIST. */
+  isLive?: boolean;
+  /** Seconds the player waits between playlist reloads (#EXT-X-TARGETDURATION). */
+  targetDurationSec?: number;
 }
 
 function formatResolution(
@@ -70,8 +74,73 @@ export function parseHlsManifest(
   }
 
   // --- Media playlist: single variant (the manifest itself) ---
+  // Open-ended playlists (no #EXT-X-ENDLIST, or PLAYLIST-TYPE:EVENT) are live
+  // broadcasts: their segment list grows over time and a plain VOD download
+  // would fetch a sliding snapshot. They record instead.
+  const isLive =
+    manifest?.endList !== true ||
+    /#EXT-X-PLAYLIST-TYPE\s*:\s*EVENT/i.test(text);
+  const targetDurationSec: number | undefined =
+    typeof manifest?.targetDuration === "number" && manifest.targetDuration > 0
+      ? manifest.targetDuration
+      : undefined;
   const single: Variant = { id: "hls-0", url: manifestUrl };
-  return { variants: [single], drmProtected, drmReason, isMaster: false };
+  return { variants: [single], drmProtected, drmReason, isMaster: false, isLive, targetDurationSec };
+}
+
+/** One ordered entry of a live media playlist's current window. */
+export interface HlsLiveSegmentEntry {
+  /** Absolute media sequence number (#EXT-X-MEDIA-SEQUENCE based). */
+  seq: number;
+  url: string;
+}
+
+export interface HlsMediaPlaylistInfo {
+  entries: HlsLiveSegmentEntry[];
+  /** Playlist closed (#EXT-X-ENDLIST present) — the broadcast is over. */
+  endList: boolean;
+  targetDurationSec?: number;
+  /** fMP4 init URL (#EXT-X-MAP), when the playlist declares one. */
+  initUrl?: string;
+}
+
+/**
+ * Parse an HLS *media* playlist for live recording: ordered segment URLs
+ * paired with their media-sequence numbers so a sliding window can be diffed
+ * across reloads (segments leaving the window are simply absent; sequence
+ * numbers are the stable identity).
+ */
+export function parseHlsMediaPlaylist(
+  text: string,
+  playlistUrl: string,
+): HlsMediaPlaylistInfo {
+  const parser = new Parser();
+  parser.push(text);
+  parser.end();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const manifest = parser.manifest as any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const segments: any[] = manifest?.segments ?? [];
+  const baseSeq: number =
+    typeof manifest?.mediaSequence === "number" ? manifest.mediaSequence : 0;
+  const entries: HlsLiveSegmentEntry[] = [];
+  let initUrl: string | undefined;
+  segments.forEach((s, i) => {
+    const url = safeResolve(s?.uri, playlistUrl);
+    if (url) entries.push({ seq: baseSeq + i, url });
+    if (!initUrl) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mapUri: unknown = (s as any)?.map?.resolvedUri ?? (s as any)?.map?.uri;
+      if (typeof mapUri === "string" && mapUri.length > 0) {
+        initUrl = safeResolve(mapUri, playlistUrl);
+      }
+    }
+  });
+  const targetDurationSec: number | undefined =
+    typeof manifest?.targetDuration === "number" && manifest.targetDuration > 0
+      ? manifest.targetDuration
+      : undefined;
+  return { entries, endList: manifest?.endList === true, targetDurationSec, initUrl };
 }
 
 /**

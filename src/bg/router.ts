@@ -172,6 +172,23 @@ async function handleCancelJob(m: AnyMsg): Promise<unknown> {
   return { ok: false, error: "Job is not running." };
 }
 
+/** End a live recording gracefully: the offscreen poll loop stops and saves
+ *  everything captured so far (DOWNLOAD_DONE with the recording note). */
+async function handleStopRecording(m: AnyMsg): Promise<unknown> {
+  if (typeof m.jobId !== "string") return { ok: false, error: "Unknown message" };
+  await ensureJobsLoaded();
+  const job = getJob(m.jobId);
+  if (!job || job.status !== "running" || !job.recording) {
+    return { ok: false, error: "No active recording for this job." };
+  }
+  try {
+    await chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP", jobId: m.jobId });
+  } catch {
+    /* offscreen gone — the recording can't be finalized anyway */
+  }
+  return { ok: true };
+}
+
 async function handlePauseJob(m: AnyMsg): Promise<unknown> {
   if (typeof m.jobId !== "string") return { ok: false, error: "Unknown message" };
   await ensureJobsLoaded();
@@ -720,6 +737,7 @@ const HANDLERS: Record<string, Handler> = {
   PROBE_QUALITY: handleProbeQuality,
   CANCEL_JOB: handleCancelJob,
   PAUSE_JOB: handlePauseJob,
+  STOP_RECORDING: handleStopRecording,
   RESUME_JOB: handleResumeJob,
   RETRY_JOB: handleRetryJob,
   START_DOWNLOAD: handleStartDownload,
@@ -754,6 +772,7 @@ const HANDLERS: Record<string, Handler> = {
   OFFSCREEN_CANCEL: handleIgnored,
   OFFSCREEN_PAUSE: handleIgnored,
   OFFSCREEN_RESUME: handleIgnored,
+  OFFSCREEN_STOP: handleIgnored,
   OFFSCREEN_STATUS: handleIgnored,
   OFFSCREEN_PROBE: handleIgnored,
   CONTEXT_DOWNLOAD: handleIgnored,
