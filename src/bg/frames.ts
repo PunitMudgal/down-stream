@@ -65,20 +65,23 @@ export async function sendToAcceptingFrame<T = unknown>(
   frameId: number | undefined,
   msg: unknown,
   maxFrames = 12,
-): Promise<{ accepted: boolean; error?: string; response?: T }> {
+): Promise<{ accepted: boolean; error?: string; reason?: string; response?: T }> {
   const preferred = addressableFrame(frameId);
   const all = await frameIdsFor(tabId);
   const ordered =
     preferred === undefined ? all : [preferred, ...all.filter((id) => id !== preferred)];
   let declineError: string | undefined;
+  let declineReason: string | undefined;
   for (const id of ordered.slice(0, maxFrames)) {
     try {
       const res = (await chrome.tabs.sendMessage(tabId, msg, { frameId: id })) as {
         declined?: boolean;
         error?: string;
+        reason?: string;
       };
       if (res?.declined === true) {
         declineError = declineError ?? res.error;
+        declineReason = declineReason ?? (typeof res.reason === "string" ? res.reason : undefined);
         continue; // this frame doesn't hold it — ask the next one
       }
       return { accepted: true, response: res as T };
@@ -90,7 +93,16 @@ export async function sendToAcceptingFrame<T = unknown>(
   const res = (await chrome.tabs.sendMessage(tabId, msg)) as {
     declined?: boolean;
     error?: string;
+    reason?: string;
   };
-  if (res?.declined === true) return { accepted: false, error: declineError ?? res.error };
+  if (res?.declined === true) {
+    const out: { accepted: boolean; error?: string; reason?: string } = {
+      accepted: false,
+      error: declineError ?? res.error,
+    };
+    const reason = declineReason ?? (typeof res.reason === "string" ? res.reason : undefined);
+    if (reason !== undefined) out.reason = reason;
+    return out;
+  }
   return { accepted: true, response: res as T };
 }

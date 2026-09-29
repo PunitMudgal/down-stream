@@ -145,7 +145,7 @@ export type RuntimeMessage =
   | { type: "MS_CANCEL"; jobId: string }
   // --- Blob-file transfer (page Blob object URL -> hook slices -> offscreen) ---
   | { type: "BLOB_DOWNLOAD"; jobId: string; url: string; filename: string }
-  | { type: "MS_TRACK_START"; jobId: string; total: number; mime: string; filename: string }
+  | { type: "MS_TRACK_START"; jobId: string; total: number; mime: string; filename: string; truncated?: boolean }
   | { type: "MS_TRACK_CHUNK"; jobId: string; which: 0 | 1; index: number; total: number; buf: ArrayBuffer }
   | { type: "MS_TRACK_END"; jobId: string }
   /** Drop a finished capture's buffered parts (bounded offscreen memory). */

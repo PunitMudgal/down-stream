@@ -949,7 +949,13 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
   // buffers, and pruning of sessions that never received data. Once a cap
   // hits, the wrapper degrades to pure passthrough (zero copy).
   try {
-    const TRACK_CAP = 64_000_000; // per-track memory cap (was 250MB)
+    // Per-track memory cap. 64 MB used to cut long videos off mid-way without
+    // saying so; 256 MB covers ~6 minutes of 1080p while staying well inside a
+    // tab's heap. Past the cap the wrapper degrades to pure passthrough and the
+    // download reports the truncation.
+    const TRACK_CAP = 256_000_000;
+    /** A session being read by the extension is never evicted for this long. */
+    const SESSION_PIN_MS = 120_000;
     const MAX_SESSIONS = 4; // oldest session evicted beyond this
     const XFER = 4_000_000; // bytes per postMessage chunk
     const BLOB_RESOLVE_MS = 8000; // budget for reading a blob: URL in-page
@@ -968,6 +974,13 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
       eme: boolean;
       created: number;
       lastAppend: number;
+      /**
+       * Wall-clock deadline until which this session must not be evicted or
+       * pruned. Set while the extension is streaming it out, so a busy page
+       * (several players, e.g. a feed) cannot drop a buffer mid-download and
+       * fail the job with "Capture session expired".
+       */
+      pinnedUntil: number;
     }
 
     const MS = window as unknown as {
@@ -1004,15 +1017,29 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
     }
 
     function evictOldest(): void {
-      let oldestId: string | undefined;
-      let oldestTs = Infinity;
+      // Sessions the extension is actively reading are evicted last: dropping
+      // one mid-transfer fails a download the user already started, while an
+      // idle player can simply be re-detected on the next scan.
+      const now = Date.now();
+      let victimId: string | undefined;
+      let victimTs = Infinity;
+      let fallbackId: string | undefined;
+      let fallbackTs = Infinity;
       sessions.forEach((s, id) => {
-        if (s.created < oldestTs) {
-          oldestTs = s.created;
-          oldestId = id;
+        if (s.pinnedUntil > now) {
+          if (s.created < fallbackTs) {
+            fallbackTs = s.created;
+            fallbackId = id;
+          }
+          return;
+        }
+        if (s.created < victimTs) {
+          victimTs = s.created;
+          victimId = id;
         }
       });
-      if (oldestId !== undefined) sessions.delete(oldestId);
+      const chosen = victimId ?? fallbackId;
+      if (chosen !== undefined) sessions.delete(chosen);
       // blobToMs entries are bounded separately below.
       while (blobToMs.size > 100) {
         const first = blobToMs.keys().next().value as string | undefined;
@@ -1023,6 +1050,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
 
     function pruneEmptySessions(now: number): void {
       sessions.forEach((s, id) => {
+        if (s.pinnedUntil > now) return; // being downloaded right now
         if (s.tracks.length === 0 && now - s.created > 60_000) sessions.delete(id);
         else if (sessionBytes(s) === 0 && now - s.created > 120_000) sessions.delete(id);
       });
@@ -1040,6 +1068,7 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
           eme: false,
           created: Date.now(),
           lastAppend: Date.now(),
+          pinnedUntil: 0,
         });
       }
       return id;
@@ -1127,7 +1156,37 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
     // (Instagram/Facebook, dash.js) still get captured.
     function captureAppend(sb: object, data: unknown): void {
       try {
-        const info = sbInfo.get(sb);
+        let info = sbInfo.get(sb);
+        // The player called addSourceBuffer before this hook wrapped the
+        // prototype (tab open before install/reload, early iframe): there is
+        // no binding, but the bytes are still the video. Attribute them to
+        // the most recently active clear session, or an orphan session as a
+        // last resort — dropping them is exactly the "play for minutes, still
+        // empty buffer" failure.
+        if (!info) {
+          let best: MsSession | undefined;
+          sessions.forEach((s) => {
+            if (s.eme) return;
+            if (!best || s.lastAppend >= best.lastAppend) best = s;
+          });
+          if (!best) {
+            if (sessions.size >= MAX_SESSIONS) evictOldest();
+            const id = `ms-${++msSeq}`;
+            best = {
+              id,
+              tracks: [],
+              eme: false,
+              created: Date.now(),
+              lastAppend: Date.now(),
+              pinnedUntil: 0,
+            };
+            sessions.set(id, best);
+          }
+          const trackIdx = best.tracks.length;
+          best.tracks.push({ mime: "", kind: "other", parts: [], bytes: 0, overflow: false });
+          info = { msId: best.id, trackIdx };
+          sbInfo.set(sb, info);
+        }
         const sess = info ? sessions.get(info.msId) : undefined;
         const trk = sess?.tracks[info?.trackIdx ?? -1];
         // Only this session's own DRM taint blocks capture; a DRM player
@@ -1187,12 +1246,39 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
     }
 
     try {
-      const SB = (window as unknown as { SourceBuffer?: { prototype?: { appendBuffer?: (data: BufferSource) => void } } }).SourceBuffer;
+      const SB = (window as unknown as { SourceBuffer?: { prototype?: { appendBuffer?: (data: BufferSource) => void; changeType?: (mime: string) => void } } }).SourceBuffer;
       if (SB?.prototype?.appendBuffer) {
         const origAppend = SB.prototype.appendBuffer;
         SB.prototype.appendBuffer = function (this: SourceBuffer, data: BufferSource): void {
           captureAppend(this as object, data);
           origAppend.call(this, data);
+        };
+      }
+      // A quality switch reuses the SAME SourceBuffer with a new codec/mime.
+      // Without a split, one track mixes two inits and the saver must cut the
+      // file where the new quality begins. Start a fresh track instead so each
+      // quality stays a clean, downloadable stream (biggest wins at pick).
+      if (SB?.prototype && typeof SB.prototype.changeType === "function") {
+        const origChange = SB.prototype.changeType;
+        SB.prototype.changeType = function (this: SourceBuffer, mime: string): void {
+          try {
+            const info = sbInfo.get(this as object);
+            const sess = info ? sessions.get(info.msId) : undefined;
+            if (sess && !sess.eme) {
+              const trackIdx = sess.tracks.length;
+              sess.tracks.push({
+                mime: String(mime ?? ""),
+                kind: trackKind(String(mime ?? "")),
+                parts: [],
+                bytes: 0,
+                overflow: false,
+              });
+              sbInfo.set(this as object, { msId: sess.id, trackIdx });
+            }
+          } catch {
+            /* ignore */
+          }
+          origChange.call(this, mime);
         };
       }
     } catch {
@@ -1403,6 +1489,9 @@ import { extractMediaFileUrls, hasMediaBodyHint } from "./lib/apiUrls";
       const s = sessions.get(id);
       const t = s?.tracks[trackIdx];
       if (!s || !t) return { __vdg: "ms-chunk", error: "Capture session expired (page navigated or video reloaded)." };
+      // Reading counts as "in use": keep this buffer alive for the rest of the
+      // transfer even if the page opens more players meanwhile.
+      s.pinnedUntil = Date.now() + SESSION_PIN_MS;
       if (cursor < 0 || cursor > t.bytes) return { __vdg: "ms-chunk", error: "Bad cursor." };
       if (cursor >= t.bytes) {
         return { __vdg: "ms-chunk", cursor, next: cursor, done: true, total: t.bytes };

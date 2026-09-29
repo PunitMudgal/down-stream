@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleCaptureSessions, handleVideoSignals } from "../src/bg/signals";
 import { memoryStore } from "../src/bg/store";
+import { BLOB_PLACEHOLDER_HINT } from "../src/lib/blobResolve";
 import type { BlobFileInfo, MediaItem, VideoSignal } from "../src/lib/types";
 
 const BLOB_URL = "blob:https://www.instagram.com/reel-1";
@@ -48,7 +49,7 @@ describe("handleVideoSignals blob players", () => {
     const items = memoryStore.get(7) ?? [];
     expect(items).toHaveLength(1);
     expect(items[0].type).toBe("blob");
-    expect(items[0].error).toMatch(/Blob\/MSE stream/i);
+    expect(items[0].error).toBe(BLOB_PLACEHOLDER_HINT);
   });
 
   it("turns that placeholder into a downloadable blobfile once the page Blob is known", async () => {

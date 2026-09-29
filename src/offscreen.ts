@@ -29,6 +29,7 @@ import {
   liveLoadRange,
 } from "./lib/liveRecord";
 import { basenameOf, withExtPreservingDir } from "./lib/filename";
+import { cleanCapturedStream, countInitTraks, describeCaptureCleanup } from "./lib/captureClean";
 import { muxFmp4 } from "./lib/mp4mux";
 import {
   clearJob as persistClearJob,
@@ -66,6 +67,8 @@ interface CaptureAcc {
   partNo: number[];
   /** Byte offset within each track's buffered parts. */
   offset: number[];
+  /** The page hit its per-track capture cap — the tail was never buffered. */
+  truncated?: boolean;
 }
 const captures = new Map<string, CaptureAcc>();
 const cancelledCaptures = new Set<string>();
@@ -801,6 +804,17 @@ function describeParts(r: TrackSaveResult): string {
 }
 
 /**
+ * One sentence for everything the capture path had to repair or leave out, so a
+ * finished download explains itself instead of quietly differing from the video.
+ */
+function capNote(notes: string[]): string {
+  const lines = notes.map((n) =>
+    n.replace(/^Repaired the captured buffer:\s*/i, "").replace(/\.\s*$/, ""),
+  );
+  return `Saved from the player's buffer: ${lines.join("; ")}.`;
+}
+
+/**
  * Split A/V download: merge video+audio into one file when it fits; past
  * the safety cap save each track as its own part-file set instead of
  * failing with "Video exceeds the 1.5 GB safety cap".
@@ -1242,6 +1256,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       filename: typeof m.filename === "string" && m.filename ? m.filename : `capture-${m.jobId}.mp4`,
       partNo: [1, 1],
       offset: [0, 0],
+      truncated: m.truncated === true,
     });
     try {
       sendResponse({ ok: true });
@@ -1294,6 +1309,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return false;
     }
     if (m.buf instanceof ArrayBuffer) {
+      // The page keeps appending while we transfer, so the snapshot sent in
+      // MS_TRACK_START goes stale — track the live total instead of showing
+      // progress past 100%.
+      if (typeof m.total === "number" && m.total > acc.total) acc.total = m.total;
       // which: 0 = primary track, 1 = paired audio track (muxed at END).
       if (m.which === 1) acc.pairParts.push(m.buf);
       else acc.parts.push(m.buf);
@@ -1353,12 +1372,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           report({ type: "DOWNLOAD_DONE", jobId: m.jobId, filename: files[0] ?? acc.filename, note });
           return;
         }
+        const video = cleanCapturedStream(toU8(acc.parts));
+        if (video.bytes.byteLength === 0) throw new Error("Capture arrived empty.");
+        const audio = acc.pairParts.length ? cleanCapturedStream(toU8(acc.pairParts)) : undefined;
+        const notes: string[] = [];
+        for (const c of [video, audio]) {
+          if (!c) continue;
+          const line = describeCaptureCleanup(c);
+          if (line) notes.push(line);
+        }
+        if (acc.truncated) {
+          notes.push(
+            "the page stopped buffering at its capture limit, so the last part of this video was never in the player's buffer",
+          );
+        }
         let blob: Blob;
         let filename = acc.filename;
-        if (acc.pairParts.length) {
+        // A primary track whose init carries BOTH video and audio is already a
+        // complete file (the player muxes them into one SourceBuffer); merging
+        // the separate audio track into it is impossible and would only fail.
+        const alreadyMuxed = countInitTraks(video.bytes) > 1;
+        if (audio && audio.bytes.byteLength > 0 && !alreadyMuxed) {
           // Paired audio track present: merge into one file with sound.
           try {
-            const merged = muxFmp4(toU8(acc.parts), toU8(acc.pairParts));
+            const merged = muxFmp4(video.bytes, audio.bytes);
             blob = new Blob([merged.buffer as ArrayBuffer], { type: "video/mp4" });
             filename = withExtension(acc.filename, ".mp4");
           } catch (err) {
@@ -1367,13 +1404,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             );
           }
         } else {
-          blob = new Blob(acc.parts, { type: acc.mime || "video/mp4" });
+          if (alreadyMuxed && audio && audio.bytes.byteLength > 0) {
+            notes.push("the player buffers video and audio together, so the separate audio track was left out");
+          }
+          const vBytes =
+            video.bytes.byteOffset === 0 && video.bytes.byteLength === video.bytes.buffer.byteLength
+              ? (video.bytes.buffer as ArrayBuffer)
+              : (video.bytes.slice().buffer as ArrayBuffer);
+          blob = new Blob([vBytes], { type: acc.mime || "video/mp4" });
           const ext = await sniffExtension(blob, ".mp4");
           filename = withExtension(acc.filename, ext);
         }
         acc.parts = [];
         acc.pairParts = [];
-        await finalizeJobFile(m.jobId, blob, filename);
+        await finalizeJobFile(m.jobId, blob, filename, notes.length ? capNote(notes) : undefined);
       } catch (err) {
         report({
           type: "DOWNLOAD_ERROR",

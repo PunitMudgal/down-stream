@@ -413,6 +413,17 @@ button.ghost.cancelbtn:hover { color: var(--danger); border-color: var(--danger)
 .retry-btn:disabled { opacity: 0.55; cursor: default; }
 .retry-btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
 .protected { color: var(--warning); background: var(--warning-soft); }
+/* Neutral note on a row that is still downloadable (player buffer, hints). */
+.note {
+  font-size: 12px;
+  margin-top: 8px;
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  color: var(--muted);
+  background: var(--card-2);
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
 
 .empty {
   color: var(--muted);

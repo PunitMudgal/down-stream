@@ -76,6 +76,20 @@ function errorRow(message: string, retry?: MediaItem): HTMLElement {
   return row;
 }
 
+/**
+ * Neutral explanation row (no error colouring): used for rows that are
+ * downloadable but need an action first, such as a `blob:` player buffer.
+ */
+function noteRow(message: string): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "note";
+  const text = document.createElement("span");
+  text.className = "error-text";
+  text.textContent = message;
+  row.appendChild(text);
+  return row;
+}
+
 /** Re-read one item's manifest (fresh read) and repaint on success. */
 async function retryParseManifest(
   item: MediaItem,
@@ -308,6 +322,7 @@ async function scanPageDirect(tabId: number): Promise<{
   msSessions: MsSessionMeta[];
   pageTitle?: string;
   adapterItems: MediaItem[];
+  playerCount: number;
 }> {
   try {
     const res = await withTimeout(
@@ -321,6 +336,7 @@ async function scanPageDirect(tabId: number): Promise<{
         msSessions: Array.isArray(res.msSessions) ? (res.msSessions as MsSessionMeta[]) : [],
         pageTitle: typeof res.pageTitle === "string" ? res.pageTitle : undefined,
         adapterItems: Array.isArray(res.adapterItems) ? (res.adapterItems as MediaItem[]) : [],
+        playerCount: typeof res.playerCount === "number" && res.playerCount >= 0 ? res.playerCount : 0,
       };
     }
   } catch {
@@ -341,7 +357,8 @@ async function scanPageDirect(tabId: number): Promise<{
               return null;
             }
           };
-          return Array.from(document.querySelectorAll("video")).flatMap((v) => {
+          const playerCount = document.querySelectorAll("video").length;
+          const videos = Array.from(document.querySelectorAll("video")).flatMap((v) => {
             const cands: string[] = [];
             if ((v as HTMLVideoElement).currentSrc) cands.push((v as HTMLVideoElement).currentSrc);
             for (const a of ["src", "data-src", "data-url", "data-video-url"]) {
@@ -363,19 +380,29 @@ async function scanPageDirect(tabId: number): Promise<{
               },
             ];
           });
+          return { videos, playerCount };
         },
       }),
       6000,
       "Page injection",
     );
     const out: VideoSignal[] = [];
+    let playerCount = 0;
     for (const r of results ?? []) {
       const val = (r as chrome.scripting.InjectionResult)?.result as unknown;
-      if (Array.isArray(val)) out.push(...(val as VideoSignal[]));
+      if (val && typeof val === "object" && Array.isArray((val as { videos?: unknown }).videos)) {
+        const v = val as { videos: VideoSignal[]; playerCount?: unknown };
+        if (Array.isArray(v.videos)) out.push(...(v.videos as VideoSignal[]));
+        if (typeof v.playerCount === "number") playerCount = Math.max(playerCount, v.playerCount);
+      } else if (Array.isArray(val)) {
+        // Older shape (plain array) — kept for tolerance.
+        out.push(...(val as VideoSignal[]));
+        playerCount = Math.max(playerCount, out.length);
+      }
     }
-    return { videos: out, msSessions: [], pageTitle: undefined, adapterItems: [] };
+    return { videos: out, msSessions: [], pageTitle: undefined, adapterItems: [], playerCount };
   } catch {
-    return { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [] };
+    return { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [], playerCount: 0 };
   }
 }
 
@@ -718,7 +745,7 @@ async function loadMedia(): Promise<void> {
   let workerItems = workerSettled.status === "fulfilled" ? workerSettled.value : [];
   const pageScan = pageSettled.status === "fulfilled"
     ? pageSettled.value
-    : { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [] };
+    : { videos: [], msSessions: [], pageTitle: undefined, adapterItems: [], playerCount: 0 };
   // COLLECT_FOR_POPUP pushes VIDEO_ELEMENTS (blobs/captures) before it
   // answers — re-read so a blob: player that just became downloadable
   // shows a button instead of the placeholder error.
@@ -791,7 +818,11 @@ async function loadMedia(): Promise<void> {
     div.appendChild(iconSpan("search", "empty-icon"));
     const title = document.createElement("div");
     title.className = "empty-title";
-    title.textContent = currentHost ? `No video on ${currentHost} yet` : "No video detected yet";
+    const players = pageScan.playerCount ?? 0;
+    title.textContent =
+      players > 0
+        ? `Found ${players} video player${players === 1 ? "" : "s"} — no stream exposed yet`
+        : currentHost ? `No video on ${currentHost} yet` : "No video detected yet";
     div.appendChild(title);
     const steps = document.createElement("div");
     steps.className = "hint-steps";
@@ -1251,6 +1282,11 @@ function renderCard(item: MediaItem): HTMLElement {
     btn.title = "Download the exact bytes the player buffered (lossless)";
     btn.onclick = () => void handleStartDownload(item, undefined, btn);
     meta.appendChild(btn);
+    if (item.meta?.includes("partial")) {
+      meta.appendChild(
+        noteRow("Partial buffer: the player only kept part of this video. For the full video in any quality, use the stream row above."),
+      );
+    }
   } else if (item.type === "blob") {
     // A blob: player IS downloadable: at click time the page is asked for the
     // video's bytes — the file behind the object URL when it is Blob-backed,
@@ -1263,7 +1299,7 @@ function renderCard(item: MediaItem): HTMLElement {
     btn.title = "Read this video out of the page — file bytes or the buffer its player filled";
     btn.onclick = () => void handleStartDownload(item, undefined, btn);
     meta.appendChild(btn);
-    meta.appendChild(errorRow(item.error ?? BLOB_PLACEHOLDER_HINT));
+    meta.appendChild(noteRow(item.error ?? BLOB_PLACEHOLDER_HINT));
   } else if (item.error) {
     // Any other type that failed to resolve — surface it rather than hide it.
     meta.appendChild(errorRow(item.error));

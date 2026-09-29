@@ -92,6 +92,53 @@ export async function maybeCloseOffscreen(): Promise<void> {
 
 // ---- naming + job construction -------------------------------------------
 
+/**
+ * A decline worth waiting out once: the player simply hasn't appended
+ * anything yet (click landed the instant playback started). Anything else
+ * (revoked URL, live buffer with no capture, lost session) will not improve
+ * by waiting. The hook reports the raw token as `reason`; prose stays in
+ * `error`.
+ */
+export function isTransientBlobDecline(reason: string | undefined): boolean {
+  return reason === "empty";
+}
+
+/** One grace pause before a final attempt — the player is actively filling. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Best alternative when a `blob:` click can't be served from the player
+ * buffer (empty, revoked, hook missed the appends). The user asked for "the
+ * video", and the same player is often ALSO listed as a manifest (with the
+ * full quality ladder), grouped segments, or a capture row — any of which
+ * downloads the same content without the buffer. Same-frame items win so a
+ * multi-video page falls back to the right player; blob rows never qualify
+ * (that would loop back here).
+ */
+export function pickBlobFallback(items: MediaItem[], failed: MediaItem): MediaItem | undefined {
+  const cands = items.filter(
+    (x) => x.url !== failed.url && !x.drmProtected && x.type !== "blob" && x.type !== "blobfile",
+  );
+  if (!cands.length) return undefined;
+  const sameFrame = cands.filter((x) => x.frameId === failed.frameId);
+  const pool = sameFrame.length ? sameFrame : cands;
+  const newest = (list: MediaItem[]): MediaItem | undefined => {
+    let best: MediaItem | undefined;
+    for (const x of list) {
+      if (!best || (x.detectedAt ?? 0) > (best.detectedAt ?? 0)) best = x;
+    }
+    return best;
+  };
+  return (
+    newest(pool.filter((x) => x.type === "capture")) ??
+    newest(pool.filter((x) => x.type === "hls" || x.type === "dash")) ??
+    newest(pool.filter((x) => x.type === "segments" && (x.segments?.length ?? 0) > 0)) ??
+    newest(pool.filter((x) => x.type !== "capture" && x.type !== "segments" && x.type !== "hls" && x.type !== "dash" && x.type !== "unknown"))
+  );
+}
+
 /** Extension from a detected filename, falling back to the media-type default. */
 function extOfName(name: string, type: string): string {
   const m = /\.([a-z0-9]{2,5})$/i.exec(name ?? "");
@@ -243,15 +290,40 @@ export async function startDownload(
     };
     await upsertJob(job);
     await ensureOffscreen();
+    const blobMsg = {
+      type: "BLOB_DOWNLOAD",
+      jobId,
+      url: item.url,
+      filename: job.filename,
+    };
     try {
       // Only the frame holding this Blob can stream it; the others decline.
-      const sent = await sendToAcceptingFrame(tabId, item.frameId, {
-        type: "BLOB_DOWNLOAD",
-        jobId,
-        url: item.url,
-        filename: job.filename,
-      });
+      let sent = await sendToAcceptingFrame(tabId, item.frameId, blobMsg);
+      if (!sent.accepted && isTransientBlobDecline(sent.reason)) {
+        // No better source on this tab AND the buffer is merely empty — the
+        // click likely landed the instant playback started. One grace pause,
+        // one final attempt; the per-frame declines stay fast so this costs
+        // seconds once, not seconds per iframe.
+        if (!pickBlobFallback(items, item)) {
+          await sleep(6000);
+          sent = await sendToAcceptingFrame(tabId, item.frameId, blobMsg);
+        }
+      }
       if (!sent.accepted) {
+        // The buffer wasn't readable (empty/revoked) — but the playing video
+        // is often ALSO listed as a manifest (full quality ladder), grouped
+        // segments, or a capture row. Fall back to the best of those instead
+        // of failing the click: the user asked for "the video", not the row.
+        const fallback = pickBlobFallback(items, item);
+        if (fallback) {
+          job.status = "error";
+          job.error = "Player buffer unreadable — downloading the same video from its full stream instead.";
+          await upsertJob(job);
+          return await startDownload(tabId, fallback.url, undefined, undefined, {
+            refresh: false,
+            cardUrl: fallback.url,
+          });
+        }
         job.status = "error";
         job.error = sent.error ?? "Blob expired — replay the video and Rescan.";
         await upsertJob(job);

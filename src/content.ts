@@ -786,7 +786,9 @@ async function driveMsDownload(
           jobId,
           which,
           index,
-          total: track.bytes,
+          // The live total, not the start-time snapshot: the player keeps
+          // appending while we transfer, and progress must not pass 100%.
+          total: typeof res.total === "number" && res.total > 0 ? res.total : track.bytes,
           buf: res.buf,
         });
         if (!ok) throw new Error("Download cancelled.");
@@ -798,9 +800,23 @@ async function driveMsDownload(
     return index;
   };
   try {
-    const sessions = await queryMsSessions();
-    const session = sessions.find((s) => s.id === captureId);
-    const track = session?.tracks[trackIdx];
+    // The user often clicks Download the instant they press play — the hook
+    // may not have seen the first append yet. Wait briefly for bytes to land
+    // instead of failing with "empty buffer".
+    let sessions = await queryMsSessions();
+    let session = sessions.find((s) => s.id === captureId);
+    let track = session?.tracks[trackIdx];
+    if (session && track && track.bytes <= 0) {
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        if (msAbort.has(jobId)) throw new Error("Download cancelled.");
+        await new Promise((r) => setTimeout(r, 1000));
+        sessions = await queryMsSessions();
+        session = sessions.find((s) => s.id === captureId);
+        track = session?.tracks[trackIdx];
+        if (!session || !track || track.bytes > 0) break;
+      }
+    }
     if (!session || !track || track.bytes <= 0) {
       fail(!session || !track ? "Capture expired — the page dropped the player buffer. Replay the video and Rescan." : "Capture is empty — let the video play longer, then retry.");
       return;
@@ -813,6 +829,9 @@ async function driveMsDownload(
       total,
       mime: track.mime,
       filename,
+      // The page's per-track capture cap was already hit, so the tail of this
+      // video never entered the player's buffer — say so on the finished file.
+      truncated: session.complete === false,
     });
     let index = await pullTrack(trackIdx, 0, 0);
     if (pair && pair.bytes > 0) {
@@ -1127,6 +1146,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         attachPageMediaUrls(videos);
         const [msSessions, blobs] = await Promise.all([queryMsSessions(), queryBlobs()]);
         const adapterItems = collectAdapterItems(videos);
+        // Live <video> elements known to this frame (even ones with no URL
+        // yet — JS players attach the source after user interaction), so the
+        // popup can tell "players present, nothing exposed yet" apart from
+        // "no video on this page".
+        let playerCount = 0;
+        try {
+          liveVideos.forEach((v) => {
+            if (v.isConnected) playerCount++;
+            else liveVideos.delete(v);
+          });
+        } catch {
+          /* ignore */
+        }
         // Keep the worker in lockstep with the popup scan so a blob: player
         // that just got a backing Blob/capture upgrades before Download.
         await bgSend({
@@ -1138,7 +1170,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           blobs,
           adapterItems: adapterItems.length ? adapterItems : undefined,
         });
-        sendResponse({ ok: true, videos, pageTitle: document.title, msSessions, blobs, adapterItems });
+        sendResponse({
+          ok: true,
+          videos,
+          pageTitle: document.title,
+          msSessions,
+          blobs,
+          adapterItems,
+          playerCount,
+        });
       } catch (err) {
         noteDead(err);
         try {
@@ -1164,6 +1204,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             ok: false,
             declined: true,
             error: "Capture expired — the page dropped the player buffer. Replay the video and Rescan.",
+            reason: "not-held",
           });
         } catch {
           /* ignore */
@@ -1204,10 +1245,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // same-origin tab can serve a Blob-backed URL, so the first one that
       // succeeds accepts and streams; frames that cannot (a MediaSource
       // buffer, a revoked URL) decline with the reason we report.
+      //
+      // Declines are FAST on purpose: the background walks every frame of the
+      // tab, so any wait here multiplies by the frame count (ad iframes make
+      // a seconds-long wait feel like a hang). The background does a single
+      // grace retry for transient "empty" answers instead.
       if (!route) route = await resolveBlobDeep(blobUrl);
       if (route.kind === "dead") {
         try {
-          sendResponse({ ok: false, declined: true, error: blobDeadMessage(route.reason) });
+          sendResponse({
+            ok: false,
+            declined: true,
+            error: blobDeadMessage(route.reason),
+            reason: route.reason,
+          });
         } catch {
           /* ignore */
         }

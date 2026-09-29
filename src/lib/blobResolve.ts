@@ -42,21 +42,26 @@ export interface BlobDeadRoute {
 
 export type BlobRoute = BlobBytesRoute | BlobMseRoute | BlobDeadRoute;
 
-/** Shown on the placeholder card the worker creates for a blob: player. */
+/**
+ * Shown on the card the worker/popup creates for a `blob:` player. Worded as
+ * an instruction, not a failure: the row IS downloadable (the button next to
+ * it reads the video out of the player), it just needs the video to have been
+ * played so the player has buffered something to read.
+ */
 export const BLOB_PLACEHOLDER_HINT =
-  "Blob/MSE stream (in-player buffer) — the file is captured from the network while it plays. Play the video for a few seconds, then Rescan.";
+  "Player buffer (blob:). Download reads the video out of the player itself — nothing is captured until the video starts playing, so play a few seconds first if the download reports an empty buffer.";
 
 /** The page revoked the buffer, or we are looking at a stale blob: URL. */
 export const BLOB_GONE_HINT =
-  "The page released this buffer (one-time stream or revoked URL). Replay the video, then Rescan.";
+  "The page released this player's buffer (one-time stream or revoked URL) and it hasn't been re-buffered. Replay the video, then Rescan and download again.";
 
 /** A live MediaSource URL, with no captured appends to fall back on. */
 export const BLOB_MSE_HINT =
-  "This player feeds a live MediaSource buffer instead of loading a file, and nothing has been captured from it yet. Play the video for a few seconds, then Rescan — or reload the tab so the capture hook is active before playback starts.";
+  "This player streams into a browser buffer instead of loading a file, and no bytes have been buffered since the capture hook started. Play the video for a few seconds — or reload the tab so capture starts with playback — then Rescan.";
 
 /** Captured appends exist but carry no bytes yet. */
 export const BLOB_EMPTY_HINT =
-  "The player's buffer is still empty — play the video for a few seconds, then retry.";
+  "The player's buffer is still empty. Let the video play for a few seconds, then download again.";
 
 /**
  * Turn a hook reply (or nothing at all) into a route. Defensive on purpose:
@@ -78,6 +83,13 @@ export function parseBlobRoute(raw: unknown): BlobRoute | undefined {
   if (kind === "mse") {
     if (typeof r.sessionId !== "string" || !r.sessionId) return undefined;
     const tracks = Array.isArray(r.tracks) ? (r.tracks as BlobTrackRef[]) : [];
+    // A session with no bytes yet (player hasn't appended, or the hook missed
+    // the early appends) is not a downloadable route — report it as empty so
+    // the caller fails fast with "play a few seconds" AND can fall back to a
+    // manifest/segments row instead of starting a doomed buffer transfer.
+    if (!tracks.some((t) => t && typeof t.bytes === "number" && t.bytes > 0)) {
+      return { kind: "dead", reason: "empty" };
+    }
     const picked = pickCaptureTracks(tracks);
     return {
       kind: "mse",

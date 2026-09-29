@@ -45,9 +45,12 @@ export function hasAudioCodec(c: string): boolean {
 /**
  * Mirror of the popup display filter — the badge shows the same real-video
  * count the popup does (manifests dominate; fragments/placeholders hidden).
+ * Blob player rows count too: every one carries a Download button that reads
+ * the buffer (or falls back to the full stream), so hiding them makes video
+ * pages look empty.
  */
 export function countForBadge(items: MediaItem[]): number {
-  return forDisplay(items).filter((x) => x.type !== "blob").length;
+  return forDisplay(items).filter((x) => !x.drmProtected).length;
 }
 
 /** Badge counts real videos, not blob placeholders or raw fragments. */

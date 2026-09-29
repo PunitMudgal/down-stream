@@ -118,4 +118,22 @@ describe("sendToAcceptingFrame", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(9, msg, { frameId: 6 });
   });
+
+  it("carries the machine-readable decline reason through the walk", async () => {
+    sendMessage.mockResolvedValue({
+      ok: false,
+      declined: true,
+      error: "The player's buffer is still empty.",
+      reason: "empty",
+    });
+    const res = await sendToAcceptingFrame(9, undefined, { type: "BLOB_DOWNLOAD", jobId: "b1" });
+    expect(res).toEqual({ accepted: false, error: "The player's buffer is still empty.", reason: "empty" });
+  });
+
+  it("omits the reason when declining frames give none", async () => {
+    sendMessage.mockResolvedValue({ ok: false, declined: true, error: "nope" });
+    const res = await sendToAcceptingFrame(9, undefined, msg);
+    expect(res).toEqual({ accepted: false, error: "nope" });
+    expect("reason" in res).toBe(false);
+  });
 });
